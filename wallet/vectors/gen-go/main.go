@@ -515,6 +515,41 @@ func genBeef(f Fixtures) (any, error) {
 		c.Reserialized = hex.EncodeToString(rb)
 		cases = append(cases, c)
 	}
+	// Damaged BEEFs, made by go-sdk from the V2 fixtures: the proven parent
+	// dropped (a missing input), or turned txid-only.
+	var damaged []map[string]any
+	for _, b := range f.Beefs {
+		if !strings.HasPrefix(b.Name, "utv-") || !strings.HasSuffix(b.Name, "-v2") {
+			continue
+		}
+		for _, mode := range []string{"parent-dropped", "parent-txid-only"} {
+			bf, _, _, err := transaction.ParseBeef(must(hex.DecodeString(b.Hex)))
+			if err != nil {
+				return nil, err
+			}
+			var parent *chainhash.Hash
+			for id, t := range bf.Transactions {
+				if t.DataFormat == transaction.RawTxAndBumpIndex {
+					id := id
+					parent = &id
+					break
+				}
+			}
+			if mode == "parent-dropped" {
+				delete(bf.Transactions, *parent)
+			} else {
+				bf.MakeTxidOnly(parent)
+			}
+			raw, err := bf.Bytes()
+			if err != nil {
+				return nil, err
+			}
+			damaged = append(damaged, map[string]any{
+				"name": b.Name + "/" + mode, "hex": hex.EncodeToString(raw),
+				"valid": bf.IsValid(false), "validTxidOnly": bf.IsValid(true),
+			})
+		}
+	}
 	// Malformed inputs go-sdk refuses.
 	bad := []map[string]string{}
 	for _, m := range []struct{ name, hex string }{
@@ -533,6 +568,7 @@ func genBeef(f Fixtures) (any, error) {
 		"about":     "BEEF (BRC-62/95/96) parse: version, atomic subject, BUMPs, txs by txid with format and bump index (go-sdk transaction.ParseBeef), validity (Beef.IsValid) and go-sdk's reserialization.",
 		"cases":     cases,
 		"malformed": bad,
+		"damaged":   damaged,
 	}, nil
 }
 
