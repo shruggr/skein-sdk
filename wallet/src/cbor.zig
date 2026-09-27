@@ -201,7 +201,7 @@ pub fn encodeInto(allocator: std.mem.Allocator, out: *std.ArrayList(u8), v: Valu
             const sorted = try allocator.dupe(Entry, entries);
             defer allocator.free(sorted);
             std.sort.pdq(Entry, sorted, {}, keyLess);
-            for (sorted[1..], 0..) |e, i| if (std.mem.eql(u8, e.key, sorted[i].key)) return error.InvalidCbor;
+            if (sorted.len > 1) for (sorted[1..], 0..) |e, i| if (std.mem.eql(u8, e.key, sorted[i].key)) return error.InvalidCbor;
             try head(allocator, out, 5, sorted.len);
             for (sorted) |e| {
                 try head(allocator, out, 3, e.key.len);
@@ -253,6 +253,14 @@ test "cbor: canonical map order and round trip" {
     try std.testing.expectEqualStrings("x", back.getText("b").?);
     try std.testing.expectEqualSlices(u8, &.{ 1, 0x71, 0x12, 0x20 }, back.getCid("c").?);
     try std.testing.expectEqualSlices(u8, bytes, try encode(a, back));
+}
+
+test "cbor: empty containers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualSlices(u8, &.{0xa0}, try encode(arena.allocator(), .{ .map = &.{} }));
+    try std.testing.expectEqualSlices(u8, &.{0x80}, try encode(arena.allocator(), .{ .array = &.{} }));
+    try std.testing.expectError(error.InvalidCbor, encode(arena.allocator(), .{ .map = &.{ .{ .key = "a", .value = .null }, .{ .key = "a", .value = .null } } }));
 }
 
 test "cbor: refuses indefinite lengths, non-text keys, other tags, trailing bytes" {

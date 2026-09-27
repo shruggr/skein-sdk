@@ -35,9 +35,9 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/program.zig"),
             .target = wasi,
-            .optimize = .ReleaseSmall,
+            .optimize = .ReleaseSafe,
             .strip = true,
-            .imports = &.{.{ .name = "wallet", .module = libModule(b, wasi, .ReleaseSmall) }},
+            .imports = &.{.{ .name = "wallet", .module = libModule(b, wasi, .ReleaseSafe) }},
         }),
     });
     const install_prog = b.addInstallArtifact(prog, .{});
