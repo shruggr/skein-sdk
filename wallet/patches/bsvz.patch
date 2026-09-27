@@ -1,0 +1,19 @@
+diff --git i/src/transaction/preimage.zig w/src/transaction/preimage.zig
+index cdf8945..88917f1 100644
+--- i/src/transaction/preimage.zig
++++ w/src/transaction/preimage.zig
+@@ -36,10 +36,11 @@ pub const Preimage = struct {
+ 
+         const script_len = try primitives.varint.VarInt.parse(raw[cursor..]);
+         cursor += script_len.len;
+-        if (raw.len < cursor + script_len.value + 8 + 4 + 32 + 4 + 4) return error.EndOfStream;
++        const script_n = std.math.cast(usize, script_len.value) orelse return error.EndOfStream;
++        if (raw.len < cursor + script_n + 8 + 4 + 32 + 4 + 4) return error.EndOfStream;
+ 
+-        const script_code = Script.init(raw[cursor .. cursor + script_len.value]);
+-        cursor += script_len.value;
++        const script_code = Script.init(raw[cursor .. cursor + script_n]);
++        cursor += script_n;
+ 
+         const satoshis = std.mem.readInt(i64, raw[cursor..][0..8], .little);
+         cursor += 8;

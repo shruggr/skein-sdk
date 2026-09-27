@@ -1,0 +1,247 @@
+{
+  "about": "BRC-29 payments: protocol [2, \"3241645161d8\"], keyID \"\u003cderivationPrefix\u003e \u003cderivationSuffix\u003e\" (BRC-43 invoice 2-3241645161d8-\u003ckeyID\u003e). Keys by go-sdk wallet.KeyDeriver (BRC-42): the payer's and payee's derivations agree. `recognize`: which declared remittances match the P2PKH output at their vout.",
+  "cases": [
+    {
+      "name": "brc29-0",
+      "senderPrivateKey": "0065161e127d85a02cfccd89f29254cc24748ada0c4c32f986f344e207f3459f",
+      "senderIdentityKey": "025e941cf6293fc6ef61a841166a3dc3f402e4728cf7e9aace1a530a954dbdce9e",
+      "recipientPrivateKey": "9b87e3dc10981aecfb13e9bc6d38b2d4b7bd07a895d65c0ae27584f073c18f1e",
+      "recipientIdentityKey": "039ca78dcddde4a1267d876700b442d4236066e412395e01d80b05c88b7601a7a8",
+      "derivationPrefix": "cHJlZml4",
+      "derivationSuffix": "c3VmZml4",
+      "keyID": "cHJlZml4 c3VmZml4",
+      "invoice": "2-3241645161d8-cHJlZml4 c3VmZml4",
+      "payerDerivedKey": "02bfc148dbd85e40b4608bcf0b21401fcaf8c00ac1aaf8da9ce9dd9e6817f6fc9b",
+      "payeeDerivedKey": "02bfc148dbd85e40b4608bcf0b21401fcaf8c00ac1aaf8da9ce9dd9e6817f6fc9b",
+      "payeePrivateKey": "92a3d18a432947156542b073de16ff8253d090bd9309767bd9f57818dc99733c",
+      "lockingScript": "76a91415b2ab183ffd63a4e47021c9e6f59f22ae7d22cd88ac"
+    },
+    {
+      "name": "brc29-1",
+      "senderPrivateKey": "9999fc2f5d50125315e06469851d8ea699cc61452bb66cf034e75f708b782706",
+      "senderIdentityKey": "036e1cd29c6089cd5ca89e15bb572046fefa16d34722b0f4d13a2ea0d7db24c7b5",
+      "recipientPrivateKey": "3227d755ea524c74c713ccb43cad23c6aa0c2d008251d73e42ce0e546763a321",
+      "recipientIdentityKey": "0302d90508886e74db90d6f410eca60133b77a140af0390dc8979f4bb532bc79d4",
+      "derivationPrefix": "c2tlaW4tcHJlZml4LTAwMDE=",
+      "derivationSuffix": "c2tlaW4tc3VmZml4LTAwMDE=",
+      "keyID": "c2tlaW4tcHJlZml4LTAwMDE= c2tlaW4tc3VmZml4LTAwMDE=",
+      "invoice": "2-3241645161d8-c2tlaW4tcHJlZml4LTAwMDE= c2tlaW4tc3VmZml4LTAwMDE=",
+      "payerDerivedKey": "036969b3f9ccab594b648db1dfe257fd136c1d8a2480f8485cb2dc73808185a142",
+      "payeeDerivedKey": "036969b3f9ccab594b648db1dfe257fd136c1d8a2480f8485cb2dc73808185a142",
+      "payeePrivateKey": "201b038b6b5069d3e1ea1c5c50062758f495cd03b0ef84c9dc2f1ee04ca206a2",
+      "lockingScript": "76a9145ad4f22fd2b0d2423a6a1f001a0271d12d4a3d0688ac"
+    },
+    {
+      "name": "brc29-2",
+      "senderPrivateKey": "ac4a0210cdb8f00bda34e0c089a2abdbf17bd4b22910b14ca431aede13348ce2",
+      "senderIdentityKey": "0262acb0da5c8735a1f936f2de61b650c391a8b8fc9410c78f3d549452cc809b47",
+      "recipientPrivateKey": "8f387d13f814dc8dc45ee6c51c7efdde320e29896f3407d737ebfdd9981bec8c",
+      "recipientIdentityKey": "037ff5cbf82b694ffdd163f43df24618b8a8925a9e287405817597203a63c03408",
+      "derivationPrefix": "OUbKZP942TymEJCkN8u2sw==",
+      "derivationSuffix": "rTKIRqoYsyozWA==",
+      "keyID": "OUbKZP942TymEJCkN8u2sw== rTKIRqoYsyozWA==",
+      "invoice": "2-3241645161d8-OUbKZP942TymEJCkN8u2sw== rTKIRqoYsyozWA==",
+      "payerDerivedKey": "02dba2bb126cc6cb7584e8669801f6239e8b3f5733f8bc2ff8b2c8e20dda3d8d24",
+      "payeeDerivedKey": "02dba2bb126cc6cb7584e8669801f6239e8b3f5733f8bc2ff8b2c8e20dda3d8d24",
+      "payeePrivateKey": "de8d7d30d50efaaebfb6b6ed92006245bd53897f5df508d111999245c8e46af7",
+      "lockingScript": "76a914e8347b9ad94351eeae91f85f2fd4b4c3ecf28ac988ac"
+    },
+    {
+      "name": "brc29-3",
+      "senderPrivateKey": "2443291ed8b9e2e8cf6f81fb0d4b754e81ed51dd241a3197175dcc9416ee83ef",
+      "senderIdentityKey": "023749fef8849a17894438feeee9bd4b79e54bda98dd3c63dbbe8eef98a72a24f8",
+      "recipientPrivateKey": "3b434baa4c5bf34212c0fb7fa1bb72224ec1baea97d67239297cd6102aa17032",
+      "recipientIdentityKey": "02ad6efffb187ed2fb6f3b8ceba06ed8160774666f9f2dff8e720154a90f8c8d87",
+      "derivationPrefix": "Zm9v",
+      "derivationSuffix": "YmFy",
+      "keyID": "Zm9v YmFy",
+      "invoice": "2-3241645161d8-Zm9v YmFy",
+      "payerDerivedKey": "0366baccd53dd41f783131cc53e2c06ffc43cd7319c2118caba3965b5038273852",
+      "payeeDerivedKey": "0366baccd53dd41f783131cc53e2c06ffc43cd7319c2118caba3965b5038273852",
+      "payeePrivateKey": "faf730fd31e938780a70a082918d95b9b0e2a031837cd7472f3f4a07a1357484",
+      "lockingScript": "76a914e0b963f9242cf59b583812f370f676010267636b88ac"
+    }
+  ],
+  "protocol": [
+    2,
+    "3241645161d8"
+  ],
+  "recognize": [
+    {
+      "name": "brc29-0",
+      "recipientPrivateKey": "9b87e3dc10981aecfb13e9bc6d38b2d4b7bd07a895d65c0ae27584f073c18f1e",
+      "recipientIdentityKey": "039ca78dcddde4a1267d876700b442d4236066e412395e01d80b05c88b7601a7a8",
+      "txHex": "01000000010695b2b83042b418d3c7cd19d8a0dc2949104a89ad5baeb3ddb4f9ebd225f448000000000100ffffffff03e8030000000000001976a914ec527e73070c47ab6f66ab442ac2f74aae45e92388ace8030000000000001976a91415b2ab183ffd63a4e47021c9e6f59f22ae7d22cd88ace8030000000000001976a914b0a76806d4a4e5b0132a3ae59d16dbf7a86f784388ac00000000",
+      "txid": "ac93e24604a311d0a66c872fc7e1b2d3e3941f6f5e2a3227b2731546ddd1aefd",
+      "remittances": [
+        {
+          "vout": 1,
+          "derivationPrefix": "cHJlZml4",
+          "derivationSuffix": "c3VmZml4",
+          "senderIdentityKey": "025e941cf6293fc6ef61a841166a3dc3f402e4728cf7e9aace1a530a954dbdce9e",
+          "matches": true
+        },
+        {
+          "vout": 0,
+          "derivationPrefix": "cHJlZml4",
+          "derivationSuffix": "c3VmZml4",
+          "senderIdentityKey": "025e941cf6293fc6ef61a841166a3dc3f402e4728cf7e9aace1a530a954dbdce9e",
+          "matches": false
+        },
+        {
+          "vout": 2,
+          "derivationPrefix": "cHJlZml4",
+          "derivationSuffix": "c3VmZml4",
+          "senderIdentityKey": "025e941cf6293fc6ef61a841166a3dc3f402e4728cf7e9aace1a530a954dbdce9e",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "cHJlZml4",
+          "derivationSuffix": "bm90LWl0",
+          "senderIdentityKey": "025e941cf6293fc6ef61a841166a3dc3f402e4728cf7e9aace1a530a954dbdce9e",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "cHJlZml4",
+          "derivationSuffix": "c3VmZml4",
+          "senderIdentityKey": "0320960f594eca86cbeeedc0c68b7f4cfa6f5a52ad250abe227b4305ef436c4e53",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "brc29-1",
+      "recipientPrivateKey": "3227d755ea524c74c713ccb43cad23c6aa0c2d008251d73e42ce0e546763a321",
+      "recipientIdentityKey": "0302d90508886e74db90d6f410eca60133b77a140af0390dc8979f4bb532bc79d4",
+      "txHex": "01000000016ca9c56ca0d1aebccd5fce6e3b6d195cae958a04a157fe2b011420bd9f0a33ad000000000100ffffffff03e9030000000000001976a914ec527e73070c47ab6f66ab442ac2f74aae45e92388ace9030000000000001976a9145ad4f22fd2b0d2423a6a1f001a0271d12d4a3d0688ace9030000000000001976a914ef417ff8a990c966532ddd79a0abd081aaef8ff388ac00000000",
+      "txid": "6fd3a361d9a9eef19d4b9807fc63ae667e89cf4e1d706bf0b0b072f30d0d9033",
+      "remittances": [
+        {
+          "vout": 1,
+          "derivationPrefix": "c2tlaW4tcHJlZml4LTAwMDE=",
+          "derivationSuffix": "c2tlaW4tc3VmZml4LTAwMDE=",
+          "senderIdentityKey": "036e1cd29c6089cd5ca89e15bb572046fefa16d34722b0f4d13a2ea0d7db24c7b5",
+          "matches": true
+        },
+        {
+          "vout": 0,
+          "derivationPrefix": "c2tlaW4tcHJlZml4LTAwMDE=",
+          "derivationSuffix": "c2tlaW4tc3VmZml4LTAwMDE=",
+          "senderIdentityKey": "036e1cd29c6089cd5ca89e15bb572046fefa16d34722b0f4d13a2ea0d7db24c7b5",
+          "matches": false
+        },
+        {
+          "vout": 2,
+          "derivationPrefix": "c2tlaW4tcHJlZml4LTAwMDE=",
+          "derivationSuffix": "c2tlaW4tc3VmZml4LTAwMDE=",
+          "senderIdentityKey": "036e1cd29c6089cd5ca89e15bb572046fefa16d34722b0f4d13a2ea0d7db24c7b5",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "c2tlaW4tcHJlZml4LTAwMDE=",
+          "derivationSuffix": "bm90LWl0",
+          "senderIdentityKey": "036e1cd29c6089cd5ca89e15bb572046fefa16d34722b0f4d13a2ea0d7db24c7b5",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "c2tlaW4tcHJlZml4LTAwMDE=",
+          "derivationSuffix": "c2tlaW4tc3VmZml4LTAwMDE=",
+          "senderIdentityKey": "0252c60305890b4b10200be1981639000291c5abc85273a8097de7544fee52b993",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "brc29-2",
+      "recipientPrivateKey": "8f387d13f814dc8dc45ee6c51c7efdde320e29896f3407d737ebfdd9981bec8c",
+      "recipientIdentityKey": "037ff5cbf82b694ffdd163f43df24618b8a8925a9e287405817597203a63c03408",
+      "txHex": "0100000001e957fef7f48dc368c41537f26b0f6745f8c5175a31e11470d6970f722efed4dd000000000100ffffffff03ea030000000000001976a914ec527e73070c47ab6f66ab442ac2f74aae45e92388acea030000000000001976a914e8347b9ad94351eeae91f85f2fd4b4c3ecf28ac988acea030000000000001976a914e55b3b1c1ec775d2deb9d171c1dfd34d7519007688ac00000000",
+      "txid": "fa5a5003cc3186db707999ebe739c5b2e9671754d9a81c4a0217d9c9f2e4e1de",
+      "remittances": [
+        {
+          "vout": 1,
+          "derivationPrefix": "OUbKZP942TymEJCkN8u2sw==",
+          "derivationSuffix": "rTKIRqoYsyozWA==",
+          "senderIdentityKey": "0262acb0da5c8735a1f936f2de61b650c391a8b8fc9410c78f3d549452cc809b47",
+          "matches": true
+        },
+        {
+          "vout": 0,
+          "derivationPrefix": "OUbKZP942TymEJCkN8u2sw==",
+          "derivationSuffix": "rTKIRqoYsyozWA==",
+          "senderIdentityKey": "0262acb0da5c8735a1f936f2de61b650c391a8b8fc9410c78f3d549452cc809b47",
+          "matches": false
+        },
+        {
+          "vout": 2,
+          "derivationPrefix": "OUbKZP942TymEJCkN8u2sw==",
+          "derivationSuffix": "rTKIRqoYsyozWA==",
+          "senderIdentityKey": "0262acb0da5c8735a1f936f2de61b650c391a8b8fc9410c78f3d549452cc809b47",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "OUbKZP942TymEJCkN8u2sw==",
+          "derivationSuffix": "bm90LWl0",
+          "senderIdentityKey": "0262acb0da5c8735a1f936f2de61b650c391a8b8fc9410c78f3d549452cc809b47",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "OUbKZP942TymEJCkN8u2sw==",
+          "derivationSuffix": "rTKIRqoYsyozWA==",
+          "senderIdentityKey": "03c3a4945b4844d9032f44084ed205286c7c32d19ec13fb22c1ab58ef3d796a294",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "brc29-3",
+      "recipientPrivateKey": "3b434baa4c5bf34212c0fb7fa1bb72224ec1baea97d67239297cd6102aa17032",
+      "recipientIdentityKey": "02ad6efffb187ed2fb6f3b8ceba06ed8160774666f9f2dff8e720154a90f8c8d87",
+      "txHex": "0100000001f7dc6a3f0e459cc4a1a47cfbf5f617f5cbe7fc8361f0cca5668adb7914534a3e000000000100ffffffff03eb030000000000001976a914ec527e73070c47ab6f66ab442ac2f74aae45e92388aceb030000000000001976a914e0b963f9242cf59b583812f370f676010267636b88aceb030000000000001976a914fd0aed0e93aefb1d51b62951a5f2d28517bdc21288ac00000000",
+      "txid": "37eedd931c7dea58250e9a7682fcf1e654b2ce5e19b74390107ebc6721ecbb5f",
+      "remittances": [
+        {
+          "vout": 1,
+          "derivationPrefix": "Zm9v",
+          "derivationSuffix": "YmFy",
+          "senderIdentityKey": "023749fef8849a17894438feeee9bd4b79e54bda98dd3c63dbbe8eef98a72a24f8",
+          "matches": true
+        },
+        {
+          "vout": 0,
+          "derivationPrefix": "Zm9v",
+          "derivationSuffix": "YmFy",
+          "senderIdentityKey": "023749fef8849a17894438feeee9bd4b79e54bda98dd3c63dbbe8eef98a72a24f8",
+          "matches": false
+        },
+        {
+          "vout": 2,
+          "derivationPrefix": "Zm9v",
+          "derivationSuffix": "YmFy",
+          "senderIdentityKey": "023749fef8849a17894438feeee9bd4b79e54bda98dd3c63dbbe8eef98a72a24f8",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "Zm9v",
+          "derivationSuffix": "bm90LWl0",
+          "senderIdentityKey": "023749fef8849a17894438feeee9bd4b79e54bda98dd3c63dbbe8eef98a72a24f8",
+          "matches": false
+        },
+        {
+          "vout": 1,
+          "derivationPrefix": "Zm9v",
+          "derivationSuffix": "YmFy",
+          "senderIdentityKey": "03e335a8285938c44394dee43519fde747e68de7131c62a2857992052c43f84517",
+          "matches": false
+        }
+      ]
+    }
+  ]
+}

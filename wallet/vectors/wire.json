@@ -1,0 +1,65 @@
+{
+  "about": "BRC-100 wallet wire frames for getPublicKey (call 8), as go-sdk's WalletWireTransceiver writes them (serializer.SerializeGetPublicKeyArgs + WriteRequestFrame, empty originator), and result frames (WriteResultFrame).",
+  "requests": [
+    {
+      "name": "brc29-payee",
+      "protocolID": [
+        2,
+        "3241645161d8"
+      ],
+      "keyID": "cHJlZml4 c3VmZml4",
+      "counterparty": "025e941cf6293fc6ef61a841166a3dc3f402e4728cf7e9aace1a530a954dbdce9e",
+      "forSelf": true,
+      "frame": "080000020c3332343136343531363164381163484a6c5a6d6c34206333566d5a6d6c34025e941cf6293fc6ef61a841166a3dc3f402e4728cf7e9aace1a530a954dbdce9e00ff0100"
+    },
+    {
+      "name": "brc29-payer",
+      "protocolID": [
+        2,
+        "3241645161d8"
+      ],
+      "keyID": "Zm9v YmFy",
+      "counterparty": "02ad6efffb187ed2fb6f3b8ceba06ed8160774666f9f2dff8e720154a90f8c8d87",
+      "forSelf": false,
+      "frame": "080000020c333234313634353136316438095a6d397620596d467902ad6efffb187ed2fb6f3b8ceba06ed8160774666f9f2dff8e720154a90f8c8d8700ff0000"
+    },
+    {
+      "name": "no-forself",
+      "protocolID": [
+        2,
+        "3241645161d8"
+      ],
+      "keyID": "k",
+      "counterparty": "03efe24af16da45a3e3ce3503b7b7172d64b16b28922011f8df970dd5bf6cc6be7",
+      "forSelf": null,
+      "frame": "080000020c333234313634353136316438016b03efe24af16da45a3e3ce3503b7b7172d64b16b28922011f8df970dd5bf6cc6be700ffff00"
+    },
+    {
+      "name": "long-keyid",
+      "protocolID": [
+        2,
+        "3241645161d8"
+      ],
+      "keyID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "counterparty": "02bd54316b39e8d7903f9ded2f3cf0e492ba59339eafb5e72a99e30cfa56ad6d7d",
+      "forSelf": true,
+      "frame": "080000020c333234313634353136316438fd2c0161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616102bd54316b39e8d7903f9ded2f3cf0e492ba59339eafb5e72a99e30cfa56ad6d7d00ff0100"
+    }
+  ],
+  "results": [
+    {
+      "frame": "00034da006f958beba78ec54443df4a3f52237253f7ae8cbdb17dccf3feaa57f3126",
+      "publicKey": "034da006f958beba78ec54443df4a3f52237253f7ae8cbdb17dccf3feaa57f3126",
+      "error": false
+    },
+    {
+      "frame": "000310c283aac7b35b4ae6fab201d36e8322c3408331149982e16013a5bcb917081c",
+      "publicKey": "0310c283aac7b35b4ae6fab201d36e8322c3408331149982e16013a5bcb917081c",
+      "error": false
+    },
+    {
+      "frame": "010664656e69656400",
+      "error": true
+    }
+  ]
+}
