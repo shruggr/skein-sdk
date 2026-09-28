@@ -40,7 +40,8 @@ pub fn build(b: *std.Build) void {
 
     // The same program as a WASI 0.2 component (issue #34): the skein calls
     // through the WIT (../wit/skein.wit, world `program`) and wit-bindgen's C
-    // bindings (../wit/bindings/c), WASI through the preview1 command adapter.
+    // bindings (../wit/bindings/c), HTTP over standard wasi:http (#15,
+    // src/wasi_http.zig), WASI through the preview1 command adapter.
     // Needs wasm-tools (-Dwasm-tools, default on PATH) and the adapter
     // (-Dwasi-adapter, else $SKEIN_WASI_ADAPTER, else
     // ~/.local/wasi-adapter-v49.0.1/wasi_snapshot_preview1.command.wasm).
