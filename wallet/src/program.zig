@@ -62,7 +62,7 @@ const sk = if (component) @import("skein_wit.zig") else struct {
     extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn deadline(until: i64) i32;
     extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
-    extern "skein" fn emit(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
+    extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn take(out: [*]u8, cap: u32) i32;
     extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
 };
@@ -432,8 +432,11 @@ fn run(a: std.mem.Allocator) !void {
         for (wal.changes.items, items) |c, *it| it.* = try settlementBody(a, c);
         try out.append(a, .{ .key = "settlement", .value = .{ .array = items } });
         const watchers = try wal.watchers();
-        for (watchers) |to| for (items) |it| try sealAndEmit(a, s, step, to, "settlement", it);
-        if (watchers.len > 0) try out.append(a, .{ .key = "sent", .value = .{ .uint = watchers.len * items.len } });
+        var sent: u64 = 0;
+        for (watchers) |to| for (items) |it| {
+            if (try sendTo(a, s, step, to, "settlement", it)) sent += 1;
+        };
+        if (watchers.len > 0) try out.append(a, .{ .key = "sent", .value = .{ .uint = sent } });
     }
     // The transactions this result is about, as `mentions` (kernel edges from the thread).
     {
@@ -555,62 +558,31 @@ fn isoTime(a: std.mem.Allocator, ms: i64) ![]u8 {
     return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{ yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(), @as(u64, @intCast(@mod(ms, 1000))) });
 }
 
-/// Send `body` to identity `to` in `box`: a BRC-169 envelope in the §7.3
-/// (dag-cbor, BRC-231) form, sealed here through the oracle — signed under
-/// [2, "metanet handles envelope"], key "1", anyone, over the dag-cbor of the
-/// envelope without content and signature; the content BRC-78 to `to` under
-/// [2, "message encryption"] with a key id from the step's random — then
-/// emitted (src/envelope-cbor.ts sealCbor, programs/envelope).
-fn sealAndEmit(a: std.mem.Allocator, s: w.store.Store, step: Value, to: [33]u8, box: []const u8, body: Value) !void {
+/// Send `body` to identity `to` in `box` (#40): the messagebox program
+/// delivers it over http (an in-VM call; its http calls are this step's,
+/// recorded). True if it was delivered; a failure is logged on stderr and the
+/// step goes on (a watcher that cannot be reached misses a settlement message).
+fn sendTo(a: std.mem.Allocator, s: w.store.Store, step: Value, to: [33]u8, box: []const u8, body: Value) !bool {
     const bc = try s.putValue(a, body);
-    const plain = try s.get(a, bc); // the body as stored: what the recipient hashes
-    var content_hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(plain, &content_hash, .{});
-    const me = try identity(a);
-    const self = step.get("self");
-    const to_hex = std.fmt.bytesToHex(to, .lower);
-    const domain = if (self) |x| x.getText("domain") orelse "localhost" else "localhost";
-    var sender: std.ArrayList(cbor.Entry) = .empty;
-    try sender.append(a, .{ .key = "identityKey", .value = .{ .bytes = try a.dupe(u8, &me) } });
-    if (self) |x| if (x.getText("handle")) |h| try sender.append(a, .{ .key = "handle", .value = .{ .text = h } });
-    if (self) |x| if (x.getText("domain")) |d| try sender.append(a, .{ .key = "domain", .value = .{ .text = d } });
-    const at: i64 = @intCast(step.getUint("at") orelse return error.BadInput);
-    var env: std.ArrayList(cbor.Entry) = .empty;
-    try env.appendSlice(a, &.{
-        .{ .key = "metanetHandles", .value = .{ .text = "1.0" } },
-        .{ .key = "recipient", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "handle", .value = .{ .text = try a.dupe(u8, to_hex[0..16]) } },
-            .{ .key = "domain", .value = .{ .text = domain } },
-        }) } },
-        .{ .key = "sender", .value = .{ .map = sender.items } },
-        .{ .key = "created", .value = .{ .text = try isoTime(a, at) } },
-        .{ .key = "contentHash", .value = .{ .bytes = try a.dupe(u8, &content_hash) } },
-    });
-    const pre = try cbor.encode(a, .{ .map = env.items });
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(pre, &digest, .{});
-    const sig_frame = try w.wire.createSignatureFrame(a, 2, "metanet handles envelope", "1", .anyone, digest);
-    const sig = try w.wire.signatureResult(try VmOracle.call(&VmOracle.dummy, a, sig_frame));
-    var key_id: [32]u8 = undefined;
-    std.crypto.random.bytes(&key_id);
-    const enc = std.base64.standard.Encoder;
-    const kid = try a.alloc(u8, enc.calcSize(32));
-    _ = enc.encode(kid, &key_id);
-    const enc_frame = try w.wire.encryptFrame(a, 2, "message encryption", kid, .{ .other = to }, plain);
-    const ciphertext = try w.wire.resultPayload(try VmOracle.call(&VmOracle.dummy, a, enc_frame));
-    const content = try std.mem.concat(a, u8, &.{ &.{ 0x42, 0x42, 0x10, 0x33 }, &me, &to, &key_id, ciphertext });
-    try env.appendSlice(a, &.{
-        .{ .key = "content", .value = .{ .bytes = content } },
-        .{ .key = "signature", .value = .{ .bytes = sig } },
-    });
-    const emit_cid = try s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = "emit" } },
+    const plain = try s.get(a, bc);
+    const progs = step.get("programs") orelse return false;
+    const mb = switch (progs.get("messagebox") orelse return false) {
+        .cid => |x| x,
+        else => return false,
+    };
+    const arg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "to", .value = .{ .bytes = try a.dupe(u8, &to) } },
         .{ .key = "box", .value = .{ .text = box } },
-        .{ .key = "body", .value = .{ .cid = bc } },
-        .{ .key = "envelope", .value = .{ .map = env.items } },
+        .{ .key = "body", .value = .{ .bytes = plain } },
     }) });
-    _ = try result(a, sk.emit, .{ emit_cid.ptr, @as(u32, @intCast(emit_cid.len)) });
+    _ = result(a, sk.call, .{ mb.ptr, @as(u32, @intCast(mb.len)), "send".ptr, @as(u32, 4), arg.ptr, @as(u32, @intCast(arg.len)) }) catch |err| {
+        if (err != error.ImportFailed) return err;
+        var buf: [1200]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "wallet: {s} to {s}: {s}\n", .{ box, std.fmt.bytesToHex(to, .lower)[58..], last_error[0..last_error_len] }) catch "wallet: send failed\n";
+        std.fs.File.stderr().writeAll(line) catch {};
+        return false;
+    };
+    return true;
 }
 
 const ArcAnswer = struct {

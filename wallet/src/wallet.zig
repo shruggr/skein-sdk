@@ -876,6 +876,14 @@ pub const Wallet = struct {
         return try self.atomicBeef(txid, raw, try bsvz.transaction.Transaction.parse(self.arena, raw));
     }
 
+    /// One BEEF (V2, not atomic) of several transactions we hold, with their
+    /// ancestry back to proven ones: an aggregated lookup answer's (#40).
+    pub fn beefOfMany(self: *Wallet, txids: []const [32]u8) ![]const u8 {
+        var acc = BeefAcc{ .w = self };
+        for (txids) |t| try acc.visit(t);
+        return beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .bumps = acc.bumps.items, .entries = acc.entries.items });
+    }
+
     const BeefAcc = struct {
         w: *Wallet,
         entries: std.ArrayList(beef_mod.Entry) = .empty,

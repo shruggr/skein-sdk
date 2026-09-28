@@ -35,9 +35,18 @@ Fuel is also **not** the same across the two ABIs, and that is accepted:
 the adapter and the canonical-ABI glue are instructions too. Every other
 field of an update is the same.
 
-The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `emit`,
-`await`, `resolve`, `head`, `advance`, `subscribe`, `wallet`, `http` and
-`deadline`.
+The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `await`,
+`head`, `advance`, `subscribe`, `wallet`, `http`, `deadline` and `call`.
+`emit` and `resolve` are gone (#40): an instance delivers a message itself,
+its messagebox program's `send` over `http`, and looks a handle up with its
+`resolve` program; both are reached through `call`.
+
+- **`call`** (#40) runs a program record as a function: its entry, with
+  `input()` = `{kind: "call", fn, arg, …}`, and returns what it wrote to
+  stdout (a non-zero exit is the error: its last stderr line). From a step,
+  the callee is part of the step: its recorded calls, records and head moves
+  are the step's. From the kernel's own `call` (a request to the front door,
+  a read), it only reads. Calls nest to depth 8.
 
 - **`http`** is the preview1 shape: a dag-cbor request in, a dag-cbor
   response out. It stays for preview1 programs (and in the interface, which

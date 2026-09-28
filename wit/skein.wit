@@ -43,21 +43,12 @@ interface skein {
   /// its origin CID.
   launch: func(program: cid, args: cid) -> result<cid, string>;
 
-  /// An outbound message: an emit record carrying the complete envelope,
-  /// signed and encrypted by the program through `wallet`; checked, not
-  /// attested; its signed part's record CID. Handed on when the step ends.
-  emit: func(cid: cid) -> result<cid, string>;
-
-  /// Rest on a reply to an envelope this step emitted (the step ends
-  /// `waiting` with `awaits`; an admitted envelope whose body's `replyTo` is
-  /// that CID is the thread's next input), or on a record in the store: the
-  /// subject of a plain entry to come (#29).
+  /// Rest on a record in the store (the step ends `waiting` with `awaits`):
+  /// a message this step sent (#40: the record the messagebox's `send` put —
+  /// an admitted message whose body's `replyTo` names it, from the identity it
+  /// was sent to, is the thread's next input), or the subject of a plain entry
+  /// to come (#29).
   await: func(cid: cid) -> result<_, string>;
-
-  /// A handle "handle@domain" → the resolver's whole answer (dag-cbor
-  /// {identityKey, …}). Attested: the host's resolver answers, the answer is
-  /// recorded; replay reads the record.
-  resolve: func(name: string) -> result<list<u8>, string>;
 
   /// The tree CID a named head points at; none if it has none (preview1:
   /// n = 0). docs/VM.md "Heads".
@@ -85,6 +76,13 @@ interface skein {
   /// If this step ends waiting, rest no later than `until-ms` (ms since the
   /// epoch, after the step's time): a wake entry then steps the thread (#29).
   deadline: func(until-ms: s64) -> result<_, string>;
+
+  /// An in-VM call (#40): run `program` (a program record) as a function —
+  /// its entry, with `input()` = {kind: "call", fn, arg, …} — and return what
+  /// it wrote to stdout (a non-zero exit is the error, its last stderr line).
+  /// From a step, the callee is part of the step (its recorded calls, records
+  /// and head moves are the step's); from the kernel's `call`, it only reads.
+  call: func(program: cid, fn: string, arg: list<u8>) -> result<list<u8>, string>;
 }
 
 /// What a handler program imports beyond WASI's command world: skein's calls
