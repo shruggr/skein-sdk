@@ -30,6 +30,7 @@ const brc29 = @import("brc29.zig");
 const chain_mod = @import("chain.zig");
 const store_mod = @import("store.zig");
 const builder = @import("builder.zig");
+const overlay = @import("overlay.zig");
 
 const Store = store_mod.Store;
 const Map = store_mod.Map;
@@ -62,7 +63,15 @@ pub const Oracle = struct {
 ///   drafts    draft CID → null | settlement record          signable drafts (rejected with an input)
 ///   watchers  identity key (33 bytes) → null                who is sent settlement changes (the `settlement` box)
 ///   bySettlement  0|1|2 ‖ txid → null                       derived: every transaction we hold, by status
-pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "byStatus", "spenders", "dependents", "rejected", "proofHeights", "drafts", "watchers", "bySettlement" };
+/// The overlay's (#36, overlay.zig), in the same state record: one chain and
+/// one settlement for a wallet and an overlay in one instance.
+///   admitted  len ‖ topic ‖ outpoint → admittance record      outputs admitted into a topic
+///   consumed  len ‖ topic ‖ outpoint ‖ spending txid → retained (bool)   admitted outputs a later admitted tx spends
+///   applied   len ‖ topic ‖ txid → applied record             transactions a topic judged (dupes)
+///   spentAdmitted  len ‖ topic ‖ outpoint → spender ‖ retained   derived: consumed by a tx that is not rejected
+///   byTopic   len ‖ topic ‖ 0|1 ‖ outpoint → null             derived: 0 unspent, 1 spent
+///   byScript  sha256(script) ‖ len ‖ topic ‖ 0|1 ‖ outpoint → null   derived: by locking script hash
+pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "byStatus", "spenders", "dependents", "rejected", "proofHeights", "drafts", "watchers", "bySettlement", "admitted", "consumed", "applied", "spentAdmitted", "byTopic", "byScript" };
 
 pub const Status = enum { proven, unproven, rejected };
 
@@ -88,8 +97,9 @@ pub const Rel = enum {
 
 /// What a dependent is, in a `dependents` key: a transaction (id = its
 /// txid), our action (txid), an output record (outpoint), a draft (its CID),
-/// or any other record (its CID).
-pub const Tag = enum(u8) { tx = 't', action = 'a', output = 'o', draft = 'd', record = 'r' };
+/// an overlay's admitted output (its `admitted` key) or judgement (its
+/// `applied` key, #36), or any other record (its CID).
+pub const Tag = enum(u8) { tx = 't', action = 'a', output = 'o', draft = 'd', record = 'r', admitted = 'm', applied = 'p' };
 
 /// One settlement change in a step (what the `settlement` box is sent).
 pub const Change = struct { txid: [32]u8, status: Status, reason: []const u8, cause: ?[32]u8 = null };
@@ -266,7 +276,7 @@ pub const Wallet = struct {
         return out;
     }
 
-    fn putProof(self: *Wallet, txid: [32]u8, height: u32, path: []const u8) !void {
+    pub fn putProof(self: *Wallet, txid: [32]u8, height: u32, path: []const u8) !void {
         const key = hdr.toHex(txid);
         const cid = try self.store.putValue(self.arena, .{ .map = &.{
             .{ .key = "kind", .value = .{ .text = "proof" } },
@@ -306,7 +316,7 @@ pub const Wallet = struct {
         return try self.record(c);
     }
 
-    fn minedStatus(self: *Wallet, txid: [32]u8) !Status {
+    pub fn minedStatus(self: *Wallet, txid: [32]u8) !Status {
         const path = (try self.proofPath(txid)) orelse return .unproven;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return .unproven;
         const root = beef_mod.rootFor(self.arena, p, txid) orelse return .unproven;
@@ -351,6 +361,7 @@ pub const Wallet = struct {
         self.map("byBasket").root = by_basket.root;
         self.map("byStatus").root = by_status.root;
         self.map("bySettlement").root = by_settlement.root;
+        try overlay.rebuildDerived(self);
     }
 
     // ------------------------------------------------------------ settlement
@@ -398,6 +409,9 @@ pub const Wallet = struct {
                     .tx => if (d.id.len == 32) try queue.append(a, d.id[0..32].*),
                     .output => _ = try self.map("outputs").remove(d.id),
                     .draft => try self.map("drafts").putLink(d.id, rec),
+                    // An overlay's admittance and judgement vanish with it (#36); what it consumed is freed at save.
+                    .admitted => _ = try self.map("admitted").remove(d.id),
+                    .applied => _ = try self.map("applied").remove(d.id),
                     .action, .record => {}, // an action's status is computed; a record is only reported
                 }
             }
@@ -423,7 +437,7 @@ pub const Wallet = struct {
 
     /// A transaction that spends an output a proven transaction of ours
     /// already spends is dead on arrival: rejected.
-    fn rejectIfConflicted(self: *Wallet, txid: [32]u8) !bool {
+    pub fn rejectIfConflicted(self: *Wallet, txid: [32]u8) !bool {
         const raw = (try self.txRaw(txid)) orelse return false;
         const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
         for (tx.inputs) |in| {
@@ -506,13 +520,13 @@ pub const Wallet = struct {
         return .proven;
     }
 
-    const SpvCtx = struct {
+    pub const SpvCtx = struct {
         w: *Wallet,
-        fn rootAt(ptr: *anyopaque, height: u32) anyerror!?[32]u8 {
+        pub fn rootAt(ptr: *anyopaque, height: u32) anyerror!?[32]u8 {
             const self: *SpvCtx = @ptrCast(@alignCast(ptr));
             return self.w.chain().rootAt(height);
         }
-        fn knownRaw(ptr: *anyopaque, arena: std.mem.Allocator, txid: [32]u8) anyerror!?[]const u8 {
+        pub fn knownRaw(ptr: *anyopaque, arena: std.mem.Allocator, txid: [32]u8) anyerror!?[]const u8 {
             _ = arena;
             const self: *SpvCtx = @ptrCast(@alignCast(ptr));
             return self.w.txRaw(txid);
