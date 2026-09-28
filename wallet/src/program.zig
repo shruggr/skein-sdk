@@ -35,7 +35,10 @@ const Value = cbor.Value;
 
 /// The skein calls: the preview1 `skein` imports, or (the component build, issue
 /// #34) the same calls over the WIT interface skein:kernel/skein (skein_wit.zig).
-const sk = if (@import("build_options").component) @import("skein_wit.zig") else struct {
+const component = @import("build_options").component;
+/// Outgoing HTTP in the component build (#15): standard wasi:http.
+const wasi_http = if (component) @import("wasi_http.zig") else struct {};
+const sk = if (component) @import("skein_wit.zig") else struct {
     extern "skein" fn input(out: [*]u8, cap: u32) i32;
     extern "skein" fn get(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn put(data: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
@@ -436,10 +439,16 @@ const ArcAnswer = struct {
     }
 };
 
+/// One call to ARC's API: over the `http` import in the preview1 build (this
+/// function as it was before #15, so the pinned module is unchanged), over
+/// standard wasi:http in the component build (wasiArcCall, #15), which the
+/// kernel serializes into the very same recorded request.
+const arcCall = if (component) wasiArcCall else p1ArcCall;
+
 /// One call to ARC's API over the `http` import (attested: request and
 /// response are recorded, so replay never touches the network). A 4xx is a
 /// rejection unless ARC names a status; anything else unanswered stays pending.
-fn arcCall(a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8) !ArcAnswer {
+fn p1ArcCall(a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8) !ArcAnswer {
     var req: std.ArrayList(cbor.Entry) = .empty;
     try req.appendSlice(a, &.{
         .{ .key = "method", .value = .{ .text = method } },
@@ -455,6 +464,42 @@ fn arcCall(a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]c
     const res = try cbor.decode(a, res_bytes);
     const status = res.getUint("status") orelse return error.BadHttpResponse;
     const text = res.getBytes("body") orelse "";
+    var ans = ArcAnswer{ .http_status = status, .tx_status = "", .merkle_path = null, .extra = "" };
+    if (std.json.parseFromSliceLeaky(std.json.Value, a, text, .{})) |j| {
+        if (j == .object) {
+            if (j.object.get("txStatus")) |t| if (t == .string) {
+                ans.tx_status = t.string;
+            };
+            if (j.object.get("extraInfo")) |t| if (t == .string) {
+                ans.extra = t.string;
+            };
+            if (j.object.get("merklePath")) |t| if (t == .string and t.string.len > 0) {
+                const p = try a.alloc(u8, t.string.len / 2);
+                _ = std.fmt.hexToBytes(p, t.string) catch return error.BadHttpResponse;
+                ans.merkle_path = p;
+            };
+        }
+    } else |_| {}
+    if (ans.tx_status.len == 0 and status >= 400 and status < 500) ans.tx_status = "REJECTED";
+    return ans;
+}
+
+/// The same call over wasi:http (the component build): the same method, URL,
+/// headers and body, so the kernel records the same request; the same reading
+/// of the answer as p1ArcCall's.
+fn wasiArcCall(a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8) !ArcAnswer {
+    const headers: []const wasi_http.Header = if (body != null) &.{
+        .{ .name = "Content-Type", .value = "application/octet-stream" },
+        .{ .name = "Accept", .value = "application/json" },
+    } else &.{.{ .name = "Accept", .value = "application/json" }};
+    const r = wasi_http.request(a, method, url, headers, body) catch |e| {
+        const n = @min(wasi_http.last_error.len, last_error.len);
+        @memcpy(last_error[0..n], wasi_http.last_error[0..n]);
+        last_error_len = n;
+        return e;
+    };
+    const status: u64 = r.status;
+    const text = r.body;
     var ans = ArcAnswer{ .http_status = status, .tx_status = "", .merkle_path = null, .extra = "" };
     if (std.json.parseFromSliceLeaky(std.json.Value, a, text, .{})) |j| {
         if (j == .object) {
