@@ -19,14 +19,25 @@
 //!   {op: "createAction", description, outputs, labels?, options?: {signAndProcess?, noSend?}}   BRC-100 createAction
 //!   {op: "signAction", reference}                BRC-100 signAction for a draft (signAndProcess: false)
 //!   {op: "list", basket?, includeSpent?}        our outputs in a basket (default "default")
+//!   {op: "watch", settlement?: bool}            the sender opts in (default) or out of settlement messages
 //!
 //! Plain entries (docs/WALLET.md): {kind: "header", raw}, {kind: "proof",
 //! subject, txid, path}, {kind: "status", subject, txid, txStatus, merklePath?}.
 //!
-//! Attested calls: the oracle over the `wallet` import (getPublicKey,
-//! createSignature: no key is ever here), and `http` (ARC: broadcast, status
-//! re-query). After a broadcast the thread awaits its transaction's CID with
-//! a deadline; a `status`/`proof` entry for it, or the deadline, steps it.
+//! Recorded calls: the oracle over the `wallet` import (getPublicKey,
+//! createSignature, encrypt: no key is ever here), and `http` (ARC:
+//! broadcast, status re-query). After a broadcast the thread awaits its
+//! transaction's CID with a deadline; a `status`/`proof` entry for it, or
+//! the deadline, steps it. A transaction never mined within
+//! defaults.walletAbandonMs of its broadcast is abandoned (rejected); a reorg
+//! that turns ours back to unproven broadcasts them again and awaits them.
+//!
+//! Settlement (#37): every change of a transaction of ours (proven,
+//! unproven after a reorg, rejected — with what the rejection bubbled to) is
+//! sent as a `{kind: "settlement", txid, status, reason, cause?}` message to
+//! each identity that opted in (`watch`), in its `settlement` box. A
+//! result record names the transactions it is about as `refs` with rel
+//! `mentions` (kernel edges; a mention never propagates a rejection).
 const std = @import("std");
 const w = @import("wallet");
 
@@ -45,6 +56,7 @@ const sk = struct {
     extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn deadline(until: i64) i32;
     extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
+    extern "skein" fn emit(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn take(out: [*]u8, cap: u32) i32;
     extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
 };
@@ -172,9 +184,10 @@ fn run(a: std.mem.Allocator) !void {
     const defaults = step.get("defaults");
     const arc_url: ?[]const u8 = if (defaults) |d| d.getText("walletArc") else null;
     const recheck_ms: i64 = if (defaults) |d| std.fmt.parseInt(i64, d.getText("walletRecheckMs") orelse "600000", 10) catch return error.BadConfig else 600000;
+    const abandon_ms: i64 = if (defaults) |d| std.fmt.parseInt(i64, d.getText("walletAbandonMs") orelse "86400000", 10) catch return error.BadConfig else 86400000;
     const now: i64 = @intCast(step.getUint("at") orelse return error.BadInput);
-    // After the step: await this transaction (its CID) until the deadline.
-    var await_tx: ?[32]u8 = null;
+    // After the step: await these transactions (their CIDs) until the deadline.
+    var await_txs: std.ArrayList([32]u8) = .empty;
 
     // The network (its genesis header anchors the chain): genesis defaults.walletNetwork, else mainnet.
     const net_name = if (step.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
@@ -187,6 +200,7 @@ fn run(a: std.mem.Allocator) !void {
     const fee_rate = std.fmt.parseInt(u64, rate_text, 10) catch return error.BadConfig;
     const state_cid = try result(a, sk.head, .{ head_name.ptr, @as(u32, head_name.len) });
     var wal = try w.wallet.Wallet.load(a, s, if (state_cid.len > 0) state_cid else null, network);
+    wal.now = now;
 
     var out: std.ArrayList(cbor.Entry) = .empty;
     try out.appendSlice(a, &.{
@@ -201,6 +215,7 @@ fn run(a: std.mem.Allocator) !void {
         const raws = try a.alloc([]const u8, list.array.len);
         for (list.array, raws) |x, *r| r.* = if (x == .bytes) x.bytes else return error.BadBody;
         const res = try wal.addHeaders(raws);
+        try rebroadcast(a, &wal, arc_url, &await_txs, &out);
         try out.appendSlice(a, &.{
             .{ .key = "added", .value = .{ .uint = res.added } },
             .{ .key = "known", .value = .{ .uint = res.known } },
@@ -262,6 +277,7 @@ fn run(a: std.mem.Allocator) !void {
         try out.append(a, .{ .key = "event", .value = .{ .text = kind } });
         if (std.mem.eql(u8, kind, "header")) {
             const res = try wal.addHeaders(&.{body.getBytes("raw") orelse return error.BadEvent});
+            try rebroadcast(a, &wal, arc_url, &await_txs, &out);
             try out.appendSlice(a, &.{
                 .{ .key = "added", .value = .{ .uint = res.added } },
                 .{ .key = "known", .value = .{ .uint = res.known } },
@@ -278,25 +294,40 @@ fn run(a: std.mem.Allocator) !void {
             });
         } else return error.BadEvent;
     } else if (std.mem.eql(u8, op, "callback")) {
-        // A transaction we broadcast: its status entry, or its deadline (re-ask ARC).
-        const txid = if (callback != null) try eventTxid(body) else try txidFromTip(a, s, step);
+        // Transactions we broadcast: a status entry for one of them, or the
+        // deadline (each still awaited is abandoned if due, else ARC is asked again).
+        var awaited = try awaitedFromTip(a, s, step);
+        var txid: [32]u8 = undefined;
         var outcome: w.wallet.Wallet.Outcome = .pending;
         if (callback != null) {
+            txid = try eventTxid(body);
             const kind = body.getText("kind") orelse return error.BadEvent;
             outcome = try applyEvent(&wal, txid, kind, body);
             try out.append(a, .{ .key = "event", .value = .{ .text = kind } });
-        } else if (try wal.awaitingRecord(txid)) |r| {
-            const arc = r.getText("arc") orelse return error.BadRecord;
-            const url = try std.fmt.allocPrint(a, "{s}/v1/tx/{s}", .{ arc, w.header.toHex(txid) });
-            const ans = try arcCall(a, "GET", url, null);
-            outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
-            try out.append(a, .{ .key = "arc", .value = try ans.value(a) });
-        } else outcome = if ((try wal.status(txid)) == .proven) .proven else .rejected;
+            if (!contains(awaited.items, txid)) try awaited.insert(a, 0, txid);
+        } else {
+            if (awaited.items.len == 0) return error.BadInput;
+            txid = awaited.items[0];
+            for (awaited.items) |t| {
+                const r = (try wal.awaitingRecord(t)) orelse continue;
+                if (try wal.abandonIfDue(t, abandon_ms)) continue;
+                const arc = r.getText("arc") orelse return error.BadRecord;
+                const url = try std.fmt.allocPrint(a, "{s}/v1/tx/{s}", .{ arc, w.header.toHex(t) });
+                const ans = try arcCall(a, "GET", url, null);
+                _ = try wal.applyStatus(t, ans.tx_status, ans.merkle_path);
+                if (std.mem.eql(u8, &t, &txid)) try out.append(a, .{ .key = "arc", .value = try ans.value(a) });
+            }
+            outcome = switch (try wal.status(txid)) {
+                .proven => .proven,
+                .rejected => .rejected,
+                .unproven => .pending,
+            };
+        }
         try out.appendSlice(a, &.{
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(txid)) } },
             .{ .key = "outcome", .value = .{ .text = @tagName(outcome) } },
         });
-        if (outcome == .pending) await_tx = txid;
+        for (awaited.items) |t| if ((try wal.awaitingRecord(t)) != null) try await_txs.append(a, t);
     } else if (std.mem.eql(u8, op, "createAction") or std.mem.eql(u8, op, "signAction")) {
         var ws = w.builder.WireSigner{ .ctx = &VmOracle.dummy, .call = VmOracle.call };
         const created = if (std.mem.eql(u8, op, "createAction")) blk: {
@@ -331,7 +362,7 @@ fn run(a: std.mem.Allocator) !void {
                 .{ .key = "arc", .value = try ans.value(a) },
                 .{ .key = "outcome", .value = .{ .text = @tagName(outcome) } },
             });
-            if (outcome == .pending) await_tx = created.txid;
+            if (outcome == .pending) try await_txs.append(a, created.txid);
         };
     } else if (std.mem.eql(u8, op, "list")) {
         mutates = false;
@@ -355,6 +386,13 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "outputs", .value = .{ .array = items } },
             .{ .key = "total", .value = .{ .uint = total } },
         });
+    } else if (std.mem.eql(u8, op, "watch")) {
+        // The sender opts in (or out) of settlement messages in its `settlement` box.
+        const sender = args.getBytes("sender") orelse return error.BadBody;
+        if (sender.len != 33) return error.BadBody;
+        const on = body.getBool("settlement") orelse true;
+        try wal.watch(sender[0..33].*, on);
+        try out.append(a, .{ .key = "settlement", .value = .{ .boolean = on } });
     } else {
         std.log.err("unknown op {s}", .{op});
         return error.BadBody;
@@ -367,15 +405,46 @@ fn run(a: std.mem.Allocator) !void {
     } else if (state_cid.len > 0) {
         try out.append(a, .{ .key = "state", .value = .{ .cid = state_cid } });
     }
-    if (await_tx) |t| {
-        // Rest until a `status` / `proof` entry for this transaction (its CID is its txid), or the deadline.
-        const subject = w.store.bitcoinCid(.tx, (try wal.txRaw(t)) orelse return error.BadRecord);
-        if (sk.@"await"(&subject, subject.len) < 0) return failed();
+    if (await_txs.items.len > 0) {
+        // Rest until a `status` / `proof` entry for one of these transactions (a CID is its txid), or the deadline.
+        const hexes = try a.alloc(Value, await_txs.items.len);
+        for (await_txs.items, hexes) |t, *h| {
+            const subject = txCid(t);
+            if (sk.@"await"(&subject, subject.len) < 0) return failed();
+            h.* = .{ .text = try a.dupe(u8, &w.header.toHex(t)) };
+        }
         if (sk.deadline(now + recheck_ms) < 0) return failed();
         try out.appendSlice(a, &.{
-            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(t)) } },
+            .{ .key = "txid", .value = hexes[0] },
+            .{ .key = "awaited", .value = .{ .array = hexes } },
             .{ .key = "awaiting", .value = .{ .boolean = true } },
         });
+    }
+    // Settlement changes: in the result, and to each watcher's `settlement` box.
+    if (wal.changes.items.len > 0) {
+        const items = try a.alloc(Value, wal.changes.items.len);
+        for (wal.changes.items, items) |c, *it| it.* = try settlementBody(a, c);
+        try out.append(a, .{ .key = "settlement", .value = .{ .array = items } });
+        const watchers = try wal.watchers();
+        for (watchers) |to| for (items) |it| try sealAndEmit(a, s, step, to, "settlement", it);
+        if (watchers.len > 0) try out.append(a, .{ .key = "sent", .value = .{ .uint = watchers.len * items.len } });
+    }
+    // The transactions this result is about, as `mentions` (kernel edges from the thread).
+    {
+        var named: std.ArrayList([32]u8) = .empty;
+        for (out.items) |e| if (std.mem.eql(u8, e.key, "txid") and e.value == .text) {
+            const t = w.header.fromHex(e.value.text) catch continue;
+            if (!contains(named.items, t)) try named.append(a, t);
+        };
+        for (wal.changes.items) |c| if (!contains(named.items, c.txid)) try named.append(a, c.txid);
+        if (named.items.len > 0) {
+            const refs = try a.alloc(Value, named.items.len);
+            for (named.items, refs) |t, *r| r.* = .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "to", .value = .{ .cid = try a.dupe(u8, &txCid(t)) } },
+                .{ .key = "rel", .value = .{ .text = "mentions" } },
+            }) };
+            try out.append(a, .{ .key = "refs", .value = .{ .array = refs } });
+        }
     }
     const res_cid = try s.putValue(a, .{ .map = try dedupe(a, out.items) });
     if (sk.keep(res_cid.ptr, @intCast(res_cid.len)) < 0) return failed();
@@ -407,13 +476,135 @@ fn applyEvent(wal: *w.wallet.Wallet, txid: [32]u8, kind: []const u8, ev: Value) 
     return error.BadEvent;
 }
 
-/// The txid the thread awaits: in the result its last step kept.
-fn txidFromTip(a: std.mem.Allocator, s: w.store.Store, step: Value) ![32]u8 {
-    const tip = try s.getValue(a, step.getCid("tip") orelse return error.BadInput);
-    const kept = tip.getArray("kept") orelse return error.BadInput;
-    if (kept.len == 0 or kept[kept.len - 1] != .cid) return error.BadInput;
+/// The txids the thread awaits: in the result its last step kept (`awaited`, else its `txid`).
+fn awaitedFromTip(a: std.mem.Allocator, s: w.store.Store, step: Value) !std.ArrayList([32]u8) {
+    var out: std.ArrayList([32]u8) = .empty;
+    const tip = try s.getValue(a, step.getCid("tip") orelse return out);
+    const kept = tip.getArray("kept") orelse return out;
+    if (kept.len == 0 or kept[kept.len - 1] != .cid) return out;
     const res = try s.getValue(a, kept[kept.len - 1].cid);
-    return w.header.fromHex(res.getText("txid") orelse return error.BadInput);
+    if (res.getArray("awaited")) |xs| {
+        for (xs) |x| if (x == .text) try out.append(a, try w.header.fromHex(x.text));
+    } else if (res.getText("txid")) |t| try out.append(a, try w.header.fromHex(t));
+    return out;
+}
+
+fn contains(xs: []const [32]u8, t: [32]u8) bool {
+    for (xs) |x| if (std.mem.eql(u8, &x, &t)) return true;
+    return false;
+}
+
+/// A transaction's CID: bitcoin-tx (0xb1), dbl-sha2-256, the txid.
+fn txCid(txid: [32]u8) [37]u8 {
+    return .{ 0x01, 0xb1, 0x01, 0x56, 0x20 } ++ txid;
+}
+
+/// After a reorg: our transactions turned back to unproven are broadcast
+/// again (as after createAction) and awaited.
+fn rebroadcast(a: std.mem.Allocator, wal: *w.wallet.Wallet, arc_url: ?[]const u8, await_txs: *std.ArrayList([32]u8), out: *std.ArrayList(cbor.Entry)) !void {
+    if (wal.reverted.items.len == 0) return;
+    const hexes = try a.alloc(Value, wal.reverted.items.len);
+    for (wal.reverted.items, hexes) |t, *h| h.* = .{ .text = try a.dupe(u8, &w.header.toHex(t)) };
+    try out.append(a, .{ .key = "reverted", .value = .{ .array = hexes } });
+    const arc = arc_url orelse return;
+    for (wal.reverted.items) |t| {
+        const beef = (try wal.beefOf(t)) orelse continue;
+        try wal.noteBroadcast(t, arc, "");
+        const ans = try arcCall(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), beef);
+        if ((try wal.applyStatus(t, ans.tx_status, ans.merkle_path)) == .pending and !contains(await_txs.items, t)) try await_txs.append(a, t);
+    }
+}
+
+/// What the `settlement` box is sent: {kind: "settlement", txid, status, reason, cause?}.
+fn settlementBody(a: std.mem.Allocator, c: w.wallet.Change) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "settlement" } },
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(c.txid)) } },
+        .{ .key = "status", .value = .{ .text = @tagName(c.status) } },
+        .{ .key = "reason", .value = .{ .text = c.reason } },
+    });
+    if (c.cause) |x| try es.append(a, .{ .key = "cause", .value = .{ .text = try a.dupe(u8, &w.header.toHex(x)) } });
+    return .{ .map = es.items };
+}
+
+var identity_key: ?[33]u8 = null;
+
+/// This instance's identity key, from the oracle (once per step).
+fn identity(a: std.mem.Allocator) ![33]u8 {
+    if (identity_key) |k| return k;
+    const frame = try w.wire.identityKeyFrame(a);
+    const res = try result(a, sk.wallet, .{ frame.ptr, @as(u32, @intCast(frame.len)) });
+    identity_key = try w.wire.publicKeyResult(res);
+    return identity_key.?;
+}
+
+/// ISO 8601 of a time in ms since the epoch (as JavaScript's toISOString).
+fn isoTime(a: std.mem.Allocator, ms: i64) ![]u8 {
+    const secs: u64 = @intCast(@divFloor(ms, 1000));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{ yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(), @as(u64, @intCast(@mod(ms, 1000))) });
+}
+
+/// Send `body` to identity `to` in `box`: a BRC-169 envelope in the §7.3
+/// (dag-cbor, BRC-231) form, sealed here through the oracle — signed under
+/// [2, "metanet handles envelope"], key "1", anyone, over the dag-cbor of the
+/// envelope without content and signature; the content BRC-78 to `to` under
+/// [2, "message encryption"] with a key id from the step's random — then
+/// emitted (src/envelope-cbor.ts sealCbor, programs/envelope).
+fn sealAndEmit(a: std.mem.Allocator, s: w.store.Store, step: Value, to: [33]u8, box: []const u8, body: Value) !void {
+    const bc = try s.putValue(a, body);
+    const plain = try s.get(a, bc); // the body as stored: what the recipient hashes
+    var content_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(plain, &content_hash, .{});
+    const me = try identity(a);
+    const self = step.get("self");
+    const to_hex = std.fmt.bytesToHex(to, .lower);
+    const domain = if (self) |x| x.getText("domain") orelse "localhost" else "localhost";
+    var sender: std.ArrayList(cbor.Entry) = .empty;
+    try sender.append(a, .{ .key = "identityKey", .value = .{ .bytes = try a.dupe(u8, &me) } });
+    if (self) |x| if (x.getText("handle")) |h| try sender.append(a, .{ .key = "handle", .value = .{ .text = h } });
+    if (self) |x| if (x.getText("domain")) |d| try sender.append(a, .{ .key = "domain", .value = .{ .text = d } });
+    const at: i64 = @intCast(step.getUint("at") orelse return error.BadInput);
+    var env: std.ArrayList(cbor.Entry) = .empty;
+    try env.appendSlice(a, &.{
+        .{ .key = "metanetHandles", .value = .{ .text = "1.0" } },
+        .{ .key = "recipient", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "handle", .value = .{ .text = try a.dupe(u8, to_hex[0..16]) } },
+            .{ .key = "domain", .value = .{ .text = domain } },
+        }) } },
+        .{ .key = "sender", .value = .{ .map = sender.items } },
+        .{ .key = "created", .value = .{ .text = try isoTime(a, at) } },
+        .{ .key = "contentHash", .value = .{ .bytes = try a.dupe(u8, &content_hash) } },
+    });
+    const pre = try cbor.encode(a, .{ .map = env.items });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(pre, &digest, .{});
+    const sig_frame = try w.wire.createSignatureFrame(a, 2, "metanet handles envelope", "1", .anyone, digest);
+    const sig = try w.wire.signatureResult(try VmOracle.call(&VmOracle.dummy, a, sig_frame));
+    var key_id: [32]u8 = undefined;
+    std.crypto.random.bytes(&key_id);
+    const enc = std.base64.standard.Encoder;
+    const kid = try a.alloc(u8, enc.calcSize(32));
+    _ = enc.encode(kid, &key_id);
+    const enc_frame = try w.wire.encryptFrame(a, 2, "message encryption", kid, .{ .other = to }, plain);
+    const ciphertext = try w.wire.resultPayload(try VmOracle.call(&VmOracle.dummy, a, enc_frame));
+    const content = try std.mem.concat(a, u8, &.{ &.{ 0x42, 0x42, 0x10, 0x33 }, &me, &to, &key_id, ciphertext });
+    try env.appendSlice(a, &.{
+        .{ .key = "content", .value = .{ .bytes = content } },
+        .{ .key = "signature", .value = .{ .bytes = sig } },
+    });
+    const emit_cid = try s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "emit" } },
+        .{ .key = "to", .value = .{ .bytes = try a.dupe(u8, &to) } },
+        .{ .key = "box", .value = .{ .text = box } },
+        .{ .key = "body", .value = .{ .cid = bc } },
+        .{ .key = "envelope", .value = .{ .map = env.items } },
+    }) });
+    _ = try result(a, sk.emit, .{ emit_cid.ptr, @as(u32, @intCast(emit_cid.len)) });
 }
 
 const ArcAnswer = struct {

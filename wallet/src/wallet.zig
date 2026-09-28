@@ -856,6 +856,12 @@ pub const Wallet = struct {
         return beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .atomic = txid, .bumps = acc.bumps.items, .entries = acc.entries.items });
     }
 
+    /// The Atomic BEEF of a transaction we hold, or null.
+    pub fn beefOf(self: *Wallet, txid: [32]u8) !?[]const u8 {
+        const raw = (try self.txRaw(txid)) orelse return null;
+        return try self.atomicBeef(txid, raw, try bsvz.transaction.Transaction.parse(self.arena, raw));
+    }
+
     const BeefAcc = struct {
         w: *Wallet,
         entries: std.ArrayList(beef_mod.Entry) = .empty,
