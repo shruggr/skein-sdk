@@ -33,7 +33,9 @@ const w = @import("wallet");
 const cbor = w.cbor;
 const Value = cbor.Value;
 
-const sk = struct {
+/// The skein calls: the preview1 `skein` imports, or (the component build, issue
+/// #34) the same calls over the WIT interface skein:kernel/skein (skein_wit.zig).
+const sk = if (@import("build_options").component) @import("skein_wit.zig") else struct {
     extern "skein" fn input(out: [*]u8, cap: u32) i32;
     extern "skein" fn get(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn put(data: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
