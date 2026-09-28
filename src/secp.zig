@@ -114,6 +114,22 @@ pub fn verifyAnyone(identity_hex: []const u8, level: u8, name: []const u8, key_i
     return verify(child, data, der);
 }
 
+/// verifyAnyone with the identity key as its 33 bytes (format 2 records, #33).
+pub fn verifyAnyoneKey(key: []const u8, level: u8, name: []const u8, key_id: []const u8, data: []const u8, der: []const u8) bool {
+    if (!isKey(key)) return false;
+    var inv_buf: [256]u8 = undefined;
+    const invoice = std.fmt.bufPrint(&inv_buf, "{d}-{s}-{s}", .{ level, name, key_id }) catch return false;
+    var kb: [33]u8 = undefined;
+    @memcpy(&kb, key[0..33]);
+    const child = anyoneKey(&kb, invoice) catch return false;
+    return verify(child, data, der);
+}
+
+/// A compressed secp256k1 key as bytes: 33 bytes, 0x02 or 0x03 first (format 2 records, #33).
+pub fn isKey(b: []const u8) bool {
+    return b.len == 33 and (b[0] == 2 or b[0] == 3);
+}
+
 /// A compressed secp256k1 key in hex (records.ts isIdentity: /^0[23][0-9a-f]{64}$/).
 pub fn isIdentity(s: []const u8) bool {
     if (s.len != 66 or s[0] != '0' or (s[1] != '2' and s[1] != '3')) return false;

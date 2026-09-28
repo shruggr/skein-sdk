@@ -25,6 +25,16 @@ The interface has the same calls, with the same behaviour, as the preview1
 | `head` → n = 0 when there is no head | `result<option<cid>, string>` |
 | `subscribe(…, sender, sender_len = 0, …)` for any sender | `sender: option<string>` |
 
+Two differences from preview1 were accepted on #34 (David, 2026-09-28):
+
+- `take` and `error` are **not** in the WIT. They exist only for preview1's
+  caller-supplied buffers, and the canonical ABI makes those unnecessary.
+- `head` returns `option<cid>`.
+
+Fuel is also **not** the same across the two ABIs, and that is accepted:
+the adapter and the canonical-ABI glue are instructions too. Every other
+field of an update is the same.
+
 The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `emit`,
 `await`, `resolve`, `head`, `advance`, `subscribe`, `wallet`, `http` and
 `deadline`.
