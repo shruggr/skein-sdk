@@ -133,6 +133,16 @@ pub fn @"await"(p: [*]const u8, n: u32) i32 {
     return 0;
 }
 
+/// An outbound message (#37: settlement messages): the emit record's CID →
+/// its envelope's signed-part CID.
+pub fn emit(p: [*]const u8, n: u32, out: [*]u8, cap: u32) i32 {
+    var k = cid(p, n);
+    var r: c.skein_kernel_skein_cid_t = undefined;
+    var e: c.program_string_t = undefined;
+    if (!c.skein_kernel_skein_emit(&k, &r, &e)) return fail(&e);
+    return holdCid(r, out, cap);
+}
+
 pub fn take(out: [*]u8, cap: u32) i32 {
     if (held.len > cap) {
         last_error = "take: buffer too small";
