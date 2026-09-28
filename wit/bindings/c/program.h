@@ -662,6 +662,12 @@ extern bool skein_kernel_skein_http(program_list_u8_t *request, program_list_u8_
 // If this step ends waiting, rest no later than `until-ms` (ms since the
 // epoch, after the step's time): a wake entry then steps the thread (#29).
 extern bool skein_kernel_skein_deadline(int64_t until_ms, program_string_t *err);
+// An in-VM call (#40): run `program` (a program record) as a function —
+// its entry, with `input()` = {kind: "call", fn, arg, …} — and return what
+// it wrote to stdout (a non-zero exit is the error, its last stderr line).
+// From a step, the callee is part of the step (its recorded calls, records
+// and head moves are the step's); from the kernel's `call`, it only reads.
+extern bool skein_kernel_skein_call(skein_kernel_skein_cid_t *program, program_string_t *fn, program_list_u8_t *arg, program_list_u8_t *ret, program_string_t *err);
 
 // Imported Functions from `wasi:io/poll@0.2.12`
 // Return the readiness of a pollable. This function never blocks.

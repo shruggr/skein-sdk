@@ -85,6 +85,13 @@ interface skein {
   /// If this step ends waiting, rest no later than `until-ms` (ms since the
   /// epoch, after the step's time): a wake entry then steps the thread (#29).
   deadline: func(until-ms: s64) -> result<_, string>;
+
+  /// An in-VM call (#40): run `program` (a program record) as a function —
+  /// its entry, with `input()` = {kind: "call", fn, arg, …} — and return what
+  /// it wrote to stdout (a non-zero exit is the error, its last stderr line).
+  /// From a step, the callee is part of the step (its recorded calls, records
+  /// and head moves are the step's); from the kernel's `call`, it only reads.
+  call: func(program: cid, fn: string, arg: list<u8>) -> result<list<u8>, string>;
 }
 
 /// What a handler program imports beyond WASI's command world: skein's calls

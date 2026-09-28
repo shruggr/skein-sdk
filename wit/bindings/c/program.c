@@ -50,6 +50,9 @@ extern void __wasm_import_skein_kernel_skein_http(uint8_t *, size_t, uint8_t *);
 __attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("deadline")))
 extern void __wasm_import_skein_kernel_skein_deadline(int64_t, uint8_t *);
 
+__attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("call")))
+extern void __wasm_import_skein_kernel_skein_call(uint8_t *, size_t, uint8_t *, size_t, uint8_t *, size_t, uint8_t *);
+
 // Imported Functions from `wasi:io/poll@0.2.12`
 
 __attribute__((__import_module__("wasi:io/poll@0.2.12"), __import_name__("[method]pollable.ready")))
@@ -1359,6 +1362,33 @@ bool skein_kernel_skein_deadline(int64_t until_ms, program_string_t *err) {
     }
   }
   if (!result.is_err) {
+    return 1;
+  } else {
+    *err = result.val.err;
+    return 0;
+  }
+}
+
+bool skein_kernel_skein_call(skein_kernel_skein_cid_t *program, program_string_t *fn, program_list_u8_t *arg, program_list_u8_t *ret, program_string_t *err) {
+  __attribute__((__aligned__(sizeof(void*))))
+  uint8_t ret_area[(3*sizeof(void*))];
+  uint8_t *ptr = (uint8_t *) &ret_area;
+  __wasm_import_skein_kernel_skein_call((uint8_t *) (*program).ptr, (*program).len, (uint8_t *) (*fn).ptr, (*fn).len, (uint8_t *) (*arg).ptr, (*arg).len, ptr);
+  skein_kernel_skein_result_list_u8_string_t result;
+  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
+    case 0: {
+      result.is_err = false;
+      result.val.ok = (program_list_u8_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
+      break;
+    }
+    case 1: {
+      result.is_err = true;
+      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
+      break;
+    }
+  }
+  if (!result.is_err) {
+    *ret = result.val.ok;
     return 1;
   } else {
     *err = result.val.err;
