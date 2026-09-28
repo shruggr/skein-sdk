@@ -3,13 +3,23 @@
 //! dag-cbor records; lookups go through index maps — the kernel's Merkle
 //! search trees (#30), one per lookup, their roots in the state record.
 //! Status and spendability are computed from the records, never stored as
-//! fields. The derived maps (`spent`, `byBasket`, `byStatus`) are rebuilt
+//! fields. The derived maps (`spent`, `byBasket`, `byStatus`, `bySettlement`) are rebuilt
 //! from the primary ones on every save, so they are a pure function of the
 //! records and the best chain: anyone can recompute and compare (the trees
 //! are canonical: same contents, same root).
 //!
 //! One `Wallet` lives for one step: load from the state record, apply
 //! operations, save (new map nodes, a new state record).
+//!
+//! Settlement (#37): every transaction we hold is `proven` (a merkle proof
+//! against our best chain), `unproven`, or `rejected` (a `settlement` record
+//! says so: ARC rejected it, a competing spend was proven, it was never
+//! mined in time, or something it depends on was rejected). The relations
+//! between records are kept as they are written, in `dependents`, each with
+//! its kind: `spends`, `derives-from`, `admits` (#36) propagate a
+//! rejection; `mentions` does not. A rejection walks them and recomputes
+//! what was derived (the outputs vanish, drafts and dependent transactions
+//! are rejected in turn, the inputs they consumed are spendable again).
 const std = @import("std");
 const bsvz = @import("bsvz");
 const cbor = @import("cbor.zig");
@@ -44,10 +54,45 @@ pub const Oracle = struct {
 ///   awaiting  txid → broadcast record                       transactions awaiting a status callback
 ///   spent     txid ‖ vout → spending txid (bytes)            derived: inputs of our actions
 ///   byBasket  len ‖ basket ‖ 0|1 ‖ outpoint → null          derived: 0 spendable, 1 spent
-///   byStatus  0|1 ‖ txid → null                             derived: our actions, 0 proven, 1 unproven
-pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "byStatus" };
+///   byStatus  0|1|2 ‖ txid → null                           derived: our actions, 0 proven, 1 unproven, 2 rejected
+///   spenders  txid ‖ vout ‖ spending txid → null             every input of every transaction we hold
+///   dependents  txid ‖ tag ‖ id → rel (text)                what depends on a transaction, and how (Rel, Tag)
+///   rejected  txid → settlement record                      transactions that will never be mined
+///   proofHeights  height (u32 BE) ‖ txid → null             proofs by block height (what a reorg reverts)
+///   drafts    draft CID → null | settlement record          signable drafts (rejected with an input)
+///   watchers  identity key (33 bytes) → null                who is sent settlement changes (the `settlement` box)
+///   bySettlement  0|1|2 ‖ txid → null                       derived: every transaction we hold, by status
+pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "byStatus", "spenders", "dependents", "rejected", "proofHeights", "drafts", "watchers", "bySettlement" };
 
-pub const Status = enum { proven, unproven };
+pub const Status = enum { proven, unproven, rejected };
+
+/// The kind of a relation from a record to the transaction it names: whether
+/// the record stands or falls with it. `spends` (an input of a transaction
+/// we hold consumes one of its outputs), `admits` (an overlay admitted one of
+/// its outputs, #36: reserved), `derives-from` (a record built on it: our
+/// action, an output record, a draft) propagate a rejection; `mentions` (a
+/// record that merely names it) does not.
+pub const Rel = enum {
+    spends,
+    admits,
+    @"derives-from",
+    mentions,
+
+    pub fn parse(t: []const u8) ?Rel {
+        return std.meta.stringToEnum(Rel, t);
+    }
+    pub fn propagates(r: Rel) bool {
+        return r != .mentions;
+    }
+};
+
+/// What a dependent is, in a `dependents` key: a transaction (id = its
+/// txid), our action (txid), an output record (outpoint), a draft (its CID),
+/// or any other record (its CID).
+pub const Tag = enum(u8) { tx = 't', action = 'a', output = 'o', draft = 'd', record = 'r' };
+
+/// One settlement change in a step (what the `settlement` box is sent).
+pub const Change = struct { txid: [32]u8, status: Status, reason: []const u8, cause: ?[32]u8 = null };
 
 pub const PaymentRemittance = struct { derivation_prefix: []const u8, derivation_suffix: []const u8, sender_identity_key: [33]u8 };
 pub const InsertionRemittance = struct { basket: []const u8, custom_instructions: ?[]const u8 = null, tags: []const []const u8 = &.{} };
@@ -129,6 +174,12 @@ pub const Wallet = struct {
     network: Network,
     maps: *store_mod.Maps,
     m: [map_names.len]Map,
+    /// The step's time (ms): settlement records and broadcasts are stamped with it.
+    now: i64 = 0,
+    /// Settlement changes this step made (in order), for the `settlement` box.
+    changes: std.ArrayList(Change) = .empty,
+    /// Transactions of ours a reorg this step turned back to unproven: to be asked about again.
+    reverted: std.ArrayList([32]u8) = .empty,
 
     /// The wallet the state record names (null: a new one) on `network`; a
     /// state made for another network is refused.
@@ -178,11 +229,41 @@ pub const Wallet = struct {
         return try self.store.get(self.arena, c);
     }
 
+    /// A transaction, held: its block, and each input as a `spends` relation
+    /// to the transaction it consumes (held or not) and in `spenders`.
     pub fn putTx(self: *Wallet, txid: [32]u8, raw: []const u8) ![]const u8 {
         if (try self.map("txs").link(&txid)) |c| return c;
         const cid = try self.store.putBitcoin(self.arena, .tx, raw);
         try self.map("txs").putLink(&txid, cid);
+        const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+        for (tx.inputs) |in| {
+            const src = in.previous_outpoint.txid.bytes;
+            try self.map("spenders").add(&(store_mod.outpointKey(src, in.previous_outpoint.index) ++ txid));
+            try self.relate(src, .tx, &txid, .spends);
+        }
         return cid;
+    }
+
+    /// A relation from a dependent record to the transaction it names (`dependents`).
+    pub fn relate(self: *Wallet, to: [32]u8, tag: Tag, id: []const u8, rel: Rel) !void {
+        const key = try std.mem.concat(self.arena, u8, &.{ &to, &.{@intFromEnum(tag)}, id });
+        try self.map("dependents").put(key, .{ .string = @tagName(rel) });
+    }
+
+    /// What depends on a transaction: each dependent's tag, id and relation.
+    pub const Dependent = struct { tag: Tag, id: []const u8, rel: ?Rel };
+    pub fn dependentsOf(self: *Wallet, txid: [32]u8) ![]Dependent {
+        const kvs = try self.map("dependents").prefixed(&txid);
+        const out = try self.arena.alloc(Dependent, kvs.len);
+        for (kvs, out) |kv, *d| {
+            if (kv.key.len < 33) return error.BadIndex;
+            d.* = .{
+                .tag = std.meta.intToEnum(Tag, kv.key[32]) catch return error.BadIndex,
+                .id = kv.key[33..],
+                .rel = if (kv.value == .string) Rel.parse(kv.value.string) else null,
+            };
+        }
+        return out;
     }
 
     fn putProof(self: *Wallet, txid: [32]u8, height: u32, path: []const u8) !void {
@@ -194,6 +275,7 @@ pub const Wallet = struct {
             .{ .key = "path", .value = .{ .bytes = path } },
         } });
         try self.map("proofs").putLink(&txid, cid);
+        try self.map("proofHeights").add(&(store_mod.be32(height) ++ txid));
     }
 
     /// The proof we hold for a txid (its BRC-74 bytes), or null.
@@ -209,9 +291,22 @@ pub const Wallet = struct {
 
     // ------------------------------------------------------------ status (computed)
 
-    /// proven: we hold a merkle proof for the txid whose root is our
-    /// best-chain header's at its height. Anything else is unproven.
+    /// rejected: a settlement record says the transaction will never be
+    /// mined (it stays so). proven: we hold a merkle proof for the txid whose
+    /// root is our best-chain header's at its height. Anything else is
+    /// unproven — a reorg that drops the block turns it back, with nothing to update.
     pub fn status(self: *Wallet, txid: [32]u8) !Status {
+        if (try self.map("rejected").has(&txid)) return .rejected;
+        return self.minedStatus(txid);
+    }
+
+    /// The settlement record of a rejected transaction, or null.
+    pub fn settlement(self: *Wallet, txid: [32]u8) !?Value {
+        const c = (try self.map("rejected").link(&txid)) orelse return null;
+        return try self.record(c);
+    }
+
+    fn minedStatus(self: *Wallet, txid: [32]u8) !Status {
         const path = (try self.proofPath(txid)) orelse return .unproven;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return .unproven;
         const root = beef_mod.rootFor(self.arena, p, txid) orelse return .unproven;
@@ -221,18 +316,17 @@ pub const Wallet = struct {
 
     fn rebuildDerived(self: *Wallet) !void {
         const a = self.arena;
-        // spent: every outpoint one of our actions consumes → the spending txid.
+        // spent: every outpoint a transaction we hold consumes → the spending
+        // txid, unless that transaction is rejected (its inputs are free again).
         var spent = self.maps.map(null);
-        const actions = try self.map("actions").prefixed("");
-        for (actions) |kv| {
-            const txid: [32]u8 = kv.key[0..32].*;
-            const raw = (try self.txRaw(txid)) orelse return error.BadRecord;
-            const tx = try bsvz.transaction.Transaction.parse(a, raw);
-            for (tx.inputs) |in| {
-                const k = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
-                try spent.put(&k, .{ .bytes = try a.dupe(u8, &txid) });
-            }
+        for (try self.map("spenders").prefixed("")) |kv| {
+            if (kv.key.len != 68) return error.BadIndex;
+            const spender: [32]u8 = kv.key[36..68].*;
+            if (try self.map("rejected").has(&spender)) continue;
+            if (try spent.has(kv.key[0..36])) continue; // the first (lowest txid) names it
+            try spent.put(kv.key[0..36], .{ .bytes = try a.dupe(u8, &spender) });
         }
+        const actions = try self.map("actions").prefixed("");
         // byBasket: basket ‖ 0 (spendable) | 1 (spent) ‖ outpoint.
         var by_basket = self.maps.map(null);
         for (try self.map("outputs").prefixed("")) |kv| {
@@ -241,31 +335,174 @@ pub const Wallet = struct {
             const state: u8 = if (try spent.has(kv.key)) 1 else 0;
             try by_basket.add(try store_mod.nameKey(a, basket, &.{ &.{state}, kv.key }));
         }
-        // byStatus: 0 (proven) | 1 (unproven) ‖ txid.
+        // byStatus: 0 (proven) | 1 (unproven) | 2 (rejected) ‖ txid, our actions.
         var by_status = self.maps.map(null);
         for (actions) |kv| {
-            const st: u8 = if ((try self.status(kv.key[0..32].*)) == .proven) 0 else 1;
+            const st: u8 = @intFromEnum(try self.status(kv.key[0..32].*));
             try by_status.add(try std.mem.concat(a, u8, &.{ &.{st}, kv.key }));
+        }
+        // bySettlement: the same over every transaction we hold.
+        var by_settlement = self.maps.map(null);
+        for (try self.map("txs").prefixed("")) |kv| {
+            const st: u8 = @intFromEnum(try self.status(kv.key[0..32].*));
+            try by_settlement.add(try std.mem.concat(a, u8, &.{ &.{st}, kv.key }));
         }
         self.map("spent").root = spent.root;
         self.map("byBasket").root = by_basket.root;
         self.map("byStatus").root = by_status.root;
+        self.map("bySettlement").root = by_settlement.root;
+    }
+
+    // ------------------------------------------------------------ settlement
+
+    /// Reject a transaction and bubble: record a settlement record for it,
+    /// then walk what depends on it through `dependents`, following only the
+    /// relations that propagate — a transaction that spends it is rejected in
+    /// turn (transitively, breadth first in key order: deterministic), an
+    /// output record of it vanishes, a draft built on it is rejected; a
+    /// `mentions` is left alone. What is derived from the remaining records
+    /// (spent, spendable, by status) is recomputed at `save`: the inputs a
+    /// rejected transaction consumed are spendable again unless another
+    /// transaction we hold spends them. A proven transaction is never
+    /// rejected (its proof is on our best chain), nor walked through. → the
+    /// transactions rejected, the given one first.
+    pub fn reject(self: *Wallet, root: [32]u8, reason: []const u8) ![][32]u8 {
+        const a = self.arena;
+        var queue: std.ArrayList([32]u8) = .empty;
+        try queue.append(a, root);
+        var out: std.ArrayList([32]u8) = .empty;
+        var i: usize = 0;
+        while (i < queue.items.len) : (i += 1) {
+            const t = queue.items[i];
+            if (try self.map("rejected").has(&t)) continue;
+            if ((try self.minedStatus(t)) == .proven) continue;
+            const by = i > 0;
+            var fields: std.ArrayList(cbor.Entry) = .empty;
+            try fields.appendSlice(a, &.{
+                .{ .key = "kind", .value = .{ .text = "settlement" } },
+                .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(t)) } },
+                .{ .key = "status", .value = .{ .text = "rejected" } },
+                .{ .key = "reason", .value = .{ .text = if (by) "input-rejected" else reason } },
+                .{ .key = "at", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
+            });
+            if (by) try fields.append(a, .{ .key = "cause", .value = .{ .text = try a.dupe(u8, &hdr.toHex(root)) } });
+            const rec = try self.store.putValue(a, .{ .map = fields.items });
+            try self.map("rejected").putLink(&t, rec);
+            _ = try self.map("awaiting").remove(&t);
+            try out.append(a, t);
+            if (try self.map("actions").has(&t)) try self.changes.append(a, .{ .txid = t, .status = .rejected, .reason = if (by) "input-rejected" else reason, .cause = if (by) root else null });
+            for (try self.dependentsOf(t)) |d| {
+                const rel = d.rel orelse continue;
+                if (!rel.propagates()) continue;
+                switch (d.tag) {
+                    .tx => if (d.id.len == 32) try queue.append(a, d.id[0..32].*),
+                    .output => _ = try self.map("outputs").remove(d.id),
+                    .draft => try self.map("drafts").putLink(d.id, rec),
+                    .action, .record => {}, // an action's status is computed; a record is only reported
+                }
+            }
+        }
+        return out.items;
+    }
+
+    /// A transaction just proven: every other transaction we hold that spends
+    /// one of the same outputs is a double spend, and rejected (with what
+    /// depends on it).
+    fn rejectConflicting(self: *Wallet, txid: [32]u8) !void {
+        const raw = (try self.txRaw(txid)) orelse return;
+        const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+        for (tx.inputs) |in| {
+            const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
+            for (try self.map("spenders").prefixed(&op)) |kv| {
+                const other: [32]u8 = kv.key[36..68].*;
+                if (std.mem.eql(u8, &other, &txid)) continue;
+                _ = try self.reject(other, "double-spent");
+            }
+        }
+    }
+
+    /// A transaction that spends an output a proven transaction of ours
+    /// already spends is dead on arrival: rejected.
+    fn rejectIfConflicted(self: *Wallet, txid: [32]u8) !bool {
+        const raw = (try self.txRaw(txid)) orelse return false;
+        const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+        for (tx.inputs) |in| {
+            const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
+            for (try self.map("spenders").prefixed(&op)) |kv| {
+                const other: [32]u8 = kv.key[36..68].*;
+                if (std.mem.eql(u8, &other, &txid)) continue;
+                if ((try self.status(other)) == .proven) {
+                    _ = try self.reject(txid, "double-spent");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// After a reorg replaced our chain from `start`: the proofs at those
+    /// heights no longer hold, so those transactions are unproven again
+    /// (computed; nothing to rewrite). Ours are noted in `reverted`, to be
+    /// asked about again as after a fresh broadcast.
+    fn revertFrom(self: *Wallet, start: u32) !void {
+        for (try self.map("proofHeights").from(&store_mod.be32(start))) |kv| {
+            if (kv.key.len != 36) return error.BadIndex;
+            const txid: [32]u8 = kv.key[4..36].*;
+            const c = (try self.map("proofs").link(&txid)) orelse continue;
+            const rec = try self.record(c);
+            if (rec.getUint("height") != std.mem.readInt(u32, kv.key[0..4], .big)) continue; // a later proof replaced it
+            if ((try self.status(txid)) != .unproven) continue;
+            if (!(try self.map("actions").has(&txid))) continue;
+            var dup = false;
+            for (self.reverted.items) |r| dup = dup or std.mem.eql(u8, &r, &txid);
+            if (dup) continue;
+            try self.reverted.append(self.arena, txid);
+            try self.changes.append(self.arena, .{ .txid = txid, .status = .unproven, .reason = "reorg" });
+        }
+    }
+
+    // ------------------------------------------------------------ watchers (the `settlement` box)
+
+    pub fn watch(self: *Wallet, identity: [33]u8, on: bool) !void {
+        if (on) try self.map("watchers").add(&identity) else _ = try self.map("watchers").remove(&identity);
+    }
+
+    pub fn watchers(self: *Wallet) ![][33]u8 {
+        const kvs = try self.map("watchers").prefixed("");
+        const out = try self.arena.alloc([33]u8, kvs.len);
+        for (kvs, out) |kv, *o| {
+            if (kv.key.len != 33) return error.BadIndex;
+            o.* = kv.key[0..33].*;
+        }
+        return out;
     }
 
     // ------------------------------------------------------------ operations
 
+    /// A run of headers. When a heavier branch replaces ours, the proofs
+    /// against the replaced headers stop holding: those transactions are
+    /// unproven again (`reverted`, for ours).
     pub fn addHeaders(self: *Wallet, raws: []const []const u8) !chain_mod.Chain.AddResult {
-        return self.chain().add(raws);
+        const res = try self.chain().add(raws);
+        if (res.replaced > 0) try self.revertFrom(res.tip + 1 - res.added);
+        return res;
     }
 
-    /// A merkle proof for a transaction we hold (a `proof` entry, or ARC's answer).
+    /// A merkle proof for a transaction we hold (a `proof` entry, or ARC's
+    /// answer). A proof makes every competing spend of the same outputs a
+    /// double spend: rejected. A rejected transaction keeps its rejection
+    /// (the proof is kept, the status stays `rejected`).
     pub fn addProof(self: *Wallet, txid: [32]u8, path: []const u8) !Status {
         if ((try self.txRaw(txid)) == null) return error.UnknownTransaction;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return error.BadProof;
         const root = beef_mod.rootFor(self.arena, p, txid) orelse return error.BadProof;
         const want = (try self.chain().rootAt(p.block_height)) orelse return error.UnknownHeader;
         if (!std.mem.eql(u8, &root, &want)) return error.RootMismatch;
+        const before = try self.status(txid);
         try self.putProof(txid, p.block_height, path);
+        if (before == .rejected) return .rejected;
+        if (before != .proven and try self.map("actions").has(&txid)) try self.changes.append(self.arena, .{ .txid = txid, .status = .proven, .reason = "mined" });
+        try self.rejectConflicting(txid);
         return .proven;
     }
 
@@ -333,6 +570,7 @@ pub const Wallet = struct {
             rec.* = .{ .map = fields.items };
         }
 
+        if (try self.map("rejected").has(&subject)) return error.TransactionRejected;
         // Record: every transaction the BEEF carries, every proof it carries, then the action and its outputs.
         var tx_cid: []const u8 = undefined;
         for (b.entries, checked.proven) |e, proven| {
@@ -351,11 +589,19 @@ pub const Wallet = struct {
             var fields = try a.dupe(cbor.Entry, rec.map);
             fields = try a.realloc(fields, fields.len + 1);
             fields[fields.len - 1] = .{ .key = "tx", .value = .{ .cid = tx_cid } };
-            const c = try self.store.putValue(a, .{ .map = fields });
             const vout: u32 = @intCast(rec.getUint("vout").?);
-            try self.map("outputs").putLink(&store_mod.outpointKey(subject, vout), c);
+            try self.putOutput(subject, vout, .{ .map = fields });
         }
+        // A spend of an output a proven transaction already spends is never mined.
+        _ = try self.rejectIfConflicted(subject);
         return .{ .txid = subject, .status = try self.status(subject), .outputs = @intCast(args.outputs.len) };
+    }
+
+    /// An output record of ours, derived from its transaction (a `derives-from` relation).
+    fn putOutput(self: *Wallet, txid: [32]u8, vout: u32, rec: Value) !void {
+        const op = store_mod.outpointKey(txid, vout);
+        try self.map("outputs").putLink(&op, try self.store.putValue(self.arena, rec));
+        try self.relate(txid, .output, &op, .@"derives-from");
     }
 
     /// An action (a transaction of ours), unless we already hold one for the txid.
@@ -372,6 +618,7 @@ pub const Wallet = struct {
         });
         if (extra) |x| try fields.appendSlice(a, x);
         try self.map("actions").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
+        try self.relate(txid, .action, &txid, .@"derives-from");
     }
 
     /// Outputs in a basket, spendable ones only unless `include_spent`.
@@ -512,6 +759,9 @@ pub const Wallet = struct {
             .{ .key = "satsPerKb", .value = .{ .uint = sats_per_kb } },
             .{ .key = "noSend", .value = .{ .boolean = args.no_send } },
         } });
+        // The draft stands on its inputs' transactions (`derives-from`): rejected with any of them.
+        try self.map("drafts").add(draft);
+        for (inputs) |in| try self.relate(in.source_txid, .draft, draft, .@"derives-from");
         return .{ .txid = built.txid, .beef = try self.atomicBeef(built.txid, built.raw, built.tx), .reference = draft, .no_send = args.no_send };
     }
 
@@ -521,6 +771,7 @@ pub const Wallet = struct {
         const a = self.arena;
         const d = self.record(reference) catch return error.UnknownReference;
         if (!std.mem.eql(u8, d.getText("kind") orelse "", "draft")) return error.UnknownReference;
+        if (try self.map("drafts").get(reference)) |v| if (v == .cid) return error.DraftRejected;
         const outputs = try decodeOutputs(a, d.getArray("outputs") orelse return error.BadRecord);
         try self.rebuildDerived();
         const ops = d.getArray("inputs") orelse return error.BadRecord;
@@ -552,6 +803,9 @@ pub const Wallet = struct {
             .labels = try textsOf(a, d.getArray("labels") orelse &.{}),
             .no_send = d.getBool("noSend") orelse false,
         };
+        // Signed, the draft is done: the action stands in its place (its own relations).
+        _ = try self.map("drafts").remove(reference);
+        for (inputs) |in| _ = try self.map("dependents").remove(try std.mem.concat(a, u8, &.{ &in.source_txid, &.{@intFromEnum(Tag.draft)}, reference }));
         return self.recordSigned(built, args, prefix, suffix);
     }
 
@@ -563,7 +817,7 @@ pub const Wallet = struct {
         try self.putAction(built.txid, tx_cid, args.description, args.labels, &.{.{ .key = "noSend", .value = .{ .boolean = args.no_send } }});
         const txid_hex = try a.dupe(u8, &hdr.toHex(built.txid));
         if (built.change) |c| {
-            const rc = try self.store.putValue(a, .{ .map = &.{
+            try self.putOutput(built.txid, c.vout, .{ .map = try a.dupe(cbor.Entry, &.{
                 .{ .key = "kind", .value = .{ .text = "output" } },
                 .{ .key = "txid", .value = .{ .text = txid_hex } },
                 .{ .key = "vout", .value = .{ .uint = c.vout } },
@@ -572,8 +826,7 @@ pub const Wallet = struct {
                 .{ .key = "protocol", .value = .{ .text = "wallet change" } },
                 .{ .key = "derivationPrefix", .value = .{ .text = change_prefix } },
                 .{ .key = "derivationSuffix", .value = .{ .text = change_suffix } },
-            } });
-            try self.map("outputs").putLink(&store_mod.outpointKey(built.txid, c.vout), rc);
+            }) });
         }
         for (args.outputs, 0..) |o, i| {
             const basket = o.basket orelse continue;
@@ -588,7 +841,7 @@ pub const Wallet = struct {
                 .{ .key = "tags", .value = .{ .array = try textArray(a, o.tags) } },
             });
             if (o.custom_instructions) |ci| try fields.append(a, .{ .key = "customInstructions", .value = .{ .text = ci } });
-            try self.map("outputs").putLink(&store_mod.outpointKey(built.txid, @intCast(i)), try self.store.putValue(a, .{ .map = fields.items }));
+            try self.putOutput(built.txid, @intCast(i), .{ .map = fields.items });
         }
         return .{ .txid = built.txid, .beef = try self.atomicBeef(built.txid, built.raw, built.tx), .no_send = args.no_send };
     }
@@ -642,15 +895,18 @@ pub const Wallet = struct {
     }
 
     /// A transaction of ours now awaits its status: the `awaiting` map names
-    /// the broadcast record (the ARC it went to, the last status heard).
+    /// the broadcast record (the ARC it went to, the last status heard, and
+    /// `since`: when it was first broadcast, the abandonment clock).
     pub fn noteBroadcast(self: *Wallet, txid: [32]u8, arc: []const u8, tx_status: []const u8) !void {
         const a = self.arena;
+        const since: u64 = if (try self.awaitingRecord(txid)) |r| r.getUint("since") orelse @intCast(@max(self.now, 0)) else @intCast(@max(self.now, 0));
         const cid = try self.store.putValue(a, .{ .map = &.{
             .{ .key = "kind", .value = .{ .text = "broadcast" } },
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
             .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &store_mod.bitcoinCid(.tx, (try self.txRaw(txid)) orelse return error.UnknownTransaction)) } },
             .{ .key = "arc", .value = .{ .text = arc } },
             .{ .key = "txStatus", .value = .{ .text = tx_status } },
+            .{ .key = "since", .value = .{ .uint = since } },
         } });
         try self.map("awaiting").putLink(&txid, cid);
     }
@@ -660,28 +916,50 @@ pub const Wallet = struct {
         return try self.record(c);
     }
 
+    /// Every transaction awaiting a status.
+    pub fn awaitingTxids(self: *Wallet) ![][32]u8 {
+        const kvs = try self.map("awaiting").prefixed("");
+        const out = try self.arena.alloc([32]u8, kvs.len);
+        for (kvs, out) |kv, *o| o.* = kv.key[0..32].*;
+        return out;
+    }
+
+    /// Never mined in time: a transaction awaiting its status for at least
+    /// `abandon_ms` since it was broadcast is rejected ("abandoned"), with
+    /// what depends on it. → whether it was.
+    pub fn abandonIfDue(self: *Wallet, txid: [32]u8, abandon_ms: i64) !bool {
+        if (abandon_ms <= 0) return false;
+        const r = (try self.awaitingRecord(txid)) orelse return false;
+        const since: i64 = @intCast(r.getUint("since") orelse return false);
+        if (self.now - since < abandon_ms) return false;
+        if ((try self.status(txid)) != .unproven) return false;
+        _ = try self.reject(txid, "abandoned");
+        return true;
+    }
+
     /// What a status says about one of our transactions (ARC's answer, or a
     /// `status` / `proof` entry): a merkle path is a proof, checked against our
-    /// chain (a header not yet held leaves it pending); a rejection drops the
-    /// action and its outputs, so its inputs are spendable again. Proven or
+    /// chain (a header not yet held leaves it pending); a rejection rejects it
+    /// and bubbles (`reject`): what spends it and was built on it is rejected
+    /// too, its outputs vanish, its inputs are spendable again. Proven or
     /// rejected, it no longer awaits.
     pub fn applyStatus(self: *Wallet, txid: [32]u8, tx_status: []const u8, merkle_path: ?[]const u8) !Outcome {
         var outcome: Outcome = .pending;
         if (merkle_path) |p| {
-            if (self.addProof(txid, p)) |_| {
-                outcome = .proven;
+            if (self.addProof(txid, p)) |st| {
+                outcome = if (st == .rejected) .rejected else .proven;
             } else |e| switch (e) {
                 error.UnknownHeader => {},
                 else => return e,
             }
         } else if (isRejection(tx_status)) {
-            outcome = .rejected;
-            if (try self.map("actions").remove(&txid)) {
-                const raw = (try self.txRaw(txid)) orelse return error.BadRecord;
-                const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
-                for (0..tx.outputs.len) |i| _ = try self.map("outputs").remove(&store_mod.outpointKey(txid, @intCast(i)));
-            }
-        } else if ((try self.status(txid)) == .proven) outcome = .proven;
+            _ = try self.reject(txid, tx_status);
+        }
+        if (outcome == .pending) outcome = switch (try self.status(txid)) {
+            .proven => .proven,
+            .rejected => .rejected,
+            .unproven => .pending,
+        };
         if (outcome != .pending) {
             _ = try self.map("awaiting").remove(&txid);
         } else if (try self.awaitingRecord(txid)) |r| {

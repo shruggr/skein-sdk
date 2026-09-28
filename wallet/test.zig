@@ -739,6 +739,249 @@ test "wallet: basket insertion, spent outputs, BEEF refusals" {
     counts.wallet += 1;
 }
 
+// ---------------------------------------------------------------- settlement (#37)
+
+/// A wallet on regtest (1001 headers) holding one unproven BRC-29 payment to
+/// us, spendable: the state record, the payment and the keys.
+const Paid = struct {
+    state: []const u8,
+    pay_txid: [32]u8,
+    pay_sats: u64,
+    h1001: [80]u8,
+    our_priv: [32]u8,
+};
+
+fn setupPaid(a: std.mem.Allocator, s: lib.store.Store) !Paid {
+    const utv = std.json.parseFromSliceLeaky(J, a, @embedFile("vectors/beef.json"), .{}) catch unreachable;
+    var fund_hex: []const u8 = undefined;
+    for (arr(utv, "cases")) |c| if (std.mem.eql(u8, str(c, "name"), "utv-1-in-1-out-atomic")) {
+        fund_hex = str(c, "hex");
+    };
+    const fund = try beef.parse(a, try unhex(a, fund_hex));
+    const payer_priv = try key32("fdd506efec13e05cdff57ef13e24a60009aba0e8f2162e2cff2886460175cad8");
+    const payer_pub = try lib.brc29.identityKey(payer_priv);
+    const bump = fund.bumps[0];
+    var proven_txid: [32]u8 = undefined;
+    for (fund.entries) |e| if (e.format == .raw_with_bump) {
+        proven_txid = e.txid;
+    };
+    var w = try lib.wallet.Wallet.load(a, s, null, .regtest);
+    const chain = try regtestChain(a, bump.block_height + 1, &.{.{ bump.block_height, beef.rootFor(a, bump, proven_txid).? }});
+    _ = try w.addHeaders(try slices(a, chain));
+    const our_priv = try key32("6a2991c9de20e38b31d7ea147bf55f5039e4bbc073160f5e0d541d1f17e321b8");
+    const key_id = try lib.brc29.keyId(a, "cHJlZml4", "c3VmZml4");
+    const pay_to = try lib.brc29.payerKey(a, payer_priv, try lib.brc29.identityKey(our_priv), key_id);
+    const fund_tx = fund.find(fund.atomic.?).?.tx.?;
+    var b = bsvz.transaction.Builder.init(a);
+    try b.addInputFromTx(&fund_tx, 0);
+    const script = lib.brc29.p2pkh(pay_to);
+    try b.addOutput(.{ .satoshis = fund_tx.outputs[0].satoshis - 100, .locking_script = bsvz.script.Script.init(try a.dupe(u8, &script)) });
+    try b.sign(try bsvz.crypto.PrivateKey.fromBytes(payer_priv));
+    const pay_tx = try b.build();
+    const pay_raw = try pay_tx.serialize(a);
+    const pay_txid = beef.txidOf(pay_raw);
+    var entries: std.ArrayList(beef.Entry) = .empty;
+    try entries.appendSlice(a, fund.entries);
+    try entries.append(a, .{ .txid = pay_txid, .format = .raw, .raw = pay_raw, .tx = pay_tx });
+    const pay_beef = try beef.serialize(a, .{ .version = beef.V2, .atomic = pay_txid, .bumps = fund.bumps, .entries = entries.items });
+    var oracle = KeyOracle{ .priv = our_priv };
+    _ = try w.internalize(.{ .tx = pay_beef, .outputs = &.{.{ .output_index = 0, .payment = .{ .derivation_prefix = "cHJlZml4", .derivation_suffix = "c3VmZml4", .sender_identity_key = payer_pub } }}, .description = "funding" }, oracle.oracle());
+    return .{ .state = try w.save(), .pay_txid = pay_txid, .pay_sats = @intCast(fund_tx.outputs[0].satoshis - 100), .h1001 = chain[chain.len - 1], .our_priv = our_priv };
+}
+
+/// A BUMP for a block holding one transaction: its root is the txid.
+fn soloPath(a: std.mem.Allocator, height: u32, txid: [32]u8) ![]const u8 {
+    var path: std.ArrayList(u8) = .empty;
+    try path.appendSlice(a, &.{ 0xfd, 0, 0, 0x01, 0x01, 0x00, 0x02 }); // height (a 3-byte varint), 1 level, 1 leaf, offset 0, txid flag
+    std.mem.writeInt(u16, path.items[1..3], @intCast(height), .little);
+    try path.appendSlice(a, &txid);
+    return path.items;
+}
+
+fn hasChange(w: *lib.wallet.Wallet, txid: [32]u8, st: lib.wallet.Status, reason: []const u8) bool {
+    for (w.changes.items) |c| if (std.mem.eql(u8, &c.txid, &txid) and c.status == st and std.mem.eql(u8, c.reason, reason)) return true;
+    return false;
+}
+
+test "settlement: unproven → proven; reorg → unproven (reverted) → re-proven" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const p = try setupPaid(a, s);
+
+    var w = try lib.wallet.Wallet.load(a, s, p.state, .regtest);
+    try std.testing.expectEqual(lib.wallet.Status.unproven, try w.status(p.pay_txid));
+    try std.testing.expect(try w.map("bySettlement").has(&(.{1} ++ p.pay_txid)));
+    // Mined alone at 1002: proven, and a settlement change for the watchers.
+    const h1002 = mine(hdr.hash(&p.h1001), p.pay_txid, 1_700_001_800);
+    _ = try w.addHeaders(&.{&h1002});
+    try std.testing.expectEqual(lib.wallet.Status.proven, try w.addProof(p.pay_txid, try soloPath(a, 1002, p.pay_txid)));
+    try std.testing.expect(hasChange(&w, p.pay_txid, .proven, "mined"));
+    const proven_state = try w.save();
+    try std.testing.expect(try w.map("bySettlement").has(&(.{0} ++ p.pay_txid)));
+    try std.testing.expect(try w.map("byStatus").has(&(.{0} ++ p.pay_txid)));
+
+    // A heavier branch from 1001 without that block: the proof no longer holds.
+    var w2 = try lib.wallet.Wallet.load(a, s, proven_state, .regtest);
+    const alt1 = mine(hdr.hash(&p.h1001), .{3} ** 32, 1_700_001_801);
+    const alt2 = mine(hdr.hash(&alt1), .{4} ** 32, 1_700_001_802);
+    try std.testing.expectEqual(@as(u32, 1), (try w2.addHeaders(&.{ &alt1, &alt2 })).replaced);
+    try std.testing.expectEqual(lib.wallet.Status.unproven, try w2.status(p.pay_txid));
+    try std.testing.expectEqual(@as(usize, 1), w2.reverted.items.len);
+    try std.testing.expectEqualSlices(u8, &p.pay_txid, &w2.reverted.items[0]);
+    try std.testing.expect(hasChange(&w2, p.pay_txid, .unproven, "reorg"));
+    _ = try w2.save();
+    try std.testing.expect(try w2.map("bySettlement").has(&(.{1} ++ p.pay_txid)));
+    // The old proof is no longer accepted against the new chain; the new block's is.
+    try std.testing.expectError(error.RootMismatch, w2.addProof(p.pay_txid, try soloPath(a, 1002, p.pay_txid)));
+    const alt3 = mine(hdr.hash(&alt2), p.pay_txid, 1_700_001_803);
+    _ = try w2.addHeaders(&.{&alt3});
+    try std.testing.expectEqual(lib.wallet.Status.proven, try w2.addProof(p.pay_txid, try soloPath(a, 1004, p.pay_txid)));
+    try std.testing.expect(hasChange(&w2, p.pay_txid, .proven, "mined"));
+    // A proven transaction is never rejected.
+    try std.testing.expectEqual(@as(usize, 0), (try w2.reject(p.pay_txid, "REJECTED")).len);
+    try std.testing.expectEqual(lib.wallet.Status.proven, try w2.status(p.pay_txid));
+    _ = try w2.save();
+    counts.wallet += 1;
+}
+
+test "settlement: a rejection bubbles through spends and drafts; inputs freed; mentions do not propagate" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const p = try setupPaid(a, s);
+    var signer = lib.builder.KeySigner{ .root = p.our_priv };
+    const payee = lib.brc29.p2pkh(try lib.brc29.identityKey(.{0x33} ** 32));
+
+    // A spends the (unproven) payment; B spends A's change; a draft D would spend B's change.
+    var w = try lib.wallet.Wallet.load(a, s, p.state, .regtest);
+    const ca = try w.createAction(.{ .description = "A", .outputs = &.{
+        .{ .satoshis = 300, .locking_script = &payee },
+        .{ .satoshis = 1, .locking_script = &.{ 0x00, 0x6a, 0x01, 0x42 }, .basket = "tokens" },
+    } }, signer.signer(), "YQ==", "MQ==", 100);
+    _ = try w.save();
+    const cb = try w.createAction(.{ .description = "B", .outputs = &.{.{ .satoshis = 200, .locking_script = &payee }} }, signer.signer(), "Yg==", "MQ==", 100);
+    _ = try w.save();
+    const d = try w.createAction(.{ .description = "D", .sign_and_process = false, .outputs = &.{.{ .satoshis = 100, .locking_script = &payee }} }, signer.signer(), "ZA==", "MQ==", 100);
+    const before = try w.save();
+    // The relations as written: B spends A; A's action and outputs derive from A; D from B.
+    var spends_a = false;
+    for (try w.dependentsOf(ca.txid)) |dep| {
+        if (dep.tag == .tx and std.mem.eql(u8, dep.id, &cb.txid)) spends_a = dep.rel == .spends;
+    }
+    try std.testing.expect(spends_a);
+    try std.testing.expectEqual(@as(usize, 1), (try w.listOutputs("default", false)).len); // B's change only
+    try std.testing.expectEqual(@as(usize, 1), (try w.listOutputs("tokens", false)).len);
+    // Something that merely mentions A (another transaction, and a record naming it).
+    const mentioner: [32]u8 = .{0x77} ** 32;
+    try w.relate(ca.txid, .tx, &mentioner, .mentions);
+    try w.relate(ca.txid, .record, &cbor_cid(0x42), .mentions);
+
+    // ARC rejects A (e.g. a double spend it saw): A and B are rejected, D too, outputs gone, the payment spendable again.
+    w.now = 5000;
+    try std.testing.expectEqual(lib.wallet.Wallet.Outcome.rejected, try w.applyStatus(ca.txid, "DOUBLE_SPEND_ATTEMPTED", null));
+    try std.testing.expectEqual(lib.wallet.Status.rejected, try w.status(ca.txid));
+    try std.testing.expectEqual(lib.wallet.Status.rejected, try w.status(cb.txid));
+    try std.testing.expect(try w.status(mentioner) != .rejected);
+    try std.testing.expectEqual(lib.wallet.Status.unproven, try w.status(p.pay_txid));
+    const sa = (try w.settlement(ca.txid)).?;
+    try std.testing.expectEqualStrings("DOUBLE_SPEND_ATTEMPTED", sa.getText("reason").?);
+    const sb = (try w.settlement(cb.txid)).?;
+    try std.testing.expectEqualStrings("input-rejected", sb.getText("reason").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(ca.txid), sb.getText("cause").?);
+    try std.testing.expectEqual(@as(u64, 5000), sb.getUint("at").?);
+    try std.testing.expect(hasChange(&w, ca.txid, .rejected, "DOUBLE_SPEND_ATTEMPTED"));
+    try std.testing.expect(hasChange(&w, cb.txid, .rejected, "input-rejected"));
+    const after = try w.save();
+    const def = try w.listOutputs("default", true);
+    try std.testing.expectEqual(@as(usize, 1), def.len);
+    try std.testing.expectEqualSlices(u8, &p.pay_txid, &def[0].txid);
+    try std.testing.expect(def[0].spendable);
+    try std.testing.expectEqual(@as(usize, 0), (try w.listOutputs("tokens", true)).len);
+    try std.testing.expect(try w.map("byStatus").has(&(.{2} ++ ca.txid)));
+    try std.testing.expect(try w.map("byStatus").has(&(.{2} ++ cb.txid)));
+    try std.testing.expectError(error.DraftRejected, w.signAction(d.reference.?, signer.signer()));
+    // The payment funds a new spend.
+    const again = try w.createAction(.{ .description = "again", .outputs = &.{.{ .satoshis = 300, .locking_script = &payee }} }, signer.signer(), "Yw==", "MQ==", 100);
+    try std.testing.expectEqualSlices(u8, &p.pay_txid, &(try beef.parse(a, again.beef)).find(again.txid).?.tx.?.inputs[0].previous_outpoint.txid.bytes);
+
+    // Deterministic: the same rejection from the same state gives the same state record.
+    var w2 = try lib.wallet.Wallet.load(a, s, before, .regtest);
+    try w2.relate(ca.txid, .tx, &mentioner, .mentions);
+    try w2.relate(ca.txid, .record, &cbor_cid(0x42), .mentions);
+    w2.now = 5000;
+    const rej = try w2.reject(ca.txid, "DOUBLE_SPEND_ATTEMPTED");
+    try std.testing.expectEqual(@as(usize, 2), rej.len);
+    try std.testing.expectEqualStrings(after, try w2.save());
+    counts.wallet += 1;
+}
+
+test "settlement: a competing spend proven rejects ours; never mined in time is abandoned" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const p = try setupPaid(a, s);
+    var signer = lib.builder.KeySigner{ .root = p.our_priv };
+    const payee = lib.brc29.p2pkh(try lib.brc29.identityKey(.{0x33} ** 32));
+
+    var w = try lib.wallet.Wallet.load(a, s, p.state, .regtest);
+    const ca = try w.createAction(.{ .description = "A", .outputs = &.{.{ .satoshis = 300, .locking_script = &payee }} }, signer.signer(), "YQ==", "MQ==", 100);
+    const cb = try w.createAction(.{ .description = "B", .outputs = &.{.{ .satoshis = 200, .locking_script = &payee }} }, signer.signer(), "Yg==", "MQ==", 100);
+    const base = try w.save();
+
+    // Another spend of the payment's output (the same key signed it elsewhere) is mined at 1002.
+    var wc = try lib.wallet.Wallet.load(a, s, base, .regtest);
+    const out0 = (try wc.listOutputs("default", true));
+    var pay_out: lib.wallet.OutputView = undefined;
+    for (out0) |o| if (std.mem.eql(u8, &o.txid, &p.pay_txid)) {
+        pay_out = o;
+    };
+    const key = (try wc.keyOf(pay_out.record)).?;
+    const other = try lib.builder.build(a, signer.signer(), &.{.{ .source_txid = p.pay_txid, .vout = 0, .satoshis = pay_out.satoshis, .locking_script = pay_out.locking_script, .key = key }}, &.{.{ .satoshis = pay_out.satoshis / 2, .locking_script = &payee }}, .{ .key_id = "x y", .counterparty = .self }, 100, true);
+    _ = try wc.putTx(other.txid, other.raw);
+    _ = try wc.addHeaders(&.{&mine(hdr.hash(&p.h1001), other.txid, 1_700_001_800)});
+    try std.testing.expectEqual(lib.wallet.Status.proven, try wc.addProof(other.txid, try soloPath(a, 1002, other.txid)));
+    try std.testing.expectEqual(lib.wallet.Status.rejected, try wc.status(ca.txid));
+    try std.testing.expectEqual(lib.wallet.Status.rejected, try wc.status(cb.txid));
+    try std.testing.expectEqualStrings("double-spent", (try wc.settlement(ca.txid)).?.getText("reason").?);
+    _ = try wc.save();
+    // The payment's output is spent by the proven transaction: nothing of ours is spendable.
+    try std.testing.expectEqual(@as(usize, 0), (try wc.listOutputs("default", false)).len);
+
+    // Never mined: B broadcast at 1000, still unproven at the deadline, is abandoned (A stands).
+    var wa = try lib.wallet.Wallet.load(a, s, base, .regtest);
+    wa.now = 1000;
+    try wa.noteBroadcast(cb.txid, "https://arc.test", "SEEN_ON_NETWORK");
+    wa.now = 1000 + 3_600_000 - 1;
+    try std.testing.expect(!(try wa.abandonIfDue(cb.txid, 3_600_000)));
+    try wa.noteBroadcast(cb.txid, "https://arc.test", "SEEN_IN_ORPHAN_MEMPOOL"); // keeps its `since`
+    wa.now = 1000 + 3_600_000;
+    try std.testing.expect(try wa.abandonIfDue(cb.txid, 3_600_000));
+    try std.testing.expectEqual(lib.wallet.Status.rejected, try wa.status(cb.txid));
+    try std.testing.expectEqual(lib.wallet.Status.unproven, try wa.status(ca.txid));
+    try std.testing.expectEqualStrings("abandoned", (try wa.settlement(cb.txid)).?.getText("reason").?);
+    try std.testing.expect((try wa.awaitingRecord(cb.txid)) == null);
+    _ = try wa.save();
+    // A's change is spendable again; A's own input stays spent.
+    const def = try wa.listOutputs("default", false);
+    try std.testing.expectEqual(@as(usize, 1), def.len);
+    try std.testing.expectEqualSlices(u8, &ca.txid, &def[0].txid);
+    counts.wallet += 1;
+}
+
+fn cbor_cid(b: u8) [36]u8 {
+    return lib.cbor.cidOf(&.{b});
+}
+
 test "zz: vector counts" {
     std.debug.print("\nvectors passed: tx {d} (fees {d}), beef {d}, merkle {d}, headers {d}, brc29 {d}, wire {d}, signing {d}; wallet scenarios {d}\n", .{ counts.tx, counts.fee, counts.beef, counts.path, counts.header, counts.brc29, counts.wire, counts.sign, counts.wallet });
 }

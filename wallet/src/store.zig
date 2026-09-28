@@ -204,6 +204,12 @@ pub const Map = struct {
         } else try self.f().prefixed(self.maps.arena, self.root, prefix, &out);
         return out.items;
     }
+    /// Every entry whose key is at least `lo`, in key order.
+    pub fn from(self: *Map, lo: []const u8) ![]mst.KV {
+        var out = std.array_list.Managed(mst.KV).init(self.maps.arena);
+        try self.f().range(self.maps.arena, self.root, lo, null, &out);
+        return out.items;
+    }
     pub fn count(self: *Map) !usize {
         return self.f().count(self.root);
     }
