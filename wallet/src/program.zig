@@ -23,9 +23,10 @@
 //! Plain entries (docs/WALLET.md): {kind: "header", raw}, {kind: "proof",
 //! subject, txid, path}, {kind: "status", subject, txid, txStatus, merklePath?}.
 //!
-//! Attested calls: the oracle over the `wallet` import (getPublicKey,
-//! createSignature: no key is ever here), and `http` (ARC: broadcast, status
-//! re-query). After a broadcast the thread awaits its transaction's CID with
+//! Recorded calls: the oracle over the `wallet` import (getPublicKey,
+//! createSignature: no key is ever here), and HTTP to ARC (broadcast, status
+//! re-query) — the `http` import in the preview1 build, standard wasi:http in
+//! the component build (#15, wasi_http.zig), the same requests either way. After a broadcast the thread awaits its transaction's CID with
 //! a deadline; a `status`/`proof` entry for it, or the deadline, steps it.
 const std = @import("std");
 const w = @import("wallet");
