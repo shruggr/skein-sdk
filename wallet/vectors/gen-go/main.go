@@ -203,6 +203,10 @@ type MainnetHeader struct {
 // The run of consecutive headers used for chain validation vectors.
 const runStart, runLen = 814430, 12
 
+// The first mainnet headers from genesis: the wallet's chain is anchored at
+// the network's genesis header (#29), so its chain tests start there.
+const genesisRunLen = 11
+
 func fetch() error {
 	var f Fixtures
 	if err := readJSON("../inputs/fixtures.json", &f); err != nil {
@@ -210,6 +214,9 @@ func fetch() error {
 	}
 	heights := map[uint32]bool{}
 	for h := uint32(runStart); h < runStart+runLen; h++ {
+		heights[h] = true
+	}
+	for h := uint32(0); h < genesisRunLen; h++ {
 		heights[h] = true
 	}
 	for _, b := range f.Beefs {
@@ -257,6 +264,9 @@ func fetch() error {
 		if err != nil || len(bits) != 4 {
 			return fmt.Errorf("height %d: bits %q", h, w.Bits)
 		}
+		if h == 0 {
+			w.PreviousHash = strings.Repeat("0", 64) // WhatsOnChain leaves it out for genesis
+		}
 		hdr := block.Header{
 			Version:    w.Version,
 			PrevHash:   *must(chainhash.NewHashFromHex(w.PreviousHash)),
@@ -295,6 +305,7 @@ func gen() error {
 		{"../headers.json", func() (any, error) { return genHeaders(mh) }},
 		{"../brc29.json", func() (any, error) { return genBrc29() }},
 		{"../wire.json", func() (any, error) { return genWire() }},
+		{"../signing.json", genSigning},
 	}
 	for _, s := range steps {
 		v, err := s.f()
@@ -456,7 +467,7 @@ type BeefCase struct {
 	Atomic        bool         `json:"atomic"`
 	SubjectTxid   string       `json:"subjectTxid,omitempty"` // atomic: the txid it names; else the last tx
 	Bumps         []BumpCase   `json:"bumps"`
-	Txs           []BeefTxCase `json:"txs"` // sorted by txid
+	Txs           []BeefTxCase `json:"txs"`           // sorted by txid
 	Valid         bool         `json:"valid"`         // go-sdk Beef.IsValid(false)
 	ValidTxidOnly bool         `json:"validTxidOnly"` // go-sdk Beef.IsValid(true)
 	Reserialized  string       `json:"reserialized"`  // go-sdk Beef.Bytes() of the parsed BEEF (tx order is go-sdk's)
@@ -743,6 +754,23 @@ func genHeaders(mh []MainnetHeader) (any, error) {
 			return nil, fmt.Errorf("run is not a chain at %d", run[i].Height)
 		}
 	}
+	// The run from genesis: the anchor (height 0) and its first successors.
+	var genesisRun []HeaderCase
+	gwork := big.NewInt(0)
+	for _, c := range all {
+		if c.Height < genesisRunLen {
+			genesisRun = append(genesisRun, c)
+			gwork = chainmanager_AddWork(gwork, c.Bits)
+		}
+	}
+	if len(genesisRun) != genesisRunLen || genesisRun[0].PrevHash != strings.Repeat("0", 64) {
+		return nil, fmt.Errorf("genesis run: %d headers", len(genesisRun))
+	}
+	for i := 1; i < len(genesisRun); i++ {
+		if genesisRun[i].PrevHash != genesisRun[i-1].Hash || genesisRun[i].Height != genesisRun[i-1].Height+1 {
+			return nil, fmt.Errorf("genesis run is not a chain at %d", genesisRun[i].Height)
+		}
+	}
 	// Tampered headers: each must fail exactly the stated check.
 	first := must(hex.DecodeString(run[1].Hex))
 	nonce := append([]byte(nil), first...)
@@ -772,14 +800,16 @@ func genHeaders(mh []MainnetHeader) (any, error) {
 		bits = append(bits, v)
 	}
 	return map[string]any{
-		"about":         "Block headers (80 bytes): fields and hash (go-sdk block.Header), target and work from bits (go-chaintracks chainmanager_CompactToBig / CalculateWork), proof of work (hash <= target). `run` is consecutive mainnet headers: each prevHash is the previous hash; `runWork` is the run's summed work (AddWork).",
-		"headers":       all,
-		"runStart":      runStart,
-		"runLen":        runLen,
-		"runWork":       chainmanager_ChainWorkToHex(work),
-		"tampered":      tampered,
-		"bits":          bits,
-		"tamperedAbout": "Each tampered header is run[1] altered; prevHashLinks says whether it still links to run[0].",
+		"about":          "Block headers (80 bytes): fields and hash (go-sdk block.Header), target and work from bits (go-chaintracks chainmanager_CompactToBig / CalculateWork), proof of work (hash <= target). `run` is consecutive mainnet headers: each prevHash is the previous hash; `runWork` is the run's summed work (AddWork). Heights 0..genesisRunLen-1 are mainnet's first headers from genesis, the chain anchor; `genesisRunWork` is their summed work, genesis included.",
+		"headers":        all,
+		"runStart":       runStart,
+		"runLen":         runLen,
+		"runWork":        chainmanager_ChainWorkToHex(work),
+		"genesisRunLen":  genesisRunLen,
+		"genesisRunWork": chainmanager_ChainWorkToHex(gwork),
+		"tampered":       tampered,
+		"bits":           bits,
+		"tamperedAbout":  "Each tampered header is run[1] altered; prevHashLinks says whether it still links to run[0].",
 	}, nil
 }
 
@@ -808,10 +838,10 @@ func genBrc29() (any, error) {
 		DerivationSuffix     string `json:"derivationSuffix"`
 		KeyID                string `json:"keyID"`
 		Invoice              string `json:"invoice"`
-		PayerDerivedKey      string `json:"payerDerivedKey"`  // sender: DerivePublicKey(counterparty = recipient, forSelf = false)
-		PayeeDerivedKey      string `json:"payeeDerivedKey"`  // recipient: DerivePublicKey(counterparty = sender, forSelf = true)
-		PayeePrivateKey      string `json:"payeePrivateKey"`  // recipient: DerivePrivateKey(counterparty = sender)
-		LockingScript        string `json:"lockingScript"`    // P2PKH of the derived key
+		PayerDerivedKey      string `json:"payerDerivedKey"` // sender: DerivePublicKey(counterparty = recipient, forSelf = false)
+		PayeeDerivedKey      string `json:"payeeDerivedKey"` // recipient: DerivePublicKey(counterparty = sender, forSelf = true)
+		PayeePrivateKey      string `json:"payeePrivateKey"` // recipient: DerivePrivateKey(counterparty = sender)
+		LockingScript        string `json:"lockingScript"`   // P2PKH of the derived key
 	}
 	var cases []Case
 	type Remit struct {

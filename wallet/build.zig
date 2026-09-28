@@ -5,6 +5,8 @@
 //   zig build program      the handler program (wasm32-wasi) → zig-out/bin/wallet.wasm
 //
 // bsvz comes from ../.build/bsvz (scripts/fetch-bsvz.sh pins and patches it).
+// The index maps are the kernel's Merkle search trees: ../kernel-zig/src/mst.zig
+// (with its cbor.zig and cid.zig) built as the module "mst" — shared, not copied.
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -49,12 +51,27 @@ fn bsvzModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     return b.dependency("bsvz", .{ .target = target, .optimize = optimize }).module("bsvz");
 }
 
+fn mstModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("../kernel-zig/src/mst.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn imports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) []const std.Build.Module.Import {
+    return b.allocator.dupe(std.Build.Module.Import, &.{
+        .{ .name = "bsvz", .module = bsvzModule(b, target, optimize) },
+        .{ .name = "mst", .module = mstModule(b, target, optimize) },
+    }) catch @panic("OOM");
+}
+
 fn libModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "bsvz", .module = bsvzModule(b, target, optimize) }},
+        .imports = imports(b, target, optimize),
     });
 }
 
@@ -63,6 +80,6 @@ fn testModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .root_source_file = b.path("test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "bsvz", .module = bsvzModule(b, target, optimize) }},
+        .imports = imports(b, target, optimize),
     });
 }
