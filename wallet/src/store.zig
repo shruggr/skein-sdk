@@ -1,6 +1,8 @@
-//! The record store as the wallet sees it: get a record's bytes by CID, put
-//! dag-cbor bytes and get their CID. In the VM this is the `skein` get/put
-//! imports (program.zig); in tests, MemStore. Index maps are records too.
+//! The record store as the wallet sees it: get a block's bytes by CID, put
+//! dag-cbor bytes and get their CID, put a block under a CID made here
+//! (bitcoin-tx / bitcoin-block: the txid / block hash). In the VM this is the
+//! `skein` get/put/putblock imports (program.zig); in tests, MemStore. Index
+//! maps are records too.
 const std = @import("std");
 const cbor = @import("cbor.zig");
 
@@ -8,12 +10,22 @@ pub const Store = struct {
     ptr: *anyopaque,
     getFn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, cid: []const u8) anyerror![]const u8,
     putFn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, bytes: []const u8) anyerror![]const u8,
+    putBlockFn: *const fn (ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void,
 
     pub fn get(self: Store, arena: std.mem.Allocator, cid: []const u8) ![]const u8 {
         return self.getFn(self.ptr, arena, cid);
     }
     pub fn put(self: Store, arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
         return self.putFn(self.ptr, arena, bytes);
+    }
+    pub fn putBlock(self: Store, cid: []const u8, bytes: []const u8) !void {
+        return self.putBlockFn(self.ptr, cid, bytes);
+    }
+    /// A transaction (bitcoin-tx) or an 80-byte header (bitcoin-block), under its own CID.
+    pub fn putBitcoin(self: Store, arena: std.mem.Allocator, codec: Codec, bytes: []const u8) ![]const u8 {
+        const c = try arena.dupe(u8, &bitcoinCid(codec, bytes));
+        try self.putBlock(c, bytes);
+        return c;
     }
     pub fn getValue(self: Store, arena: std.mem.Allocator, cid: []const u8) !cbor.Value {
         return cbor.decode(arena, try self.get(arena, cid));
@@ -22,6 +34,30 @@ pub const Store = struct {
         return self.put(arena, try cbor.encode(arena, v));
     }
 };
+
+pub const Codec = enum(u8) { block = 0xb0, tx = 0xb1 };
+
+/// CIDv1, bitcoin-tx (0xb1) or bitcoin-block (0xb0), dbl-sha2-256 (0x56): the
+/// digest is the txid / block hash in internal byte order.
+pub fn bitcoinCid(codec: Codec, bytes: []const u8) [37]u8 {
+    var c: [37]u8 = .{ 0x01, @intFromEnum(codec), 0x01, 0x56, 0x20 } ++ .{0} ** 32;
+    c[5..37].* = dblSha256(bytes);
+    return c;
+}
+
+/// The txid / block hash a bitcoin CID names, or null for any other CID.
+pub fn bitcoinHash(cid: []const u8) ?[32]u8 {
+    if (cid.len != 37 or cid[0] != 1 or (cid[1] != 0xb0 and cid[1] != 0xb1) or cid[2] != 1 or cid[3] != 0x56 or cid[4] != 0x20) return null;
+    return cid[5..37].*;
+}
+
+pub fn dblSha256(bytes: []const u8) [32]u8 {
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &a, .{});
+    std.crypto.hash.sha2.Sha256.hash(&a, &b, .{});
+    return b;
+}
 
 /// An in-memory store for tests: CIDv1 dag-cbor sha2-256, as the runtime names records.
 pub const MemStore = struct {
@@ -40,7 +76,7 @@ pub const MemStore = struct {
         self.blocks.deinit(self.gpa);
     }
     pub fn store(self: *MemStore) Store {
-        return .{ .ptr = self, .getFn = getImpl, .putFn = putImpl };
+        return .{ .ptr = self, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl };
     }
     fn getImpl(ptr: *anyopaque, arena: std.mem.Allocator, cid: []const u8) anyerror![]const u8 {
         const self: *MemStore = @ptrCast(@alignCast(ptr));
@@ -60,6 +96,17 @@ pub const MemStore = struct {
             try self.blocks.put(self.gpa, k, try self.gpa.dupe(u8, canon));
         }
         return arena.dupe(u8, &cid);
+    }
+    /// As the kernel's putblock: bitcoin CIDs only here, hash-checked.
+    fn putBlockImpl(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
+        const self: *MemStore = @ptrCast(@alignCast(ptr));
+        const h = bitcoinHash(cid) orelse return error.UnsupportedCid;
+        if (cid[1] == 0xb0 and bytes.len != 80) return error.HashMismatch;
+        if (!std.mem.eql(u8, &h, &dblSha256(bytes))) return error.HashMismatch;
+        if (self.blocks.contains(cid)) return;
+        const k = try self.gpa.dupe(u8, cid);
+        errdefer self.gpa.free(k);
+        try self.blocks.put(self.gpa, k, try self.gpa.dupe(u8, bytes));
     }
     pub fn count(self: *const MemStore) usize {
         return self.blocks.count();

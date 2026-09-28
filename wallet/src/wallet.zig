@@ -71,18 +71,24 @@ fn textArray(arena: std.mem.Allocator, xs: []const []const u8) ![]Value {
     return out;
 }
 
+pub const Network = chain_mod.Network;
+
 pub const Wallet = struct {
     arena: std.mem.Allocator,
     store: Store,
+    network: Network,
     ix: [index_names.len]Index,
     cids: [index_names.len]?[]const u8,
 
-    pub fn load(arena: std.mem.Allocator, s: Store, state: ?[]const u8) !Wallet {
-        var w = Wallet{ .arena = arena, .store = s, .ix = undefined, .cids = .{null} ** index_names.len };
+    /// The wallet the state record names (null: a new one) on `network`; a
+    /// state made for another network is refused.
+    pub fn load(arena: std.mem.Allocator, s: Store, state: ?[]const u8, network: Network) !Wallet {
+        var w = Wallet{ .arena = arena, .store = s, .network = network, .ix = undefined, .cids = .{null} ** index_names.len };
         var st: ?Value = null;
         if (state) |c| {
             const v = try s.getValue(arena, c);
             if (!std.mem.eql(u8, v.getText("kind") orelse "", "wallet-state")) return error.BadState;
+            if (!std.mem.eql(u8, v.getText("network") orelse "", @tagName(network))) return error.NetworkMismatch;
             st = v.get("indexes") orelse return error.BadState;
         }
         for (index_names, 0..) |n, i| {
@@ -98,7 +104,7 @@ pub const Wallet = struct {
     }
 
     pub fn chain(self: *Wallet) chain_mod.Chain {
-        return .{ .arena = self.arena, .store = self.store, .headers = self.index("headers") };
+        return .{ .arena = self.arena, .store = self.store, .headers = self.index("headers"), .network = self.network };
     }
 
     /// Rebuild the derived indexes, write every changed index and a state record; → its CID.
@@ -114,26 +120,24 @@ pub const Wallet = struct {
         }
         return self.store.putValue(self.arena, .{ .map = &.{
             .{ .key = "kind", .value = .{ .text = "wallet-state" } },
+            .{ .key = "network", .value = .{ .text = @tagName(self.network) } },
             .{ .key = "indexes", .value = .{ .map = es } },
         } });
     }
 
     // ------------------------------------------------------------ records
 
+    /// A transaction we hold: a bitcoin-tx block, its CID the txid.
     fn txRaw(self: *Wallet, txid: [32]u8) !?[]const u8 {
         const v = self.index("txs").get(&hdr.toHex(txid)) orelse return null;
         if (v != .cid) return error.BadRecord;
-        const rec = try self.store.getValue(self.arena, v.cid);
-        return rec.getBytes("raw") orelse error.BadRecord;
+        return try self.store.get(self.arena, v.cid);
     }
 
     fn putTx(self: *Wallet, txid: [32]u8, raw: []const u8) ![]const u8 {
         const key = hdr.toHex(txid);
         if (self.index("txs").get(&key)) |v| if (v == .cid) return v.cid;
-        const cid = try self.store.putValue(self.arena, .{ .map = &.{
-            .{ .key = "kind", .value = .{ .text = "tx" } },
-            .{ .key = "raw", .value = .{ .bytes = raw } },
-        } });
+        const cid = try self.store.putBitcoin(self.arena, .tx, raw);
         try self.index("txs").put(self.arena, &key, .{ .cid = cid });
         return cid;
     }
@@ -214,10 +218,6 @@ pub const Wallet = struct {
     }
 
     // ------------------------------------------------------------ operations
-
-    pub fn checkpoint(self: *Wallet, height: u32, raw: []const u8) !void {
-        try self.chain().checkpoint(height, raw);
-    }
 
     pub fn addHeaders(self: *Wallet, raws: []const []const u8) !chain_mod.Chain.AddResult {
         return self.chain().add(raws);

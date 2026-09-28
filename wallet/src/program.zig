@@ -9,7 +9,6 @@
 //! the thread, and prints its CID (hex) on stdout.
 //!
 //! Body operations (dag-cbor; docs/WALLET.md):
-//!   {op: "checkpoint", height, header}          the trusted starting header (into an empty chain)
 //!   {op: "headers", headers: [bytes]}           a run of headers, parents first (ChainTracks)
 //!   {op: "internalize", tx, outputs, description, labels?}   BRC-100 internalizeAction (Atomic BEEF)
 //!   {op: "proof", txid, path}                   a merkle path (BRC-74) for a transaction we hold
@@ -27,6 +26,7 @@ const sk = struct {
     extern "skein" fn input(out: [*]u8, cap: u32) i32;
     extern "skein" fn get(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn put(data: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    extern "skein" fn putblock(cid: [*]const u8, cid_len: u32, data: [*]const u8, len: u32) i32;
     extern "skein" fn keep(cid: [*]const u8, cid_len: u32) i32;
     extern "skein" fn head(name: [*]const u8, name_len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
@@ -63,9 +63,12 @@ const VmStore = struct {
     fn putImpl(_: *anyopaque, arena: std.mem.Allocator, bytes: []const u8) anyerror![]const u8 {
         return result(arena, sk.put, .{ bytes.ptr, @as(u32, @intCast(bytes.len)) });
     }
+    fn putBlockImpl(_: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
+        if (sk.putblock(cid.ptr, @intCast(cid.len), bytes.ptr, @intCast(bytes.len)) < 0) return failed();
+    }
     var dummy: u8 = 0;
     fn store() w.store.Store {
-        return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl };
+        return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl };
     }
 };
 
@@ -134,8 +137,14 @@ fn run(a: std.mem.Allocator) !void {
     };
     const op = body.getText("op") orelse return error.BadBody;
 
+    // The network (its genesis header anchors the chain): genesis defaults.walletNetwork, else mainnet.
+    const net_name = if (step.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
+    const network = w.chain.Network.parse(net_name) orelse {
+        std.log.err("defaults.walletNetwork: {s} is not main, test or regtest", .{net_name});
+        return error.BadConfig;
+    };
     const state_cid = try result(a, sk.head, .{ head_name.ptr, @as(u32, head_name.len) });
-    var wal = try w.wallet.Wallet.load(a, s, if (state_cid.len > 0) state_cid else null);
+    var wal = try w.wallet.Wallet.load(a, s, if (state_cid.len > 0) state_cid else null, network);
 
     var out: std.ArrayList(cbor.Entry) = .empty;
     try out.appendSlice(a, &.{
@@ -144,13 +153,7 @@ fn run(a: std.mem.Allocator) !void {
     });
     var mutates = true;
 
-    if (std.mem.eql(u8, op, "checkpoint")) {
-        const height = (try field(body, "height"));
-        const raw = try field(body, "header");
-        if (height != .uint or raw != .bytes) return error.BadBody;
-        try wal.checkpoint(@intCast(height.uint), raw.bytes);
-        try out.append(a, .{ .key = "height", .value = height });
-    } else if (std.mem.eql(u8, op, "headers")) {
+    if (std.mem.eql(u8, op, "headers")) {
         const list = try field(body, "headers");
         if (list != .array) return error.BadBody;
         const raws = try a.alloc([]const u8, list.array.len);

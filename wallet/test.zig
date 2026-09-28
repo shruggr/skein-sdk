@@ -236,7 +236,7 @@ test "vectors: headers — fields, hash, target, work, PoW, links (go-sdk, go-ch
         counts.header += 1;
     }
 
-    // The run as a chain: a checkpoint at its first header, the rest added in one batch.
+    // The run far from genesis: its work, and its links.
     const run_start: u32 = @intCast(int(v, "runStart"));
     const run_len: u32 = @intCast(int(v, "runLen"));
     var run: std.ArrayList([]const u8) = .empty;
@@ -245,18 +245,50 @@ test "vectors: headers — fields, hash, target, work, PoW, links (go-sdk, go-ch
         const h: u32 = @intCast(int(c, "height"));
         if (h < run_start or h >= run_start + run_len) continue;
         const raw = try unhex(a, str(c, "hex"));
+        if (run.items.len > 0) try std.testing.expect(std.mem.eql(u8, &(try hdr.Header.parse(raw)).prev_hash, &hdr.hash(run.items[run.items.len - 1][0..80])));
         try run.append(a, raw);
         run_work += hdr.work(hdr.target((try hdr.Header.parse(raw)).bits).?);
     }
     try std.testing.expectEqualStrings(str(v, "runWork"), &hdr.u256Hex(run_work));
-    var ms = lib.store.MemStore.init(std.testing.allocator);
-    defer ms.deinit();
-    var headers_ix = lib.store.Index{ .name = "headers" };
-    const ch = lib.chain.Chain{ .arena = a, .store = ms.store(), .headers = &headers_ix };
-    try ch.checkpoint(run_start, run.items[0]);
-    const res = try ch.add(run.items[1..]);
-    try std.testing.expectEqual(run_len - 1, res.added);
-    try std.testing.expectEqual(run_start + run_len - 1, res.tip);
+
+    // The chain from the anchor: mainnet's genesis header is the chain's constant, and the
+    // first real headers extend it (with or without the genesis at the batch's head).
+    const glen: u32 = @intCast(int(v, "genesisRunLen"));
+    var grun: std.ArrayList([]const u8) = .empty;
+    var gwork: u256 = 0;
+    for (headers) |c| {
+        const h: u32 = @intCast(int(c, "height"));
+        if (h >= glen) continue;
+        const raw = try unhex(a, str(c, "hex"));
+        try grun.append(a, raw);
+        gwork += hdr.work(hdr.target((try hdr.Header.parse(raw)).bits).?);
+    }
+    try std.testing.expectEqualStrings(str(v, "genesisRunWork"), &hdr.u256Hex(gwork));
+    const main_genesis = lib.chain.Network.main.genesis();
+    try std.testing.expectEqualSlices(u8, grun.items[0], &main_genesis);
+    for ([_]bool{ false, true }) |with_genesis| {
+        var ms = lib.store.MemStore.init(std.testing.allocator);
+        defer ms.deinit();
+        var headers_ix = lib.store.Index{ .name = "headers" };
+        const ch = lib.chain.Chain{ .arena = a, .store = ms.store(), .headers = &headers_ix, .network = .main };
+        const res = try ch.add(if (with_genesis) grun.items else grun.items[1..]);
+        try std.testing.expectEqual(glen - 1, res.added);
+        try std.testing.expectEqual(@as(u32, if (with_genesis) 1 else 0), res.known);
+        try std.testing.expectEqual(glen - 1, res.tip);
+        // The header's block is its hash: a bitcoin-block CID.
+        const at5 = (try ch.at(5)).?;
+        try std.testing.expectEqualSlices(u8, grun.items[5], &at5.raw);
+        var kb: [10]u8 = undefined;
+        const c5 = headers_ix.get(lib.chain.heightKey(&kb, 5)).?.cid;
+        try std.testing.expectEqualSlices(u8, &at5.hash, &lib.store.bitcoinHash(c5).?);
+        // Again: all known. The run far away does not connect. Testnet's anchor is another chain.
+        try std.testing.expectEqual(glen - 1, (try ch.add(grun.items[1..])).known);
+        try std.testing.expectError(error.Unconnected, ch.add(run.items));
+        var ix2 = lib.store.Index{ .name = "headers" };
+        const tch = lib.chain.Chain{ .arena = a, .store = ms.store(), .headers = &ix2, .network = .@"test" };
+        try std.testing.expectError(error.Unconnected, tch.add(grun.items[1..]));
+        counts.header += 1;
+    }
     // Tampered copies of run[1]: each fails its check.
     for (arr(v, "tampered")) |t| {
         const c = t.object.get("case").?;
@@ -334,6 +366,29 @@ test "vectors: BRC-100 getPublicKey wire frames (go-sdk serializer)" {
 
 // ---------------------------------------------------------------- the wallet over records
 
+/// A regtest chain from its genesis up to `tip`, the header at each height in
+/// `roots` carrying that merkle root (the rest a filler). Heights 1..tip.
+fn regtestChain(a: std.mem.Allocator, tip: u32, roots: []const struct { u32, [32]u8 }) ![][80]u8 {
+    const out = try a.alloc([80]u8, tip);
+    var prev = hdr.hash(&lib.chain.Network.regtest.genesis());
+    for (out, 1..) |*h, height| {
+        var root: [32]u8 = .{0x5a} ** 32;
+        std.mem.writeInt(u32, root[0..4], @intCast(height), .little);
+        for (roots) |r| if (r[0] == height) {
+            root = r[1];
+        };
+        h.* = mine(prev, root, 1_700_000_000 + @as(u32, @intCast(height)) * 600);
+        prev = hdr.hash(h);
+    }
+    return out;
+}
+
+fn slices(a: std.mem.Allocator, hs: []const [80]u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, hs.len);
+    for (hs, out) |*h, *o| o.* = h;
+    return out;
+}
+
 /// Mine a header at regtest difficulty (0x207fffff): a nonce search of a few tries.
 fn mine(prev: [32]u8, merkle_root: [32]u8, time: u32) [80]u8 {
     var h = hdr.Header{ .version = 1, .prev_hash = prev, .merkle_root = merkle_root, .time = time, .bits = 0x207fffff, .nonce = 0 };
@@ -382,14 +437,12 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     };
     const root = beef.rootFor(a, bump, proven_txid).?;
 
-    // Our chain: a checkpoint at 999, then 1000 carrying that root, then 1001.
-    var w = try lib.wallet.Wallet.load(a, s, null);
-    const cp = mine(.{0} ** 32, .{7} ** 32, 1_700_000_000);
-    try w.checkpoint(bump.block_height - 1, &cp);
-    const h1000 = mine(hdr.hash(&cp), root, 1_700_000_600);
-    const h1001 = mine(hdr.hash(&h1000), .{9} ** 32, 1_700_001_200);
-    const added = try w.addHeaders(&.{ &h1000, &h1001 });
-    try std.testing.expectEqual(@as(u32, 2), added.added);
+    // Our chain: regtest from its genesis, 1000 carrying that root, up to 1001.
+    var w = try lib.wallet.Wallet.load(a, s, null, .regtest);
+    const chain = try regtestChain(a, bump.block_height + 1, &.{.{ bump.block_height, root }});
+    const h1001 = chain[chain.len - 1];
+    const added = try w.addHeaders(try slices(a, chain));
+    try std.testing.expectEqual(@as(u32, 1001), added.added);
     try std.testing.expectError(error.Unconnected, w.addHeaders(&.{&mine(.{1} ** 32, .{2} ** 32, 5)}));
 
     // The payment: the payer spends the funding output to a BRC-29 key derived for us.
@@ -433,7 +486,8 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
 
     const state1 = try w.save();
     // A fresh load from the state record sees the same wallet.
-    var w2 = try lib.wallet.Wallet.load(a, s, state1);
+    try std.testing.expectError(error.NetworkMismatch, lib.wallet.Wallet.load(a, s, state1, .main));
+    var w2 = try lib.wallet.Wallet.load(a, s, state1, .regtest);
     const list = try w2.listOutputs("default", false);
     try std.testing.expectEqual(@as(usize, 1), list.len);
     try std.testing.expect(std.mem.eql(u8, &list[0].txid, &pay_txid));
@@ -443,6 +497,8 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     // The funding transactions are known (records), but only the payment is our action.
     try std.testing.expectEqual(@as(usize, 1), w2.indexCount("actions"));
     try std.testing.expectEqual(@as(usize, 3), w2.indexCount("txs"));
+    // A transaction's block is its txid: a bitcoin-tx CID.
+    try std.testing.expectEqualSlices(u8, &pay_txid, &lib.store.bitcoinHash(w2.indexGet("txs", &hdr.toHex(pay_txid)).?.cid).?);
     try std.testing.expect(w2.indexGet("byStatus", "unproven") != null);
 
     // The payment is mined at 1002: a single-transaction block, root = txid.
@@ -457,7 +513,7 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     const state2 = try w2.save();
 
     // A reorg: a heavier branch from 1001 without our block. Status is computed, so it drops back.
-    var w3 = try lib.wallet.Wallet.load(a, s, state2);
+    var w3 = try lib.wallet.Wallet.load(a, s, state2, .regtest);
     const alt1 = mine(hdr.hash(&h1001), .{3} ** 32, 1_700_001_801);
     const alt2 = mine(hdr.hash(&alt1), .{4} ** 32, 1_700_001_802);
     const re = try w3.addHeaders(&.{ &alt1, &alt2 });
@@ -470,7 +526,7 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     _ = try w3.save();
 
     // Idempotence: internalizing the same payment again changes nothing.
-    var w4 = try lib.wallet.Wallet.load(a, s, state1);
+    var w4 = try lib.wallet.Wallet.load(a, s, state1, .regtest);
     _ = try w4.internalize(.{ .tx = pay_beef, .outputs = &.{.{ .output_index = 0, .payment = remit }}, .description = "again" }, oracle.oracle());
     try std.testing.expectEqualStrings(state1, try w4.save());
     counts.wallet += 1;
@@ -490,10 +546,9 @@ test "wallet: basket insertion, spent outputs, BEEF refusals" {
         if (std.mem.eql(u8, str(c, "name"), "utv-1-in-1-out-v2")) two_hex = str(c, "hex");
     }
     const fund = try beef.parse(a, try unhex(a, fund_hex));
-    var w = try lib.wallet.Wallet.load(a, ms.store(), null);
+    var w = try lib.wallet.Wallet.load(a, ms.store(), null, .regtest);
     var oracle = KeyOracle{ .priv = .{1} ** 32 };
     // No headers: the BUMP's height is unknown.
-    try std.testing.expectError(error.NoCheckpoint, w.addHeaders(&.{&mine(.{0} ** 32, .{0} ** 32, 1)}));
     try std.testing.expectError(error.UnknownHeader, w.internalize(.{ .tx = try unhex(a, fund_hex), .outputs = &.{.{ .output_index = 0, .insertion = .{ .basket = "tokens" } }}, .description = "x" }, oracle.oracle()));
     // Not atomic.
     try std.testing.expectError(error.NotAtomicBeef, w.internalize(.{ .tx = try unhex(a, two_hex), .outputs = &.{.{ .output_index = 0, .insertion = .{ .basket = "tokens" } }}, .description = "x" }, oracle.oracle()));
@@ -502,9 +557,7 @@ test "wallet: basket insertion, spent outputs, BEEF refusals" {
     for (fund.entries) |e| if (e.format == .raw_with_bump) {
         proven_txid = e.txid;
     };
-    const cp = mine(.{0} ** 32, .{7} ** 32, 1);
-    try w.checkpoint(fund.bumps[0].block_height - 1, &cp);
-    _ = try w.addHeaders(&.{&mine(hdr.hash(&cp), beef.rootFor(a, fund.bumps[0], proven_txid).?, 2)});
+    _ = try w.addHeaders(try slices(a, try regtestChain(a, fund.bumps[0].block_height, &.{.{ fund.bumps[0].block_height, beef.rootFor(a, fund.bumps[0], proven_txid).? }})));
     // A wrong-root header at the BUMP's height would have failed; with the right one it passes.
     try std.testing.expectError(error.BadBasket, w.internalize(.{ .tx = try unhex(a, fund_hex), .outputs = &.{.{ .output_index = 0, .insertion = .{ .basket = "default" } }}, .description = "x" }, oracle.oracle()));
     try std.testing.expectError(error.BadOutputIndex, w.internalize(.{ .tx = try unhex(a, fund_hex), .outputs = &.{.{ .output_index = 5, .insertion = .{ .basket = "tokens" } }}, .description = "x" }, oracle.oracle()));
