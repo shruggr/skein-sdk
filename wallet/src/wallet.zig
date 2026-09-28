@@ -631,6 +631,65 @@ pub const Wallet = struct {
         }
     };
 
+    // ------------------------------------------------------------ broadcast and its callback
+
+    pub const Outcome = enum { proven, pending, rejected };
+
+    /// ARC's txStatus, as the wallet reads it: rejected, or not (yet).
+    pub fn isRejection(tx_status: []const u8) bool {
+        for ([_][]const u8{ "REJECTED", "DOUBLE_SPEND_ATTEMPTED", "INVALID", "MALFORMED" }) |s| if (std.mem.eql(u8, s, tx_status)) return true;
+        return false;
+    }
+
+    /// A transaction of ours now awaits its status: the `awaiting` map names
+    /// the broadcast record (the ARC it went to, the last status heard).
+    pub fn noteBroadcast(self: *Wallet, txid: [32]u8, arc: []const u8, tx_status: []const u8) !void {
+        const a = self.arena;
+        const cid = try self.store.putValue(a, .{ .map = &.{
+            .{ .key = "kind", .value = .{ .text = "broadcast" } },
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
+            .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &store_mod.bitcoinCid(.tx, (try self.txRaw(txid)) orelse return error.UnknownTransaction)) } },
+            .{ .key = "arc", .value = .{ .text = arc } },
+            .{ .key = "txStatus", .value = .{ .text = tx_status } },
+        } });
+        try self.map("awaiting").putLink(&txid, cid);
+    }
+
+    pub fn awaitingRecord(self: *Wallet, txid: [32]u8) !?Value {
+        const c = (try self.map("awaiting").link(&txid)) orelse return null;
+        return try self.record(c);
+    }
+
+    /// What a status says about one of our transactions (ARC's answer, or a
+    /// `status` / `proof` entry): a merkle path is a proof, checked against our
+    /// chain (a header not yet held leaves it pending); a rejection drops the
+    /// action and its outputs, so its inputs are spendable again. Proven or
+    /// rejected, it no longer awaits.
+    pub fn applyStatus(self: *Wallet, txid: [32]u8, tx_status: []const u8, merkle_path: ?[]const u8) !Outcome {
+        var outcome: Outcome = .pending;
+        if (merkle_path) |p| {
+            if (self.addProof(txid, p)) |_| {
+                outcome = .proven;
+            } else |e| switch (e) {
+                error.UnknownHeader => {},
+                else => return e,
+            }
+        } else if (isRejection(tx_status)) {
+            outcome = .rejected;
+            if (try self.map("actions").remove(&txid)) {
+                const raw = (try self.txRaw(txid)) orelse return error.BadRecord;
+                const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+                for (0..tx.outputs.len) |i| _ = try self.map("outputs").remove(&store_mod.outpointKey(txid, @intCast(i)));
+            }
+        } else if ((try self.status(txid)) == .proven) outcome = .proven;
+        if (outcome != .pending) {
+            _ = try self.map("awaiting").remove(&txid);
+        } else if (try self.awaitingRecord(txid)) |r| {
+            if (!std.mem.eql(u8, r.getText("txStatus") orelse "", tx_status) and tx_status.len > 0) try self.noteBroadcast(txid, r.getText("arc") orelse "", tx_status);
+        }
+        return outcome;
+    }
+
     pub fn mapCount(self: *Wallet, comptime name: []const u8) !usize {
         return self.map(name).count();
     }
