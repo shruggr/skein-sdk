@@ -23,14 +23,8 @@ extern void __wasm_import_skein_kernel_skein_keep(uint8_t *, size_t, uint8_t *);
 __attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("launch")))
 extern void __wasm_import_skein_kernel_skein_launch(uint8_t *, size_t, uint8_t *, size_t, uint8_t *);
 
-__attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("emit")))
-extern void __wasm_import_skein_kernel_skein_emit(uint8_t *, size_t, uint8_t *);
-
 __attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("await")))
 extern void __wasm_import_skein_kernel_skein_await(uint8_t *, size_t, uint8_t *);
-
-__attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("resolve")))
-extern void __wasm_import_skein_kernel_skein_resolve(uint8_t *, size_t, uint8_t *);
 
 __attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("head")))
 extern void __wasm_import_skein_kernel_skein_head(uint8_t *, size_t, uint8_t *);
@@ -1104,33 +1098,6 @@ bool skein_kernel_skein_launch(skein_kernel_skein_cid_t *program, skein_kernel_s
   }
 }
 
-bool skein_kernel_skein_emit(skein_kernel_skein_cid_t *cid, skein_kernel_skein_cid_t *ret, program_string_t *err) {
-  __attribute__((__aligned__(sizeof(void*))))
-  uint8_t ret_area[(3*sizeof(void*))];
-  uint8_t *ptr = (uint8_t *) &ret_area;
-  __wasm_import_skein_kernel_skein_emit((uint8_t *) (*cid).ptr, (*cid).len, ptr);
-  skein_kernel_skein_result_cid_string_t result;
-  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
-    case 0: {
-      result.is_err = false;
-      result.val.ok = (skein_kernel_skein_cid_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
-      break;
-    }
-    case 1: {
-      result.is_err = true;
-      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
-      break;
-    }
-  }
-  if (!result.is_err) {
-    *ret = result.val.ok;
-    return 1;
-  } else {
-    *err = result.val.err;
-    return 0;
-  }
-}
-
 bool skein_kernel_skein_await(skein_kernel_skein_cid_t *cid, program_string_t *err) {
   __attribute__((__aligned__(sizeof(void*))))
   uint8_t ret_area[(3*sizeof(void*))];
@@ -1149,33 +1116,6 @@ bool skein_kernel_skein_await(skein_kernel_skein_cid_t *cid, program_string_t *e
     }
   }
   if (!result.is_err) {
-    return 1;
-  } else {
-    *err = result.val.err;
-    return 0;
-  }
-}
-
-bool skein_kernel_skein_resolve(program_string_t *name, program_list_u8_t *ret, program_string_t *err) {
-  __attribute__((__aligned__(sizeof(void*))))
-  uint8_t ret_area[(3*sizeof(void*))];
-  uint8_t *ptr = (uint8_t *) &ret_area;
-  __wasm_import_skein_kernel_skein_resolve((uint8_t *) (*name).ptr, (*name).len, ptr);
-  skein_kernel_skein_result_list_u8_string_t result;
-  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
-    case 0: {
-      result.is_err = false;
-      result.val.ok = (program_list_u8_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
-      break;
-    }
-    case 1: {
-      result.is_err = true;
-      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
-      break;
-    }
-  }
-  if (!result.is_err) {
-    *ret = result.val.ok;
     return 1;
   } else {
     *err = result.val.err;

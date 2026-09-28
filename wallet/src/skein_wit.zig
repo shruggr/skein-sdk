@@ -125,14 +125,15 @@ pub fn @"await"(p: [*]const u8, n: u32) i32 {
     return 0;
 }
 
-/// An outbound message (#37: settlement messages): the emit record's CID →
-/// its envelope's signed-part CID.
-pub fn emit(p: [*]const u8, n: u32, out: [*]u8, cap: u32) i32 {
+/// An in-VM call (#40): a program's function → what it wrote to stdout.
+pub fn call(p: [*]const u8, n: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32 {
     var k = cid(p, n);
-    var r: c.skein_kernel_skein_cid_t = undefined;
+    var f = str(func, func_len);
+    var d = list(arg, arg_len);
+    var r: c.program_list_u8_t = undefined;
     var e: c.program_string_t = undefined;
-    if (!c.skein_kernel_skein_emit(&k, &r, &e)) return fail(&e);
-    return holdCid(r, out, cap);
+    if (!c.skein_kernel_skein_call(&k, &f, &d, &r, &e)) return fail(&e);
+    return hold(r, out, cap);
 }
 
 pub fn take(out: [*]u8, cap: u32) i32 {

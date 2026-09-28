@@ -14,7 +14,7 @@
 // sorts), CIDs are their binary form. Everything is allocated from the
 // caller's allocator (an arena, in practice).
 const std = @import("std");
-const cidm = @import("cid.zig");
+pub const cidm = @import("cid.zig");
 
 pub const Entry = struct { key: []const u8, value: Value };
 

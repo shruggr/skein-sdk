@@ -628,19 +628,12 @@ extern bool skein_kernel_skein_keep(skein_kernel_skein_cid_t *cid, program_strin
 // Open a thread running `program` (a program record) on `args` (a record);
 // its origin CID.
 extern bool skein_kernel_skein_launch(skein_kernel_skein_cid_t *program, skein_kernel_skein_cid_t *args, skein_kernel_skein_cid_t *ret, program_string_t *err);
-// An outbound message: an emit record carrying the complete envelope,
-// signed and encrypted by the program through `wallet`; checked, not
-// attested; its signed part's record CID. Handed on when the step ends.
-extern bool skein_kernel_skein_emit(skein_kernel_skein_cid_t *cid, skein_kernel_skein_cid_t *ret, program_string_t *err);
-// Rest on a reply to an envelope this step emitted (the step ends
-// `waiting` with `awaits`; an admitted envelope whose body's `replyTo` is
-// that CID is the thread's next input), or on a record in the store: the
-// subject of a plain entry to come (#29).
+// Rest on a record in the store (the step ends `waiting` with `awaits`):
+// a message this step sent (#40: the record the messagebox's `send` put —
+// an admitted message whose body's `replyTo` names it, from the identity it
+// was sent to, is the thread's next input), or the subject of a plain entry
+// to come (#29).
 extern bool skein_kernel_skein_await(skein_kernel_skein_cid_t *cid, program_string_t *err);
-// A handle "handle@domain" → the resolver's whole answer (dag-cbor
-// {identityKey, …}). Attested: the host's resolver answers, the answer is
-// recorded; replay reads the record.
-extern bool skein_kernel_skein_resolve(program_string_t *name, program_list_u8_t *ret, program_string_t *err);
 // The tree CID a named head points at; none if it has none (preview1:
 // n = 0). docs/VM.md "Heads".
 extern bool skein_kernel_skein_head(program_string_t *name, skein_kernel_skein_option_cid_t *ret, program_string_t *err);
