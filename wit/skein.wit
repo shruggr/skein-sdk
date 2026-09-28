@@ -75,10 +75,11 @@ interface skein {
   wallet: func(frame: list<u8>) -> result<list<u8>, string>;
 
   /// One HTTP request, dag-cbor {method, url, headers?, body?} → the response
-  /// {status, headers, body}, answered by the host and attested (op "http").
-  /// The pre-#15 shape: #15 replaces it with standard `wasi:http`
-  /// (`wasi:http/outgoing-handler`), answered and recorded the same way; the
-  /// world below then imports that instead.
+  /// {status, headers, body}, answered by the host and recorded (op "http").
+  /// The pre-#15 shape, kept for preview1 programs (their `skein.http`
+  /// import); a component uses standard `wasi:http/outgoing-handler` (#15),
+  /// which the kernel turns into this very request, answered and recorded by
+  /// the same path.
   http: func(request: list<u8>) -> result<list<u8>, string>;
 
   /// If this step ends waiting, rest no later than `until-ms` (ms since the
@@ -86,13 +87,15 @@ interface skein {
   deadline: func(until-ms: s64) -> result<_, string>;
 }
 
-/// What a handler program may import from skein alone. A program built for
+/// What a handler program imports beyond WASI's command world: skein's calls
+/// and outgoing HTTP (`wasi:http`, #15). A program built for
 /// preview1 WASI (Zig, C, Rust `wasm32-wasip1`) embeds this world with
 /// wit-bindgen and becomes a component through the preview1 command adapter
 /// (`wasm-tools component new --adapt`), which brings the WASI imports and
 /// the `wasi:cli/run` export: the result targets `handler`.
 world program {
   import skein;
+  import wasi:http/outgoing-handler@0.2.12;
 }
 
 /// A handler program as a component: a WASI 0.2 command (`wasi:cli/run`) with
@@ -106,8 +109,11 @@ world program {
 /// - `wasi:random`: the entry-derived stream (insecure too);
 /// - `wasi:cli`: args (argv[0] = the program's name), no environment,
 ///   stdin empty, stdout/stderr captured; no terminal.
-/// No sockets, no `wasi:http` yet (#15 adds `import wasi:http/outgoing-handler`
-/// here and drops `skein.http`).
+/// - `wasi:http/outgoing-handler` (#15): each request is serialized into the
+///   recorded-call shape of `skein.http` and answered by the host; request and
+///   response are recorded on the step's update, so replay reads the answer
+///   and never touches the network. Bodies are buffered; no trailers.
+/// No sockets, no incoming handler.
 world handler {
   import wasi:cli/environment@0.2.12;
   import wasi:cli/exit@0.2.12;
@@ -129,6 +135,8 @@ world handler {
   import wasi:random/random@0.2.12;
   import wasi:random/insecure@0.2.12;
   import wasi:random/insecure-seed@0.2.12;
+  import wasi:http/types@0.2.12;
+  import wasi:http/outgoing-handler@0.2.12;
   import skein;
 
   export wasi:cli/run@0.2.12;
