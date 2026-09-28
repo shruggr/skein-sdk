@@ -978,6 +978,172 @@ test "settlement: a competing spend proven rejects ours; never mined in time is 
     counts.wallet += 1;
 }
 
+// ---------------------------------------------------------------- overlay (#36)
+
+/// A demo token: <"tm_demo"> OP_DROP, then P2PKH to `pkh`.
+fn tokenScript(pkh: [20]u8) [34]u8 {
+    return .{ 0x07, 't', 'm', '_', 'd', 'e', 'm', 'o', 0x75, 0x76, 0xa9, 0x14 } ++ pkh ++ .{ 0x88, 0xac };
+}
+
+/// A transaction spending `ins` (each from its source transaction, signed
+/// with `priv` as P2PKH-style: <sig> <pubkey>), paying `outs`.
+fn spend(a: std.mem.Allocator, ins: []const struct { *const bsvz.transaction.Transaction, u32 }, outs: []const struct { u64, []const u8 }, priv: [32]u8) !struct { tx: bsvz.transaction.Transaction, raw: []const u8, txid: [32]u8 } {
+    var b = bsvz.transaction.Builder.init(a);
+    for (ins) |i| try b.addInputFromTx(i[0], i[1]);
+    for (outs) |o| try b.addOutput(.{ .satoshis = @intCast(o[0]), .locking_script = bsvz.script.Script.init(try a.dupe(u8, o[1])) });
+    var tx = try b.build();
+    const key = try bsvz.crypto.PrivateKey.fromBytes(priv);
+    const unlocks = try a.alloc(bsvz.script.Script, ins.len);
+    for (ins, unlocks, 0..) |i, *u, k| {
+        const prev = i[0].outputs[i[1]];
+        u.* = try bsvz.transaction.templates.p2pkh_spend.signAndBuildUnlockingScript(a, &tx, k, prev.locking_script, prev.satoshis, key, bsvz.transaction.templates.p2pkh_spend.default_scope);
+    }
+    for (@constCast(tx.inputs), unlocks) |*in, u| in.unlocking_script = u;
+    const raw = try tx.serialize(a);
+    return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
+}
+
+test "overlay: submit and admit, spend with retained coins, lookups with valid BEEF, a rejected spend restores" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const ov = lib.overlay;
+
+    // A mined funding transaction (a mainnet vector), our regtest chain carrying its block's root.
+    const utv = std.json.parseFromSliceLeaky(J, a, @embedFile("vectors/beef.json"), .{}) catch unreachable;
+    var fund_hex: []const u8 = undefined;
+    for (arr(utv, "cases")) |c| if (std.mem.eql(u8, str(c, "name"), "utv-1-in-1-out-atomic")) {
+        fund_hex = str(c, "hex");
+    };
+    const fund = try beef.parse(a, try unhex(a, fund_hex));
+    const bump = fund.bumps[0];
+    var proven_txid: [32]u8 = undefined;
+    for (fund.entries) |e| if (e.format == .raw_with_bump) {
+        proven_txid = e.txid;
+    };
+    const priv = try key32("fdd506efec13e05cdff57ef13e24a60009aba0e8f2162e2cff2886460175cad8");
+    const pub_key = try lib.brc29.identityKey(priv);
+    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
+    const token = tokenScript(pkh);
+    var w = try lib.wallet.Wallet.load(a, s, null, .regtest);
+    _ = try w.addHeaders(try slices(a, try regtestChain(a, bump.block_height + 1, &.{.{ bump.block_height, beef.rootFor(a, bump, proven_txid).? }})));
+    const empty = try w.save();
+
+    // T1 spends the funding output into a token (output 0) and change (output 1).
+    const fund_tx = fund.find(fund.atomic.?).?.tx.?;
+    const sats: u64 = @intCast(fund_tx.outputs[0].satoshis);
+    const tok_sats = sats / 2;
+    const t1 = try spend(a, &.{.{ &fund_tx, 0 }}, &.{ .{ tok_sats, &token }, .{ sats - tok_sats - 20, &lib.brc29.p2pkh(pub_key) } }, priv);
+    var e1: std.ArrayList(beef.Entry) = .empty;
+    try e1.appendSlice(a, fund.entries);
+    try e1.append(a, .{ .txid = t1.txid, .format = .raw, .raw = t1.raw, .tx = t1.tx });
+    const t1_beef = try beef.serialize(a, .{ .version = beef.V2, .bumps = fund.bumps, .entries = e1.items }); // plain BEEF: the subject is the last
+
+    w = try lib.wallet.Wallet.load(a, s, empty, .regtest);
+    w.now = 1000;
+    const sub1 = try ov.verify(&w, t1_beef);
+    try std.testing.expectEqualSlices(u8, &t1.txid, &sub1.txid);
+    try std.testing.expectEqual(@as(usize, 0), (try ov.previousCoins(&w, "tm_demo", sub1.tx)).len);
+    // Out-of-range or duplicate instructions are refused.
+    try std.testing.expectError(error.BadInstructions, ov.apply(&w, sub1, "tm_demo", &.{}, .{ .outputs_to_admit = &.{7} }));
+    try std.testing.expectError(error.BadInstructions, ov.apply(&w, sub1, "tm_demo", &.{}, .{ .coins_to_retain = &.{0} }));
+    const a1 = try ov.apply(&w, sub1, "tm_demo", &.{}, .{ .outputs_to_admit = &.{0} });
+    try std.testing.expectEqualSlices(u32, &.{0}, a1.outputs_to_admit);
+    try std.testing.expectEqual(@as(usize, 2), a1.records.len); // the admittance and the judgement
+    // A topic that takes nothing records nothing.
+    const other = try ov.apply(&w, sub1, "tm_other", &.{}, .{});
+    try std.testing.expect(!other.dupe and other.records.len == 0);
+    const s1 = try w.save();
+    try std.testing.expect(try ov.isApplied(&w, "tm_demo", t1.txid));
+    try std.testing.expect(!(try ov.isApplied(&w, "tm_other", t1.txid)));
+    const adm = (try w.record(a1.records[0]));
+    try std.testing.expectEqualStrings("admitted", adm.getText("kind").?);
+    try std.testing.expectEqual(tok_sats, adm.getUint("satoshis").?);
+    try std.testing.expectEqualStrings("admits", adm.getArray("refs").?[0].getText("rel").?);
+    // The `admits` relation in the wallet's dependents.
+    var rel_ok = false;
+    for (try w.dependentsOf(t1.txid)) |d| rel_ok = rel_ok or (d.tag == .admitted and d.rel == .admits);
+    try std.testing.expect(rel_ok);
+
+    // Lookups: by topic and by script hash; the answer's BEEF verifies against our chain.
+    {
+        const live = try ov.inTopic(&w, "tm_demo", false);
+        try std.testing.expectEqual(@as(usize, 1), live.len);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &live[0].txid);
+        var sh: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&token, &sh, .{});
+        try std.testing.expectEqual(@as(usize, 1), (try ov.byScriptHash(&w, sh, "tm_demo", false)).len);
+        try std.testing.expectEqual(@as(usize, 1), (try ov.byScriptHash(&w, sh, null, false)).len);
+        try std.testing.expectEqual(@as(usize, 0), (try ov.byScriptHash(&w, sh, "tm_other", false)).len);
+        const ans = try beef.parse(a, try ov.beefFor(&w, t1.txid));
+        try std.testing.expectEqualSlices(u8, &t1.txid, &ans.atomic.?);
+        var fresh = try lib.wallet.Wallet.load(a, s, empty, .regtest); // verified by a node holding only the headers
+        var ctx = lib.wallet.Wallet.SpvCtx{ .w = &fresh };
+        const res = try lib.spv.verify(a, ans, .{ .ptr = &ctx, .rootAtFn = lib.wallet.Wallet.SpvCtx.rootAt, .knownRawFn = lib.wallet.Wallet.SpvCtx.knownRaw });
+        try std.testing.expect(res.proven[0]);
+    }
+
+    // T2 spends the token into a new token: the topic retains the old one for history.
+    const t2 = try spend(a, &.{.{ &t1.tx, 0 }}, &.{.{ tok_sats - 10, &token }}, priv);
+    const e2 = try a.dupe(beef.Entry, &.{.{ .txid = t2.txid, .format = .raw, .raw = t2.raw, .tx = t2.tx }});
+    const t2_beef = try beef.serialize(a, .{ .version = beef.V2, .atomic = t2.txid, .bumps = &.{}, .entries = e2 });
+    w = try lib.wallet.Wallet.load(a, s, s1, .regtest);
+    w.now = 2000;
+    const sub2 = try ov.verify(&w, t2_beef); // its input's source is held
+    const prev2 = try ov.previousCoins(&w, "tm_demo", sub2.tx);
+    try std.testing.expectEqualSlices(u32, &.{0}, prev2);
+    const a2 = try ov.apply(&w, sub2, "tm_demo", prev2, .{ .outputs_to_admit = &.{0}, .coins_to_retain = &.{0} });
+    try std.testing.expectEqualSlices(u32, &.{0}, a2.coins_to_retain);
+    try std.testing.expectEqual(@as(usize, 0), a2.coins_removed.len);
+    try std.testing.expect((try ov.apply(&w, sub2, "tm_demo", prev2, .{})).dupe);
+    const s2 = try w.save();
+    {
+        const live = try ov.inTopic(&w, "tm_demo", false);
+        try std.testing.expectEqual(@as(usize, 1), live.len);
+        try std.testing.expectEqualSlices(u8, &t2.txid, &live[0].txid);
+        const all = try ov.inTopic(&w, "tm_demo", true);
+        try std.testing.expectEqual(@as(usize, 2), all.len);
+        const sp = (try w.map("spentAdmitted").get(try std.mem.concat(a, u8, &.{ try ov.topicPrefix(a, "tm_demo"), &lib.store.outpointKey(t1.txid, 0) }))).?;
+        try std.testing.expectEqualSlices(u8, &(t2.txid ++ .{1}), sp.bytes); // spent by T2, retained
+        // The answer for T2 carries its unmined ancestry down to the proven funding.
+        const ans = try beef.parse(a, try ov.beefFor(&w, t2.txid));
+        try std.testing.expectEqual(fund.entries.len + 2, ans.entries.len);
+    }
+
+    // T2 is rejected (a status entry: ARC saw a double spend): its admittance
+    // and judgement vanish, and T1's token is live in the topic again.
+    w = try lib.wallet.Wallet.load(a, s, s2, .regtest);
+    w.now = 3000;
+    try std.testing.expectEqual(lib.wallet.Wallet.Outcome.rejected, try w.applyStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null));
+    const s3 = try w.save();
+    {
+        const live = try ov.inTopic(&w, "tm_demo", true);
+        try std.testing.expectEqual(@as(usize, 1), live.len);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &live[0].txid);
+        try std.testing.expect(!live[0].spent);
+        try std.testing.expect(!(try ov.isApplied(&w, "tm_demo", t2.txid)));
+        // Resubmitting a rejected transaction is refused.
+        try std.testing.expectError(error.TransactionRejected, ov.verify(&w, t2_beef));
+    }
+    // Deterministic: the same rejection from the same state gives the same state record.
+    var w3 = try lib.wallet.Wallet.load(a, s, s2, .regtest);
+    w3.now = 3000;
+    _ = try w3.reject(t2.txid, "DOUBLE_SPEND_ATTEMPTED");
+    try std.testing.expectEqualStrings(s3, try w3.save());
+
+    // T1 rejected instead: bubbles to T2 (it spends T1), every admittance vanishes.
+    var w4 = try lib.wallet.Wallet.load(a, s, s2, .regtest);
+    w4.now = 3000;
+    try std.testing.expectEqual(@as(usize, 2), (try w4.reject(t1.txid, "REJECTED")).len);
+    _ = try w4.save();
+    try std.testing.expectEqual(@as(usize, 0), (try ov.inTopic(&w4, "tm_demo", true)).len);
+    try std.testing.expectEqual(@as(usize, 0), try w4.map("admitted").count());
+    counts.wallet += 1;
+}
+
 fn cbor_cid(b: u8) [36]u8 {
     return lib.cbor.cidOf(&.{b});
 }

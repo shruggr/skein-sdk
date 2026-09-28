@@ -11,6 +11,9 @@ pub const wire = @import("wire.zig");
 pub const builder = @import("builder.zig");
 pub const store = @import("store.zig");
 pub const wallet = @import("wallet.zig");
+pub const overlay = @import("overlay.zig");
+/// bsvz itself, for programs built on this library (programs/overlay).
+pub const bsvz = @import("bsvz");
 
 test {
     @import("std").testing.refAllDecls(@This());
