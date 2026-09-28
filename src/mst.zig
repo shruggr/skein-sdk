@@ -18,18 +18,16 @@
 //
 // Nothing here knows SQLite or the kernel: nodes are read through `Blocks`
 // (get by CID) and new ones collect in `pending` until the owner flushes the
-// ones a root reaches; it needs only cbor.zig and cid.zig. The wallet's flat
-// placeholder index (wallet-zig/src/store.zig `Index`, issue #29) maps onto
-// one tree per index: get/put/remove are lookups and puts, and its
-// "sortedKeys" (fixed-width keys in dag-cbor order) is `range` — bytewise
-// order equals dag-cbor's length-first order when the keys are one width.
-// Inside the VM the Blocks are the `skein` get import and a flush is one
-// `put` per pending node (the wallet's cbor module would stand in for
-// cbor.zig).
+// ones a root reaches; it needs only cbor.zig and cid.zig. wallet-zig (#29)
+// builds this file as a module of its own (wallet-zig/build.zig) for the
+// wallet's index maps: inside the VM its Blocks are the `skein` get import
+// and a flush is one `putblock` per pending node.
 const std = @import("std");
 const cbor = @import("cbor.zig");
 const cidm = @import("cid.zig");
-const Value = cbor.Value;
+/// Exported for users of this file as a library module (wallet-zig, #29).
+pub const Value = cbor.Value;
+pub const codec = cbor;
 
 pub const Blocks = struct {
     ctx: *anyopaque,

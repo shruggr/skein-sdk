@@ -1,12 +1,15 @@
-//! Wallet state as records (issue #29): headers, transactions, merkle proofs,
-//! actions and outputs are records; lookups go through index maps; status
-//! and spendability are computed from them, never stored as fields. The
-//! derived index maps (`spent`, `byBasket`, `byStatus`) are rebuilt from the
-//! primary ones on every save, so they are a pure function of the records
-//! and the best chain: anyone can recompute and compare.
+//! Wallet state as records (issue #29): headers and transactions are
+//! bitcoin-block / bitcoin-tx blocks, merkle proofs, actions and outputs are
+//! dag-cbor records; lookups go through index maps — the kernel's Merkle
+//! search trees (#30), one per lookup, their roots in the state record.
+//! Status and spendability are computed from the records, never stored as
+//! fields. The derived maps (`spent`, `byBasket`, `byStatus`) are rebuilt
+//! from the primary ones on every save, so they are a pure function of the
+//! records and the best chain: anyone can recompute and compare (the trees
+//! are canonical: same contents, same root).
 //!
 //! One `Wallet` lives for one step: load from the state record, apply
-//! operations, save (new index records, a new state record).
+//! operations, save (new map nodes, a new state record).
 const std = @import("std");
 const bsvz = @import("bsvz");
 const cbor = @import("cbor.zig");
@@ -18,17 +21,30 @@ const chain_mod = @import("chain.zig");
 const store_mod = @import("store.zig");
 
 const Store = store_mod.Store;
-const Index = store_mod.Index;
+const Map = store_mod.Map;
 const Value = cbor.Value;
 
-/// The signing oracle, as far as the wallet needs it now: derive our BRC-29
+pub const Network = chain_mod.Network;
+
+/// The signing oracle, as far as internalize needs it: derive our BRC-29
 /// payee key (getPublicKey, forSelf, counterparty = the sender).
 pub const Oracle = struct {
     ptr: *anyopaque,
     derivePayeeFn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, key_id: []const u8, sender: [33]u8) anyerror![33]u8,
 };
 
-pub const index_names = [_][]const u8{ "headers", "txs", "proofs", "actions", "outputs", "spent", "byBasket", "byStatus" };
+/// The maps, by name, in the state record's order.
+///   headers   height (u32 BE) → header (bitcoin-block)       the best chain
+///   heights   block hash → height                           the best chain, backwards
+///   txs       txid → transaction (bitcoin-tx)               every transaction we hold
+///   proofs    txid → proof record                           proof by txid
+///   actions   txid → action record                          our transactions
+///   outputs   txid ‖ vout (u32 BE) → output record           output by outpoint
+///   awaiting  txid → broadcast record                       transactions awaiting a status callback
+///   spent     txid ‖ vout → spending txid (bytes)            derived: inputs of our actions
+///   byBasket  len ‖ basket ‖ 0|1 ‖ outpoint → null          derived: 0 spendable, 1 spent
+///   byStatus  0|1 ‖ txid → null                             derived: our actions, 0 proven, 1 unproven
+pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "byStatus" };
 
 pub const Status = enum { proven, unproven };
 
@@ -59,86 +75,75 @@ pub const OutputView = struct {
     basket: []const u8,
     spendable: bool,
     status: Status,
+    /// The output record (derivation, remittance fields).
+    record: Value,
 };
 
-pub fn outpointKey(arena: std.mem.Allocator, txid: [32]u8, vout: u32) ![]u8 {
-    return std.fmt.allocPrint(arena, "{s}.{d}", .{ hdr.toHex(txid), vout });
-}
-
-fn textArray(arena: std.mem.Allocator, xs: []const []const u8) ![]Value {
+pub fn textArray(arena: std.mem.Allocator, xs: []const []const u8) ![]Value {
     const out = try arena.alloc(Value, xs.len);
     for (xs, out) |x, *o| o.* = .{ .text = x };
     return out;
 }
 
-pub const Network = chain_mod.Network;
-
 pub const Wallet = struct {
     arena: std.mem.Allocator,
     store: Store,
     network: Network,
-    ix: [index_names.len]Index,
-    cids: [index_names.len]?[]const u8,
+    maps: *store_mod.Maps,
+    m: [map_names.len]Map,
 
     /// The wallet the state record names (null: a new one) on `network`; a
     /// state made for another network is refused.
     pub fn load(arena: std.mem.Allocator, s: Store, state: ?[]const u8, network: Network) !Wallet {
-        var w = Wallet{ .arena = arena, .store = s, .network = network, .ix = undefined, .cids = .{null} ** index_names.len };
-        var st: ?Value = null;
+        const maps = try store_mod.Maps.create(arena, s);
+        var w = Wallet{ .arena = arena, .store = s, .network = network, .maps = maps, .m = undefined };
+        var roots: ?Value = null;
         if (state) |c| {
             const v = try s.getValue(arena, c);
             if (!std.mem.eql(u8, v.getText("kind") orelse "", "wallet-state")) return error.BadState;
             if (!std.mem.eql(u8, v.getText("network") orelse "", @tagName(network))) return error.NetworkMismatch;
-            st = v.get("indexes") orelse return error.BadState;
+            roots = v.get("maps") orelse return error.BadState;
         }
-        for (index_names, 0..) |n, i| {
-            w.cids[i] = if (st) |v| v.getCid(n) else null;
-            w.ix[i] = try Index.load(arena, s, n, w.cids[i]);
-        }
+        for (map_names, 0..) |n, i| w.m[i] = maps.map(if (roots) |r| r.getCid(n) else null);
         return w;
     }
 
-    fn index(self: *Wallet, comptime name: []const u8) *Index {
-        inline for (index_names, 0..) |n, i| if (comptime std.mem.eql(u8, n, name)) return &self.ix[i];
-        @compileError("no index " ++ name);
+    pub fn map(self: *Wallet, comptime name: []const u8) *Map {
+        inline for (map_names, 0..) |n, i| if (comptime std.mem.eql(u8, n, name)) return &self.m[i];
+        @compileError("no map " ++ name);
     }
 
     pub fn chain(self: *Wallet) chain_mod.Chain {
-        return .{ .arena = self.arena, .store = self.store, .headers = self.index("headers"), .network = self.network };
+        return .{ .arena = self.arena, .store = self.store, .headers = self.map("headers"), .heights = self.map("heights"), .network = self.network };
     }
 
-    /// Rebuild the derived indexes, write every changed index and a state record; → its CID.
+    /// Rebuild the derived maps, put every new node, and a state record; → its CID.
     pub fn save(self: *Wallet) ![]const u8 {
         try self.rebuildDerived();
-        const es = try self.arena.alloc(cbor.Entry, index_names.len);
-        for (index_names, 0..) |n, i| {
-            if (self.ix[i].dirty or self.cids[i] == null) {
-                self.cids[i] = try self.ix[i].save(self.arena, self.store);
-                self.ix[i].dirty = false;
-            }
-            es[i] = .{ .key = n, .value = .{ .cid = self.cids[i].? } };
+        const es = try self.arena.alloc(cbor.Entry, map_names.len);
+        for (map_names, &self.m, es) |n, *mp, *e| {
+            try mp.flush();
+            e.* = .{ .key = n, .value = if (mp.root) |r| .{ .cid = r } else .null };
         }
         return self.store.putValue(self.arena, .{ .map = &.{
             .{ .key = "kind", .value = .{ .text = "wallet-state" } },
             .{ .key = "network", .value = .{ .text = @tagName(self.network) } },
-            .{ .key = "indexes", .value = .{ .map = es } },
+            .{ .key = "maps", .value = .{ .map = es } },
         } });
     }
 
     // ------------------------------------------------------------ records
 
     /// A transaction we hold: a bitcoin-tx block, its CID the txid.
-    fn txRaw(self: *Wallet, txid: [32]u8) !?[]const u8 {
-        const v = self.index("txs").get(&hdr.toHex(txid)) orelse return null;
-        if (v != .cid) return error.BadRecord;
-        return try self.store.get(self.arena, v.cid);
+    pub fn txRaw(self: *Wallet, txid: [32]u8) !?[]const u8 {
+        const c = (try self.map("txs").link(&txid)) orelse return null;
+        return try self.store.get(self.arena, c);
     }
 
-    fn putTx(self: *Wallet, txid: [32]u8, raw: []const u8) ![]const u8 {
-        const key = hdr.toHex(txid);
-        if (self.index("txs").get(&key)) |v| if (v == .cid) return v.cid;
+    pub fn putTx(self: *Wallet, txid: [32]u8, raw: []const u8) ![]const u8 {
+        if (try self.map("txs").link(&txid)) |c| return c;
         const cid = try self.store.putBitcoin(self.arena, .tx, raw);
-        try self.index("txs").put(self.arena, &key, .{ .cid = cid });
+        try self.map("txs").putLink(&txid, cid);
         return cid;
     }
 
@@ -150,8 +155,18 @@ pub const Wallet = struct {
             .{ .key = "height", .value = .{ .uint = height } },
             .{ .key = "path", .value = .{ .bytes = path } },
         } });
-        if (self.index("proofs").get(&key)) |old| if (old == .cid and std.mem.eql(u8, old.cid, cid)) return;
-        try self.index("proofs").put(self.arena, &key, .{ .cid = cid });
+        try self.map("proofs").putLink(&txid, cid);
+    }
+
+    /// The proof we hold for a txid (its BRC-74 bytes), or null.
+    pub fn proofPath(self: *Wallet, txid: [32]u8) !?[]const u8 {
+        const c = (try self.map("proofs").link(&txid)) orelse return null;
+        const rec = try self.store.getValue(self.arena, c);
+        return rec.getBytes("path") orelse error.BadRecord;
+    }
+
+    pub fn record(self: *Wallet, cid: []const u8) !Value {
+        return self.store.getValue(self.arena, cid);
     }
 
     // ------------------------------------------------------------ status (computed)
@@ -159,10 +174,7 @@ pub const Wallet = struct {
     /// proven: we hold a merkle proof for the txid whose root is our
     /// best-chain header's at its height. Anything else is unproven.
     pub fn status(self: *Wallet, txid: [32]u8) !Status {
-        const v = self.index("proofs").get(&hdr.toHex(txid)) orelse return .unproven;
-        if (v != .cid) return error.BadRecord;
-        const rec = try self.store.getValue(self.arena, v.cid);
-        const path = rec.getBytes("path") orelse return error.BadRecord;
+        const path = (try self.proofPath(txid)) orelse return .unproven;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return .unproven;
         const root = beef_mod.rootFor(self.arena, p, txid) orelse return .unproven;
         const want = (try self.chain().rootAt(p.block_height)) orelse return .unproven;
@@ -172,49 +184,34 @@ pub const Wallet = struct {
     fn rebuildDerived(self: *Wallet) !void {
         const a = self.arena;
         // spent: every outpoint one of our actions consumes → the spending txid.
-        var spent = Index{ .name = "spent" };
-        for (self.index("actions").sortedKeys()) |txid_hex| {
-            const txid = try hdr.fromHex(txid_hex);
+        var spent = self.maps.map(null);
+        const actions = try self.map("actions").prefixed("");
+        for (actions) |kv| {
+            const txid: [32]u8 = kv.key[0..32].*;
             const raw = (try self.txRaw(txid)) orelse return error.BadRecord;
             const tx = try bsvz.transaction.Transaction.parse(a, raw);
             for (tx.inputs) |in| {
-                const k = try outpointKey(a, in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
-                try spent.put(a, k, .{ .text = txid_hex });
+                const k = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
+                try spent.put(&k, .{ .bytes = try a.dupe(u8, &txid) });
             }
         }
-        // byBasket: "<basket>/spendable" | "<basket>/spent" → outpoints.
-        var lists = std.StringArrayHashMapUnmanaged(std.ArrayList(Value)).empty;
-        for (self.index("outputs").sortedKeys()) |op| {
-            const v = self.index("outputs").get(op).?;
-            const rec = try self.store.getValue(a, v.cid);
+        // byBasket: basket ‖ 0 (spendable) | 1 (spent) ‖ outpoint.
+        var by_basket = self.maps.map(null);
+        for (try self.map("outputs").prefixed("")) |kv| {
+            const rec = try self.record(kv.value.cid);
             const basket = rec.getText("basket") orelse return error.BadRecord;
-            const k = try std.fmt.allocPrint(a, "{s}/{s}", .{ basket, if (spent.get(op) != null) "spent" else "spendable" });
-            const gop = try lists.getOrPut(a, k);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(a, .{ .text = op });
+            const state: u8 = if (try spent.has(kv.key)) 1 else 0;
+            try by_basket.add(try store_mod.nameKey(a, basket, &.{ &.{state}, kv.key }));
         }
-        var by_basket = Index{ .name = "byBasket" };
-        for (lists.keys(), lists.values()) |k, l| try by_basket.put(a, k, .{ .array = l.items });
-        // byStatus: proven | unproven → our actions' txids.
-        var proven: std.ArrayList(Value) = .empty;
-        var unproven: std.ArrayList(Value) = .empty;
-        for (self.index("actions").sortedKeys()) |txid_hex| {
-            const st = try self.status(try hdr.fromHex(txid_hex));
-            try (if (st == .proven) &proven else &unproven).append(a, .{ .text = txid_hex });
+        // byStatus: 0 (proven) | 1 (unproven) ‖ txid.
+        var by_status = self.maps.map(null);
+        for (actions) |kv| {
+            const st: u8 = if ((try self.status(kv.key[0..32].*)) == .proven) 0 else 1;
+            try by_status.add(try std.mem.concat(a, u8, &.{ &.{st}, kv.key }));
         }
-        var by_status = Index{ .name = "byStatus" };
-        if (proven.items.len > 0) try by_status.put(a, "proven", .{ .array = proven.items });
-        if (unproven.items.len > 0) try by_status.put(a, "unproven", .{ .array = unproven.items });
-
-        self.replaceDerived("spent", spent);
-        self.replaceDerived("byBasket", by_basket);
-        self.replaceDerived("byStatus", by_status);
-    }
-
-    fn replaceDerived(self: *Wallet, comptime name: []const u8, fresh: Index) void {
-        const ix = self.index(name);
-        ix.* = fresh;
-        ix.dirty = true; // re-put; an unchanged map gets the same CID
+        self.map("spent").root = spent.root;
+        self.map("byBasket").root = by_basket.root;
+        self.map("byStatus").root = by_status.root;
     }
 
     // ------------------------------------------------------------ operations
@@ -223,7 +220,7 @@ pub const Wallet = struct {
         return self.chain().add(raws);
     }
 
-    /// A merkle proof for a transaction we hold (a ChainTracks/Arcade answer).
+    /// A merkle proof for a transaction we hold (a `proof` entry, or ARC's answer).
     pub fn addProof(self: *Wallet, txid: [32]u8, path: []const u8) !Status {
         if ((try self.txRaw(txid)) == null) return error.UnknownTransaction;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return error.BadProof;
@@ -311,24 +308,32 @@ pub const Wallet = struct {
                 };
             }
         }
-        const txid_hex = hdr.toHex(subject);
-        const action = try self.store.putValue(a, .{ .map = &.{
-            .{ .key = "kind", .value = .{ .text = "action" } },
-            .{ .key = "txid", .value = .{ .text = &txid_hex } },
-            .{ .key = "tx", .value = .{ .cid = tx_cid } },
-            .{ .key = "description", .value = .{ .text = args.description } },
-            .{ .key = "labels", .value = .{ .array = try textArray(a, args.labels) } },
-        } });
-        if (self.index("actions").get(&txid_hex) == null) try self.index("actions").put(a, &txid_hex, .{ .cid = action });
+        try self.putAction(subject, tx_cid, args.description, args.labels, null);
         for (recs) |*rec| {
             var fields = try a.dupe(cbor.Entry, rec.map);
             fields = try a.realloc(fields, fields.len + 1);
             fields[fields.len - 1] = .{ .key = "tx", .value = .{ .cid = tx_cid } };
             const c = try self.store.putValue(a, .{ .map = fields });
             const vout: u32 = @intCast(rec.getUint("vout").?);
-            try self.index("outputs").put(a, try outpointKey(a, subject, vout), .{ .cid = c });
+            try self.map("outputs").putLink(&store_mod.outpointKey(subject, vout), c);
         }
         return .{ .txid = subject, .status = try self.status(subject), .outputs = @intCast(args.outputs.len) };
+    }
+
+    /// An action (a transaction of ours), unless we already hold one for the txid.
+    pub fn putAction(self: *Wallet, txid: [32]u8, tx_cid: []const u8, description: []const u8, labels: []const []const u8, extra: ?[]const cbor.Entry) !void {
+        if (try self.map("actions").has(&txid)) return;
+        const a = self.arena;
+        var fields: std.ArrayList(cbor.Entry) = .empty;
+        try fields.appendSlice(a, &.{
+            .{ .key = "kind", .value = .{ .text = "action" } },
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
+            .{ .key = "tx", .value = .{ .cid = tx_cid } },
+            .{ .key = "description", .value = .{ .text = description } },
+            .{ .key = "labels", .value = .{ .array = try textArray(a, labels) } },
+        });
+        if (extra) |x| try fields.appendSlice(a, x);
+        try self.map("actions").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
     }
 
     /// Outputs in a basket, spendable ones only unless `include_spent`.
@@ -337,35 +342,31 @@ pub const Wallet = struct {
         const a = self.arena;
         try self.rebuildDerived();
         var out: std.ArrayList(OutputView) = .empty;
-        for ([_][]const u8{ "spendable", "spent" }) |state| {
-            if (!include_spent and std.mem.eql(u8, state, "spent")) continue;
-            const k = try std.fmt.allocPrint(a, "{s}/{s}", .{ basket, state });
-            const list = self.index("byBasket").get(k) orelse continue;
-            for (list.array) |op| {
-                const dot = std.mem.lastIndexOfScalar(u8, op.text, '.') orelse return error.BadRecord;
-                const txid = try hdr.fromHex(op.text[0..dot]);
-                const vout = try std.fmt.parseInt(u32, op.text[dot + 1 ..], 10);
-                const raw = (try self.txRaw(txid)) orelse return error.BadRecord;
+        for ([_]u8{ 0, 1 }) |state| {
+            if (!include_spent and state == 1) continue;
+            const prefix = try store_mod.nameKey(a, basket, &.{&.{state}});
+            for (try self.map("byBasket").prefixed(prefix)) |kv| {
+                const op = try store_mod.outpointOf(kv.key[prefix.len..]);
+                const raw = (try self.txRaw(op.txid)) orelse return error.BadRecord;
                 const tx = try bsvz.transaction.Transaction.parse(a, raw);
-                if (vout >= tx.outputs.len) return error.BadRecord;
+                if (op.vout >= tx.outputs.len) return error.BadRecord;
+                const rc = (try self.map("outputs").link(&store_mod.outpointKey(op.txid, op.vout))) orelse return error.BadRecord;
                 try out.append(a, .{
-                    .txid = txid,
-                    .vout = vout,
-                    .satoshis = @intCast(tx.outputs[vout].satoshis),
-                    .locking_script = tx.outputs[vout].locking_script.bytes,
+                    .txid = op.txid,
+                    .vout = op.vout,
+                    .satoshis = @intCast(tx.outputs[op.vout].satoshis),
+                    .locking_script = tx.outputs[op.vout].locking_script.bytes,
                     .basket = basket,
-                    .spendable = std.mem.eql(u8, state, "spendable"),
-                    .status = try self.status(txid),
+                    .spendable = state == 0,
+                    .status = try self.status(op.txid),
+                    .record = try self.record(rc),
                 });
             }
         }
         return out.toOwnedSlice(a);
     }
 
-    pub fn indexCount(self: *Wallet, comptime name: []const u8) usize {
-        return self.index(name).count();
-    }
-    pub fn indexGet(self: *Wallet, comptime name: []const u8, key: []const u8) ?Value {
-        return self.index(name).get(key);
+    pub fn mapCount(self: *Wallet, comptime name: []const u8) !usize {
+        return self.map(name).count();
     }
 };

@@ -1,10 +1,20 @@
 //! The record store as the wallet sees it: get a block's bytes by CID, put
 //! dag-cbor bytes and get their CID, put a block under a CID made here
-//! (bitcoin-tx / bitcoin-block: the txid / block hash). In the VM this is the
-//! `skein` get/put/putblock imports (program.zig); in tests, MemStore. Index
-//! maps are records too.
+//! (bitcoin-tx / bitcoin-block: the txid / block hash; index nodes). In the
+//! VM this is the `skein` get/put/putblock imports (program.zig); in tests,
+//! MemStore.
+//!
+//! The index maps are the kernel's Merkle search trees (kernel-zig/src/mst.zig,
+//! issue #30, shared through build.zig): one persistent ordered map per
+//! lookup, its root CID named in the wallet's state record. A step's changes
+//! write new nodes along one path per change; `flush` puts the ones a root
+//! reaches. Keys are bytes, ordered bytewise; values are the kernel codec's
+//! IPLD values (links, bytes, numbers, null).
 const std = @import("std");
 const cbor = @import("cbor.zig");
+pub const mst = @import("mst");
+
+pub const MValue = mst.Value;
 
 pub const Store = struct {
     ptr: *anyopaque,
@@ -90,19 +100,22 @@ pub const MemStore = struct {
         defer tmp.deinit();
         const canon = try cbor.encode(tmp.allocator(), try cbor.decode(tmp.allocator(), bytes));
         const cid = cbor.cidOf(canon);
-        if (!self.blocks.contains(&cid)) {
-            const k = try self.gpa.dupe(u8, &cid);
-            errdefer self.gpa.free(k);
-            try self.blocks.put(self.gpa, k, try self.gpa.dupe(u8, canon));
-        }
+        try self.keep(&cid, canon);
         return arena.dupe(u8, &cid);
     }
-    /// As the kernel's putblock: bitcoin CIDs only here, hash-checked.
+    /// As the kernel's putblock: the bytes must hash to the CID (bitcoin-tx,
+    /// bitcoin-block, or dag-cbor sha2-256 — index nodes).
     fn putBlockImpl(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
         const self: *MemStore = @ptrCast(@alignCast(ptr));
-        const h = bitcoinHash(cid) orelse return error.UnsupportedCid;
-        if (cid[1] == 0xb0 and bytes.len != 80) return error.HashMismatch;
-        if (!std.mem.eql(u8, &h, &dblSha256(bytes))) return error.HashMismatch;
+        if (bitcoinHash(cid)) |h| {
+            if (cid[1] == 0xb0 and bytes.len != 80) return error.HashMismatch;
+            if (!std.mem.eql(u8, &h, &dblSha256(bytes))) return error.HashMismatch;
+        } else if (cid.len == 36 and std.mem.eql(u8, cid[0..4], &.{ 0x01, 0x71, 0x12, 0x20 })) {
+            if (!std.mem.eql(u8, cid, &cbor.cidOf(bytes))) return error.HashMismatch;
+        } else return error.UnsupportedCid;
+        try self.keep(cid, bytes);
+    }
+    fn keep(self: *MemStore, cid: []const u8, bytes: []const u8) !void {
         if (self.blocks.contains(cid)) return;
         const k = try self.gpa.dupe(u8, cid);
         errdefer self.gpa.free(k);
@@ -113,77 +126,154 @@ pub const MemStore = struct {
     }
 };
 
-/// An index map (issue #30's shape, flat for now): one record
-/// `{kind: "wallet-index", name, entries: {key: value}}`, rewritten whole on
-/// change. Keys sort as dag-cbor sorts map keys (length, then bytes), so
-/// fixed-width keys (heights zero-padded, outpoints) iterate in order.
-pub const Index = struct {
-    name: []const u8,
-    entries: std.StringArrayHashMapUnmanaged(cbor.Value) = .empty,
-    dirty: bool = false,
+// ---------------------------------------------------------------- index maps
 
-    pub fn load(arena: std.mem.Allocator, s: Store, name: []const u8, cid: ?[]const u8) !Index {
-        var ix = Index{ .name = name };
-        const c = cid orelse return ix;
-        const v = try s.getValue(arena, c);
-        const kind = v.getText("kind") orelse return error.BadIndex;
-        if (!std.mem.eql(u8, kind, "wallet-index")) return error.BadIndex;
-        const entries = v.get("entries") orelse return error.BadIndex;
-        if (entries != .map) return error.BadIndex;
-        for (entries.map) |e| try ix.entries.put(arena, e.key, e.value);
-        ix.sort();
-        return ix;
+/// The node store a wallet's maps share for one step (an MST forest over the
+/// Store): nodes are read with `get`; new ones wait until `flush`.
+pub const Maps = struct {
+    arena: std.mem.Allocator,
+    store: Store,
+    forest: mst.Forest,
+
+    pub fn create(arena: std.mem.Allocator, s: Store) !*Maps {
+        const m = try arena.create(Maps);
+        m.* = .{ .arena = arena, .store = s, .forest = undefined };
+        m.forest = mst.Forest.init(arena, .{ .ctx = m, .get = blocksGet });
+        return m;
     }
 
-    fn lessThan(ctx: *const Index, a: usize, b: usize) bool {
-        const ka = ctx.entries.keys()[a];
-        const kb = ctx.entries.keys()[b];
-        if (ka.len != kb.len) return ka.len < kb.len;
-        return std.mem.lessThan(u8, ka, kb);
+    fn blocksGet(ctx: *anyopaque, a: std.mem.Allocator, cid: []const u8) anyerror!?[]u8 {
+        const m: *Maps = @ptrCast(@alignCast(ctx));
+        return @constCast(try m.store.get(a, cid));
+    }
+    fn sinkPut(ctx: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
+        const m: *Maps = @ptrCast(@alignCast(ctx));
+        try m.store.putBlock(cid, bytes);
     }
 
-    fn sort(self: *Index) void {
-        const C = struct {
-            ix: *const Index,
-            pub fn lessThan(c: @This(), a: usize, b: usize) bool {
-                return Index.lessThan(c.ix, a, b);
-            }
-        };
-        self.entries.sort(C{ .ix = self });
-    }
-
-    pub fn get(self: *const Index, key: []const u8) ?cbor.Value {
-        return self.entries.get(key);
-    }
-    pub fn put(self: *Index, arena: std.mem.Allocator, key: []const u8, v: cbor.Value) !void {
-        try self.entries.put(arena, try arena.dupe(u8, key), v);
-        self.dirty = true;
-    }
-    pub fn remove(self: *Index, key: []const u8) bool {
-        const had = self.entries.orderedRemove(key);
-        self.dirty = self.dirty or had;
-        return had;
-    }
-    pub fn clear(self: *Index) void {
-        if (self.entries.count() > 0) self.dirty = true;
-        self.entries.clearRetainingCapacity();
-    }
-    pub fn count(self: *const Index) usize {
-        return self.entries.count();
-    }
-    /// Keys in dag-cbor order.
-    pub fn sortedKeys(self: *Index) []const []const u8 {
-        self.sort();
-        return self.entries.keys();
-    }
-
-    pub fn save(self: *Index, arena: std.mem.Allocator, s: Store) ![]const u8 {
-        const es = try arena.alloc(cbor.Entry, self.entries.count());
-        for (self.entries.keys(), self.entries.values(), es) |k, v, *e| e.* = .{ .key = k, .value = v };
-        return s.putValue(arena, .{ .map = &.{
-            .{ .key = "kind", .value = .{ .text = "wallet-index" } },
-            .{ .key = "name", .value = .{ .text = self.name } },
-            .{ .key = "entries", .value = .{ .map = es } },
-        } });
+    pub fn map(self: *Maps, root: ?[]const u8) Map {
+        return .{ .maps = self, .root = root };
     }
 };
+
+/// One persistent ordered map: its root (null: empty) and the forest it lives in.
+pub const Map = struct {
+    maps: *Maps,
+    root: ?[]const u8,
+    dirty: bool = false,
+
+    fn f(self: *Map) *mst.Forest {
+        return &self.maps.forest;
+    }
+
+    pub fn get(self: *Map, key: []const u8) !?MValue {
+        return self.f().get(self.maps.arena, self.root, key);
+    }
+    /// The link stored under key (a CID), or null.
+    pub fn link(self: *Map, key: []const u8) !?[]const u8 {
+        const v = (try self.get(key)) orelse return null;
+        return if (v == .cid) v.cid else error.BadIndex;
+    }
+    pub fn has(self: *Map, key: []const u8) !bool {
+        return (try self.get(key)) != null;
+    }
+    pub fn put(self: *Map, key: []const u8, v: MValue) !void {
+        const r = try self.f().put(self.root, key, v);
+        if (!eqLink(r, self.root)) self.dirty = true;
+        self.root = r;
+    }
+    pub fn putLink(self: *Map, key: []const u8, cid: []const u8) !void {
+        return self.put(key, .{ .cid = cid });
+    }
+    /// A set member: key → null.
+    pub fn add(self: *Map, key: []const u8) !void {
+        return self.put(key, .null);
+    }
+    pub fn remove(self: *Map, key: []const u8) !bool {
+        const r = try self.f().delete(self.root, key);
+        const had = !eqLink(r, self.root);
+        self.dirty = self.dirty or had;
+        self.root = r;
+        return had;
+    }
+    /// Every entry whose key starts with `prefix` (all of them for ""), in key order.
+    pub fn prefixed(self: *Map, prefix: []const u8) ![]mst.KV {
+        var out = std.array_list.Managed(mst.KV).init(self.maps.arena);
+        if (prefix.len == 0) {
+            try self.f().range(self.maps.arena, self.root, null, null, &out);
+        } else try self.f().prefixed(self.maps.arena, self.root, prefix, &out);
+        return out.items;
+    }
+    pub fn count(self: *Map) !usize {
+        return self.f().count(self.root);
+    }
+    /// The greatest key, or null for an empty map: the rightmost path.
+    pub fn last(self: *Map) !?[]const u8 {
+        var cur = self.root orelse return null;
+        while (true) {
+            const n = try self.f().load(cur);
+            const e = n.entries[n.entries.len - 1];
+            cur = e.right orelse return e.key;
+        }
+    }
+    /// Put every new node this map's root reaches.
+    pub fn flush(self: *Map) !void {
+        try self.f().flush(self.root, .{ .ctx = self.maps, .put = Maps.sinkPut });
+    }
+};
+
+fn eqLink(x: ?[]const u8, y: ?[]const u8) bool {
+    if (x == null or y == null) return x == null and y == null;
+    return std.mem.eql(u8, x.?, y.?);
+}
+
+// ---------------------------------------------------------------- keys
+
+pub fn be32(n: u32) [4]u8 {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, n, .big);
+    return b;
+}
+
+/// txid (internal byte order) ‖ vout (4 bytes, big-endian).
+pub fn outpointKey(txid: [32]u8, vout: u32) [36]u8 {
+    return txid ++ be32(vout);
+}
+
+pub fn outpointOf(key: []const u8) !struct { txid: [32]u8, vout: u32 } {
+    if (key.len != 36) return error.BadIndex;
+    return .{ .txid = key[0..32].*, .vout = std.mem.readInt(u32, key[32..36], .big) };
+}
+
+/// A string as a key prefix: its length (one byte, so names up to 255 bytes) and bytes.
+pub fn nameKey(arena: std.mem.Allocator, name: []const u8, rest: []const []const u8) ![]u8 {
+    if (name.len > 255) return error.NameTooLong;
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, @intCast(name.len));
+    try out.appendSlice(arena, name);
+    for (rest) |r| try out.appendSlice(arena, r);
+    return out.toOwnedSlice(arena);
+}
+
+test "maps: MST over the store, persistent across steps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const maps = try Maps.create(a, ms.store());
+    var m = maps.map(null);
+    var i: u32 = 0;
+    while (i < 300) : (i += 1) try m.putLink(&be32(i), &cbor.cidOf(&be32(i)));
+    try std.testing.expectEqual(@as(usize, 300), try m.count());
+    try std.testing.expectEqualSlices(u8, &be32(299), (try m.last()).?);
+    try m.flush();
+    // A fresh forest (the next step) reads the same map from its root.
+    const maps2 = try Maps.create(a, ms.store());
+    var m2 = maps2.map(m.root);
+    try std.testing.expectEqualSlices(u8, &cbor.cidOf(&be32(7)), (try m2.link(&be32(7))).?);
+    try std.testing.expect(try m2.remove(&be32(299)));
+    try std.testing.expect(!(try m2.remove(&be32(299))));
+    try std.testing.expectEqualSlices(u8, &be32(298), (try m2.last()).?);
+    try std.testing.expectEqual(@as(usize, 298 - 256 + 1), (try m2.prefixed(&.{ 0, 0, 1 })).len);
+}

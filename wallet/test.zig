@@ -269,8 +269,10 @@ test "vectors: headers — fields, hash, target, work, PoW, links (go-sdk, go-ch
     for ([_]bool{ false, true }) |with_genesis| {
         var ms = lib.store.MemStore.init(std.testing.allocator);
         defer ms.deinit();
-        var headers_ix = lib.store.Index{ .name = "headers" };
-        const ch = lib.chain.Chain{ .arena = a, .store = ms.store(), .headers = &headers_ix, .network = .main };
+        const maps = try lib.store.Maps.create(a, ms.store());
+        var headers_ix = maps.map(null);
+        var heights_ix = maps.map(null);
+        const ch = lib.chain.Chain{ .arena = a, .store = ms.store(), .headers = &headers_ix, .heights = &heights_ix, .network = .main };
         const res = try ch.add(if (with_genesis) grun.items else grun.items[1..]);
         try std.testing.expectEqual(glen - 1, res.added);
         try std.testing.expectEqual(@as(u32, if (with_genesis) 1 else 0), res.known);
@@ -278,14 +280,15 @@ test "vectors: headers — fields, hash, target, work, PoW, links (go-sdk, go-ch
         // The header's block is its hash: a bitcoin-block CID.
         const at5 = (try ch.at(5)).?;
         try std.testing.expectEqualSlices(u8, grun.items[5], &at5.raw);
-        var kb: [10]u8 = undefined;
-        const c5 = headers_ix.get(lib.chain.heightKey(&kb, 5)).?.cid;
+        const c5 = (try headers_ix.link(&lib.store.be32(5))).?;
+        try std.testing.expectEqual(@as(u32, 5), (try ch.heightOf(at5.hash)).?);
         try std.testing.expectEqualSlices(u8, &at5.hash, &lib.store.bitcoinHash(c5).?);
         // Again: all known. The run far away does not connect. Testnet's anchor is another chain.
         try std.testing.expectEqual(glen - 1, (try ch.add(grun.items[1..])).known);
         try std.testing.expectError(error.Unconnected, ch.add(run.items));
-        var ix2 = lib.store.Index{ .name = "headers" };
-        const tch = lib.chain.Chain{ .arena = a, .store = ms.store(), .headers = &ix2, .network = .@"test" };
+        var ix2 = maps.map(null);
+        var ix3 = maps.map(null);
+        const tch = lib.chain.Chain{ .arena = a, .store = ms.store(), .headers = &ix2, .heights = &ix3, .network = .@"test" };
         try std.testing.expectError(error.Unconnected, tch.add(grun.items[1..]));
         counts.header += 1;
     }
@@ -495,11 +498,11 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     try std.testing.expect(list[0].spendable);
     try std.testing.expectEqual(lib.wallet.Status.unproven, list[0].status);
     // The funding transactions are known (records), but only the payment is our action.
-    try std.testing.expectEqual(@as(usize, 1), w2.indexCount("actions"));
-    try std.testing.expectEqual(@as(usize, 3), w2.indexCount("txs"));
+    try std.testing.expectEqual(@as(usize, 1), try w2.mapCount("actions"));
+    try std.testing.expectEqual(@as(usize, 3), try w2.mapCount("txs"));
     // A transaction's block is its txid: a bitcoin-tx CID.
-    try std.testing.expectEqualSlices(u8, &pay_txid, &lib.store.bitcoinHash(w2.indexGet("txs", &hdr.toHex(pay_txid)).?.cid).?);
-    try std.testing.expect(w2.indexGet("byStatus", "unproven") != null);
+    try std.testing.expectEqualSlices(u8, &pay_txid, &lib.store.bitcoinHash((try w2.map("txs").link(&pay_txid)).?).?);
+    try std.testing.expect(try w2.map("byStatus").has(&(.{1} ++ pay_txid)));
 
     // The payment is mined at 1002: a single-transaction block, root = txid.
     const h1002 = mine(hdr.hash(&h1001), pay_txid, 1_700_001_800);

@@ -1,22 +1,22 @@
 //! Our own chain tracker over records: headers are `bitcoin-block` blocks
-//! (the CID is the block hash), the `headers` index map names the best
-//! chain (height → header), anchored at the network's genesis header — a
-//! constant here, never an input: every header from any sender must chain
-//! back to it. A header is accepted when its target is usable, its hash
-//! meets it, and it links to a header we hold; a competing branch replaces
-//! ours when its work from the fork point is greater.
+//! (the CID is the block hash); the `headers` map names the best chain
+//! (height → header) and `heights` the way back (block hash → height), both
+//! anchored at the network's genesis header — a constant here, never an
+//! input: every header from any sender must chain back to it. A header is
+//! accepted when its target is usable, its hash meets it, and it links to a
+//! header on our best chain; a competing branch replaces ours when its work
+//! from the fork point is greater.
 //!
 //! Not checked, by decision (#29 Q3, permanent): the difficulty adjustment
 //! rule (that `bits` is the one the chain requires), timestamps and
 //! versions. A peer can feed a low-difficulty branch; it only wins against
 //! ours if it carries more work.
 const std = @import("std");
-const cbor = @import("cbor.zig");
 const hdr = @import("header.zig");
 const store_mod = @import("store.zig");
 
 const Store = store_mod.Store;
-const Index = store_mod.Index;
+const Map = store_mod.Map;
 
 pub const Error = error{ Unconnected, BadLink, BadTarget, BadPow, InvalidHeader, BadRecord };
 
@@ -42,35 +42,37 @@ pub const Network = enum {
     }
 };
 
-pub fn heightKey(buf: *[10]u8, height: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "{d:0>10}", .{height}) catch unreachable;
-}
-
 pub const Loaded = struct { height: u32, raw: [hdr.size]u8, hash: [32]u8 };
 
 pub const Chain = struct {
     arena: std.mem.Allocator,
     store: Store,
-    headers: *Index,
+    /// height (4 bytes, big-endian) → header (bitcoin-block link)
+    headers: *Map,
+    /// block hash (internal order) → height, for the best chain
+    heights: *Map,
     network: Network,
 
     pub fn at(self: Chain, height: u32) !?Loaded {
-        var kb: [10]u8 = undefined;
-        const v = self.headers.get(heightKey(&kb, height)) orelse return null;
-        if (v != .cid) return error.BadRecord;
-        const raw = try self.store.get(self.arena, v.cid);
+        const c = (try self.headers.link(&store_mod.be32(height))) orelse return null;
+        const raw = try self.store.get(self.arena, c);
         if (raw.len != hdr.size) return error.BadRecord;
         const r: [hdr.size]u8 = raw[0..hdr.size].*;
         return .{ .height = height, .raw = r, .hash = hdr.hash(&r) };
     }
 
-    /// The best chain's lowest and highest heights, or null when there is none.
-    pub fn span(self: Chain) ?struct { low: u32, tip: u32 } {
-        const keys = self.headers.sortedKeys();
-        if (keys.len == 0) return null;
-        const low = std.fmt.parseInt(u32, keys[0], 10) catch return null;
-        const tip = std.fmt.parseInt(u32, keys[keys.len - 1], 10) catch return null;
-        return .{ .low = low, .tip = tip };
+    /// The best chain's tip height, or null before the anchor is in.
+    pub fn tip(self: Chain) !?u32 {
+        const k = (try self.headers.last()) orelse return null;
+        if (k.len != 4) return error.BadRecord;
+        return std.mem.readInt(u32, k[0..4], .big);
+    }
+
+    /// The height of a best-chain header by its hash.
+    pub fn heightOf(self: Chain, hash: [32]u8) !?u32 {
+        const v = (try self.heights.get(&hash)) orelse return null;
+        if (v != .int) return error.BadRecord;
+        return @intCast(v.int);
     }
 
     /// The merkle root of the best-chain header at a height: the chain
@@ -82,26 +84,26 @@ pub const Chain = struct {
 
     fn putHeader(self: Chain, height: u32, raw: *const [hdr.size]u8) !void {
         const cid = try self.store.putBitcoin(self.arena, .block, raw);
-        var kb: [10]u8 = undefined;
-        try self.headers.put(self.arena, heightKey(&kb, height), .{ .cid = cid });
+        try self.headers.putLink(&store_mod.be32(height), cid);
+        try self.heights.put(&hdr.hash(raw), .{ .int = height });
     }
 
     /// The anchor: the network's genesis header at height 0, put when the chain is empty.
-    fn anchor(self: Chain) !void {
-        if (self.span() != null) return;
+    fn anchor(self: Chain) !u32 {
+        if (try self.tip()) |t| return t;
         const g = self.network.genesis();
         try self.putHeader(0, &g);
+        return 0;
     }
 
     pub const AddResult = struct { added: u32 = 0, replaced: u32 = 0, known: u32 = 0, ignored: u32 = 0, tip: u32 = 0 };
 
     /// A run of consecutive headers, parents first. The first must link to a
-    /// header on our best chain.
+    /// header on our best chain (or be the genesis header itself).
     pub fn add(self: Chain, raws: []const []const u8) !AddResult {
         var res = AddResult{};
-        try self.anchor();
-        const sp = self.span().?;
-        res.tip = sp.tip;
+        const old_tip = try self.anchor();
+        res.tip = old_tip;
         if (raws.len == 0) return res;
         const batch = try self.arena.alloc([hdr.size]u8, raws.len);
         for (raws, batch) |r, *b| {
@@ -122,19 +124,9 @@ pub const Chain = struct {
             if (batch.len == 1) return res;
         }
         const run = batch[b0..];
-        // The fork point: the best-chain header the batch's first names as its parent.
+        // The fork point: the best-chain header the run's first names as its parent.
         const first = try hdr.Header.parse(&run[0]);
-        var fork: ?u32 = null;
-        var hgt = sp.tip;
-        while (true) : (hgt -= 1) {
-            const have = (try self.at(hgt)) orelse break;
-            if (std.mem.eql(u8, &have.hash, &first.prev_hash)) {
-                fork = hgt;
-                break;
-            }
-            if (hgt == sp.low) break;
-        }
-        const base = fork orelse return error.Unconnected;
+        const base = (try self.heightOf(first.prev_hash)) orelse return error.Unconnected;
         // Skip the headers we already hold.
         var i: usize = 0;
         while (i < run.len) : (i += 1) {
@@ -148,7 +140,7 @@ pub const Chain = struct {
         for (run[i..]) |*b| new_work +|= hdr.work(hdr.target((try hdr.Header.parse(b)).bits).?);
         var old_work: u256 = 0;
         var h: u32 = start;
-        while (h <= sp.tip) : (h += 1) {
+        while (h <= old_tip) : (h += 1) {
             const have = (try self.at(h)) orelse break;
             old_work +|= hdr.work(hdr.target((try hdr.Header.parse(&have.raw)).bits) orelse 0);
         }
@@ -157,9 +149,10 @@ pub const Chain = struct {
             return res;
         }
         h = start;
-        while (h <= sp.tip) : (h += 1) {
-            var kb: [10]u8 = undefined;
-            if (self.headers.remove(heightKey(&kb, h))) res.replaced += 1;
+        while (h <= old_tip) : (h += 1) {
+            const have = (try self.at(h)) orelse break;
+            _ = try self.heights.remove(&have.hash);
+            if (try self.headers.remove(&store_mod.be32(h))) res.replaced += 1;
         }
         for (run[i..], 0..) |*b, j| try self.putHeader(start + @as(u32, @intCast(j)), b);
         res.added = @intCast(run.len - i);
