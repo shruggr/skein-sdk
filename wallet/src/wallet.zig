@@ -78,7 +78,7 @@ pub const Status = enum { proven, unproven, rejected };
 /// The kind of a relation from a record to the transaction it names: whether
 /// the record stands or falls with it. `spends` (an input of a transaction
 /// we hold consumes one of its outputs), `admits` (an overlay admitted one of
-/// its outputs, #36: reserved), `derives-from` (a record built on it: our
+/// its outputs, #36: overlay.zig), `derives-from` (a record built on it: our
 /// action, an output record, a draft) propagate a rejection; `mentions` (a
 /// record that merely names it) does not.
 pub const Rel = enum {
