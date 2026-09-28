@@ -14,8 +14,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The library, for other builds (programs/overlay, #36: `b.dependency("wallet", …).module("wallet")`).
     const lib = libModule(b, target, optimize);
-    _ = lib;
+    b.modules.put("wallet", lib) catch @panic("OOM");
 
     // Native tests.
     const tests = b.addTest(.{ .root_module = testModule(b, target, optimize) });
