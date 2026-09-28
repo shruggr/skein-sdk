@@ -15,7 +15,7 @@ test {
 }
 
 /// Counts of vector checks, printed at the end of the run.
-var counts = struct { tx: usize = 0, fee: usize = 0, beef: usize = 0, path: usize = 0, header: usize = 0, brc29: usize = 0, wire: usize = 0, wallet: usize = 0 }{};
+var counts = struct { sign: usize = 0, tx: usize = 0, fee: usize = 0, beef: usize = 0, path: usize = 0, header: usize = 0, brc29: usize = 0, wire: usize = 0, wallet: usize = 0 }{};
 
 fn load(arena: std.mem.Allocator, comptime name: []const u8) !J {
     return std.json.parseFromSliceLeaky(J, arena, @embedFile("vectors/" ++ name), .{});
@@ -367,6 +367,105 @@ test "vectors: BRC-100 getPublicKey wire frames (go-sdk serializer)" {
     }
 }
 
+// ---------------------------------------------------------------- signing through the oracle
+
+/// The oracle as go-sdk's ProtoWallet answered it: every request frame must be one
+/// the vector recorded, and gets the recorded result frame.
+const VectorOracle = struct {
+    frames: std.StringHashMapUnmanaged([]const u8) = .empty,
+    calls: usize = 0,
+    fn call(ctx: *anyopaque, arena: std.mem.Allocator, frame: []const u8) anyerror![]const u8 {
+        const self: *VectorOracle = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const res = self.frames.get(try hexOf(arena, frame)) orelse {
+            std.debug.print("unexpected oracle frame {s}\n", .{try hexOf(arena, frame)});
+            return error.UnexpectedFrame;
+        };
+        return unhex(arena, res);
+    }
+};
+
+fn keyOf(k: J) !lib.builder.Key {
+    const c = str(k, "counterparty");
+    return .{ .key_id = str(k, "keyID"), .counterparty = if (std.mem.eql(u8, c, "self")) .self else .{ .other = try key33(c) } };
+}
+
+test "vectors: spends signed through the oracle — frames, sighash, fee, change, tx (go-sdk ProtoWallet)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const v = try load(a, "signing.json");
+    const root = try key32(str(v, "rootKey"));
+    try std.testing.expectEqualStrings(str(v, "identityKey"), &std.fmt.bytesToHex(try lib.brc29.identityKey(root), .lower));
+    for (arr(v, "cases")) |c| {
+        var vo = VectorOracle{};
+        var inputs: std.ArrayList(lib.builder.Input) = .empty;
+        for (arr(c, "inputs")) |in| {
+            try vo.frames.put(a, str(in, "getPublicKeyFrame"), str(in, "getPublicKeyResult"));
+            try vo.frames.put(a, str(in, "createSignatureFrame"), str(in, "createSignatureResult"));
+            const src = try bsvz.transaction.Transaction.parse(a, try unhex(a, str(in, "sourceTx")));
+            const vout: u32 = @intCast(int(in, "vout"));
+            try std.testing.expectEqualStrings(str(in, "lockingScript"), try hexOf(a, src.outputs[vout].locking_script.bytes));
+            try inputs.append(a, .{
+                .source_txid = try hdr.fromHex(str(in, "sourceTxid")),
+                .vout = vout,
+                .satoshis = @intCast(int(in, "satoshis")),
+                .locking_script = src.outputs[vout].locking_script.bytes,
+                .key = try keyOf(in),
+            });
+        }
+        const ch = c.object.get("change").?;
+        try vo.frames.put(a, str(ch, "getPublicKeyFrame"), str(ch, "getPublicKeyResult"));
+        var outputs: std.ArrayList(lib.builder.Output) = .empty;
+        for (arr(c, "outputs")) |o| try outputs.append(a, .{ .satoshis = @intCast(int(o, "satoshis")), .locking_script = try unhex(a, str(o, "lockingScript")) });
+        const rate: u64 = @intCast(int(c, "satsPerKb"));
+
+        var ws = lib.builder.WireSigner{ .ctx = &vo, .call = VectorOracle.call };
+        const built = try lib.builder.build(a, ws.signer(), inputs.items, outputs.items, try keyOf(ch), rate, true);
+        try std.testing.expectEqual(@as(u64, @intCast(int(c, "fee"))), built.fee);
+        const cs = ch.object.get("satoshis").?;
+        if (cs == .null) try std.testing.expect(built.change == null) else try std.testing.expectEqual(@as(u64, @intCast(cs.integer)), built.change.?.satoshis);
+        try std.testing.expectEqualStrings(str(c, "tx"), try hexOf(a, built.raw));
+        try std.testing.expectEqualStrings(str(c, "txid"), &hdr.toHex(built.txid));
+        try std.testing.expectEqual(1 + 2 * inputs.items.len, vo.calls);
+        // The preimage and sighash, and each input's script, checked here too.
+        for (arr(c, "inputs"), inputs.items, 0..) |jin, in, i| {
+            const pre = try bsvz.transaction.sighash.formatPreimage(a, &built.tx, i, bsvz.script.Script.init(in.locking_script), @intCast(in.satoshis), lib.builder.sighash_all_forkid);
+            try std.testing.expectEqualStrings(str(jin, "preimage"), try hexOf(a, pre));
+            const d = try bsvz.transaction.sighash.digest(a, &built.tx, i, bsvz.script.Script.init(in.locking_script), @intCast(in.satoshis), lib.builder.sighash_all_forkid);
+            try std.testing.expectEqualStrings(str(jin, "sighash"), try hexOf(a, &d.bytes));
+            try std.testing.expectEqualStrings(str(jin, "unlockingScript"), try hexOf(a, built.tx.inputs[i].unlocking_script.bytes));
+            try std.testing.expect(try bsvz.script.interpreter.verifyPrevout(.{
+                .allocator = a,
+                .tx = &built.tx,
+                .input_index = i,
+                .previous_output = .{ .satoshis = @intCast(in.satoshis), .locking_script = bsvz.script.Script.init(in.locking_script) },
+                .unlocking_script = built.tx.inputs[i].unlocking_script,
+            }));
+            counts.sign += 1;
+        }
+        // The same spend with the root key in hand (bsvz's BRC-42): the same keys, a valid tx.
+        var ks = lib.builder.KeySigner{ .root = root };
+        const again = try lib.builder.build(a, ks.signer(), inputs.items, outputs.items, try keyOf(ch), rate, true);
+        try std.testing.expectEqual(built.fee, again.fee);
+        for (inputs.items, 0..) |in, i| try std.testing.expect(try bsvz.script.interpreter.verifyPrevout(.{
+            .allocator = a,
+            .tx = &again.tx,
+            .input_index = i,
+            .previous_output = .{ .satoshis = @intCast(in.satoshis), .locking_script = bsvz.script.Script.init(in.locking_script) },
+            .unlocking_script = again.tx.inputs[i].unlocking_script,
+        }));
+        for (built.tx.outputs, again.tx.outputs) |x, y| try std.testing.expectEqualSlices(u8, x.locking_script.bytes, y.locking_script.bytes);
+        counts.sign += 1;
+    }
+    // Not enough: refused before any signature.
+    var ks = lib.builder.KeySigner{ .root = root };
+    const c0 = arr(v, "cases")[0];
+    const in0 = arr(c0, "inputs")[0];
+    const src0 = try bsvz.transaction.Transaction.parse(a, try unhex(a, str(in0, "sourceTx")));
+    try std.testing.expectError(error.InsufficientFunds, lib.builder.build(a, ks.signer(), &.{.{ .source_txid = try hdr.fromHex(str(in0, "sourceTxid")), .vout = 1, .satoshis = 30000, .locking_script = src0.outputs[1].locking_script.bytes, .key = try keyOf(in0) }}, &.{.{ .satoshis = 30000, .locking_script = &.{0x51} }}, .{ .key_id = "x", .counterparty = .self }, 1, true));
+}
+
 // ---------------------------------------------------------------- the wallet over records
 
 /// A regtest chain from its genesis up to `tip`, the header at each height in
@@ -532,6 +631,63 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     var w4 = try lib.wallet.Wallet.load(a, s, state1, .regtest);
     _ = try w4.internalize(.{ .tx = pay_beef, .outputs = &.{.{ .output_index = 0, .payment = remit }}, .description = "again" }, oracle.oracle());
     try std.testing.expectEqualStrings(state1, try w4.save());
+
+    // Spending: createAction pays someone from the payment, change to a fresh key of ours, signed by the oracle.
+    var signer = lib.builder.KeySigner{ .root = our_priv };
+    const payee_script = lib.brc29.p2pkh(try lib.brc29.identityKey(.{0x33} ** 32));
+    var w5 = try lib.wallet.Wallet.load(a, s, state1, .regtest);
+    const paid: u64 = @intCast(fund_tx.outputs[0].satoshis - 100);
+    try std.testing.expectError(error.InsufficientFunds, w5.createAction(.{ .description = "too much", .outputs = &.{.{ .satoshis = paid, .locking_script = &payee_script }} }, signer.signer(), "cA==", "cw==", 100));
+    const c1 = try w5.createAction(.{ .description = "pay", .labels = &.{"out"}, .outputs = &.{
+        .{ .satoshis = 300, .locking_script = &payee_script },
+        .{ .satoshis = 1, .locking_script = &.{ 0x00, 0x6a, 0x01, 0x42 }, .basket = "tokens", .tags = &.{"t"} },
+    } }, signer.signer(), "Y2hhbmdl", "MQ==", 100);
+    try std.testing.expect(c1.reference == null);
+    const b1 = try beef.parse(a, c1.beef);
+    try std.testing.expectEqualSlices(u8, &c1.txid, &b1.atomic.?);
+    // The BEEF carries the unproven payment, its unproven parent and their proven ancestor: it SPV-checks against our chain.
+    try std.testing.expectEqual(@as(usize, 4), b1.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), b1.bumps.len);
+    const spent_tx = b1.find(c1.txid).?.tx.?;
+    try std.testing.expectEqualSlices(u8, &pay_txid, &spent_tx.inputs[0].previous_outpoint.txid.bytes);
+    try std.testing.expect(try bsvz.script.interpreter.verifyPrevout(.{ .allocator = a, .tx = &spent_tx, .input_index = 0, .previous_output = pay_tx.outputs[0], .unlocking_script = spent_tx.inputs[0].unlocking_script }));
+    const change_sats = paid - 301 - (try lib.builder.estimateFee(a, 1, &.{ .{ .satoshis = 300, .locking_script = &payee_script }, .{ .satoshis = 1, .locking_script = &.{ 0x00, 0x6a, 0x01, 0x42 } } }, 25, 100));
+    const state5 = try w5.save();
+    var w6 = try lib.wallet.Wallet.load(a, s, state5, .regtest);
+    const def = try w6.listOutputs("default", true);
+    try std.testing.expectEqual(@as(usize, 2), def.len);
+    try std.testing.expect(std.mem.eql(u8, &def[0].txid, &c1.txid) and def[0].spendable and def[0].satoshis == change_sats);
+    try std.testing.expect(std.mem.eql(u8, &def[1].txid, &pay_txid) and !def[1].spendable);
+    try std.testing.expectEqual(@as(usize, 1), (try w6.listOutputs("tokens", false)).len);
+    try std.testing.expectEqual(@as(usize, 2), try w6.mapCount("actions"));
+    // The change (counterparty self) funds the next spend, unconfirmed: its BEEF goes back to the proven grandparent.
+    const c2 = try w6.createAction(.{ .description = "again", .outputs = &.{.{ .satoshis = 100, .locking_script = &payee_script }} }, signer.signer(), "Y2hhbmdl", "Mg==", 100);
+    const b2 = try beef.parse(a, c2.beef);
+    try std.testing.expectEqual(@as(usize, 5), b2.entries.len);
+    var ctx2 = struct {
+        w: *lib.wallet.Wallet,
+        fn rootAt(ptr: *anyopaque, height: u32) anyerror!?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.w.chain().rootAt(height);
+        }
+        fn none(_: *anyopaque, _: std.mem.Allocator, _: [32]u8) anyerror!?[]const u8 {
+            return null;
+        }
+    }{ .w = &w6 };
+    _ = try lib.spv.verify(a, b2, .{ .ptr = &ctx2, .rootAtFn = @TypeOf(ctx2).rootAt, .knownRawFn = @TypeOf(ctx2).none });
+
+    // signAndProcess false: a draft, signable; signAction signs the same transaction.
+    var w7 = try lib.wallet.Wallet.load(a, s, state1, .regtest);
+    const d = try w7.createAction(.{ .description = "pay", .labels = &.{"out"}, .sign_and_process = false, .outputs = &.{
+        .{ .satoshis = 300, .locking_script = &payee_script },
+        .{ .satoshis = 1, .locking_script = &.{ 0x00, 0x6a, 0x01, 0x42 }, .basket = "tokens", .tags = &.{"t"} },
+    } }, signer.signer(), "Y2hhbmdl", "MQ==", 100);
+    try std.testing.expect(d.reference != null);
+    try std.testing.expectEqual(@as(usize, 1), try w7.mapCount("actions")); // nothing recorded yet
+    const signed = try w7.signAction(d.reference.?, signer.signer());
+    try std.testing.expectEqualSlices(u8, &c1.txid, &signed.txid);
+    try std.testing.expectEqualStrings(state5, try w7.save());
+    try std.testing.expectError(error.InputSpent, w7.signAction(d.reference.?, signer.signer()));
     counts.wallet += 1;
 }
 
@@ -584,5 +740,5 @@ test "wallet: basket insertion, spent outputs, BEEF refusals" {
 }
 
 test "zz: vector counts" {
-    std.debug.print("\nvectors passed: tx {d} (fees {d}), beef {d}, merkle {d}, headers {d}, brc29 {d}, wire {d}; wallet scenarios {d}\n", .{ counts.tx, counts.fee, counts.beef, counts.path, counts.header, counts.brc29, counts.wire, counts.wallet });
+    std.debug.print("\nvectors passed: tx {d} (fees {d}), beef {d}, merkle {d}, headers {d}, brc29 {d}, wire {d}, signing {d}; wallet scenarios {d}\n", .{ counts.tx, counts.fee, counts.beef, counts.path, counts.header, counts.brc29, counts.wire, counts.sign, counts.wallet });
 }

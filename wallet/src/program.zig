@@ -12,6 +12,8 @@
 //!   {op: "headers", headers: [bytes]}           a run of headers, parents first (ChainTracks)
 //!   {op: "internalize", tx, outputs, description, labels?}   BRC-100 internalizeAction (Atomic BEEF)
 //!   {op: "proof", txid, path}                   a merkle path (BRC-74) for a transaction we hold
+//!   {op: "createAction", description, outputs, labels?, options?: {signAndProcess?, noSend?}}   BRC-100 createAction
+//!   {op: "signAction", reference}                BRC-100 signAction for a draft (signAndProcess: false)
 //!   {op: "list", basket?, includeSpent?}        our outputs in a basket (default "default")
 //!
 //! The only attested call is getPublicKey, to derive our BRC-29 payee key
@@ -86,6 +88,12 @@ const VmOracle = struct {
     fn oracle() w.wallet.Oracle {
         return .{ .ptr = &dummy, .derivePayeeFn = derive };
     }
+    /// A wire frame to the oracle and its result frame (getPublicKey, createSignature: attested).
+    fn call(_: *anyopaque, arena: std.mem.Allocator, frame: []const u8) anyerror![]const u8 {
+        const res = try result(arena, sk.wallet, .{ frame.ptr, @as(u32, @intCast(frame.len)) });
+        if (w.wire.errorMessage(res)) |m| std.log.err("oracle: {s}", .{m});
+        return res;
+    }
 };
 
 const head_name = "wallet";
@@ -143,6 +151,9 @@ fn run(a: std.mem.Allocator) !void {
         std.log.err("defaults.walletNetwork: {s} is not main, test or regtest", .{net_name});
         return error.BadConfig;
     };
+    // The fee rate for what we build: defaults.walletFeeRate (satoshis per kB), else 100.
+    const rate_text = if (step.get("defaults")) |d| d.getText("walletFeeRate") orelse "100" else "100";
+    const fee_rate = std.fmt.parseInt(u64, rate_text, 10) catch return error.BadConfig;
     const state_cid = try result(a, sk.head, .{ head_name.ptr, @as(u32, head_name.len) });
     var wal = try w.wallet.Wallet.load(a, s, if (state_cid.len > 0) state_cid else null, network);
 
@@ -214,6 +225,31 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "txid", .value = .{ .text = txid } },
             .{ .key = "status", .value = .{ .text = @tagName(st) } },
         });
+    } else if (std.mem.eql(u8, op, "createAction") or std.mem.eql(u8, op, "signAction")) {
+        var ws = w.builder.WireSigner{ .ctx = &VmOracle.dummy, .call = VmOracle.call };
+        const created = if (std.mem.eql(u8, op, "createAction")) blk: {
+            const opts = body.get("options");
+            // The change key: a fresh BRC-29 derivation of our own, drawn from the thread's random (replayable).
+            var rnd: [24]u8 = undefined;
+            std.crypto.random.bytes(&rnd);
+            const enc = std.base64.standard.Encoder;
+            const prefix = try a.alloc(u8, enc.calcSize(12));
+            const suffix = try a.alloc(u8, enc.calcSize(12));
+            _ = enc.encode(prefix, rnd[0..12]);
+            _ = enc.encode(suffix, rnd[12..24]);
+            break :blk try wal.createAction(.{
+                .description = body.getText("description") orelse "",
+                .outputs = try w.wallet.decodeOutputs(a, (try field(body, "outputs")).array),
+                .labels = try textList(a, body.get("labels")),
+                .sign_and_process = if (opts) |o| o.getBool("signAndProcess") orelse true else true,
+                .no_send = if (opts) |o| o.getBool("noSend") orelse false else false,
+            }, ws.signer(), prefix, suffix, fee_rate);
+        } else try wal.signAction(body.getCid("reference") orelse return error.BadBody, ws.signer());
+        try out.appendSlice(a, &.{
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(created.txid)) } },
+            .{ .key = "tx", .value = .{ .bytes = created.beef } },
+        });
+        if (created.reference) |r| try out.append(a, .{ .key = "reference", .value = .{ .cid = r } });
     } else if (std.mem.eql(u8, op, "list")) {
         mutates = false;
         const basket = body.getText("basket") orelse "default";

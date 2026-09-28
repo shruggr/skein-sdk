@@ -19,6 +19,7 @@ const spv = @import("spv.zig");
 const brc29 = @import("brc29.zig");
 const chain_mod = @import("chain.zig");
 const store_mod = @import("store.zig");
+const builder = @import("builder.zig");
 
 const Store = store_mod.Store;
 const Map = store_mod.Map;
@@ -82,6 +83,43 @@ pub const OutputView = struct {
 pub fn textArray(arena: std.mem.Allocator, xs: []const []const u8) ![]Value {
     const out = try arena.alloc(Value, xs.len);
     for (xs, out) |x, *o| o.* = .{ .text = x };
+    return out;
+}
+
+pub fn textsOf(arena: std.mem.Allocator, items: []const Value) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, items.len);
+    for (items, out) |it, *o| o.* = if (it == .text) it.text else return error.BadRecord;
+    return out;
+}
+
+fn encodeOutputs(a: std.mem.Allocator, outputs: []const Wallet.CreateOutput) ![]Value {
+    const out = try a.alloc(Value, outputs.len);
+    for (outputs, out) |o, *v| {
+        var fields: std.ArrayList(cbor.Entry) = .empty;
+        try fields.appendSlice(a, &.{
+            .{ .key = "satoshis", .value = .{ .uint = o.satoshis } },
+            .{ .key = "lockingScript", .value = .{ .bytes = o.locking_script } },
+            .{ .key = "outputDescription", .value = .{ .text = o.description } },
+            .{ .key = "tags", .value = .{ .array = try textArray(a, o.tags) } },
+        });
+        if (o.basket) |b| try fields.append(a, .{ .key = "basket", .value = .{ .text = b } });
+        if (o.custom_instructions) |ci| try fields.append(a, .{ .key = "customInstructions", .value = .{ .text = ci } });
+        v.* = .{ .map = fields.items };
+    }
+    return out;
+}
+
+/// BRC-100 createAction outputs (as the program's bodies and drafts carry them).
+pub fn decodeOutputs(a: std.mem.Allocator, items: []const Value) ![]Wallet.CreateOutput {
+    const out = try a.alloc(Wallet.CreateOutput, items.len);
+    for (items, out) |it, *o| o.* = .{
+        .satoshis = it.getUint("satoshis") orelse return error.BadOutput,
+        .locking_script = it.getBytes("lockingScript") orelse return error.BadOutput,
+        .description = it.getText("outputDescription") orelse "",
+        .basket = it.getText("basket"),
+        .tags = try textsOf(a, it.getArray("tags") orelse &.{}),
+        .custom_instructions = it.getText("customInstructions"),
+    };
     return out;
 }
 
@@ -365,6 +403,233 @@ pub const Wallet = struct {
         }
         return out.toOwnedSlice(a);
     }
+
+    // ------------------------------------------------------------ building (createAction / signAction)
+
+    /// The BRC-29 key an output of ours is locked to: a payment's (counterparty
+    /// the sender) or our change's (counterparty self); null for anything else.
+    pub fn keyOf(self: *Wallet, rec: Value) !?builder.Key {
+        const protocol = rec.getText("protocol") orelse return null;
+        const key_id = try brc29.keyId(self.arena, rec.getText("derivationPrefix") orelse return null, rec.getText("derivationSuffix") orelse return null);
+        if (std.mem.eql(u8, protocol, "wallet change")) return .{ .key_id = key_id, .counterparty = .self };
+        if (!std.mem.eql(u8, protocol, "wallet payment")) return null;
+        const hex = rec.getText("senderIdentityKey") orelse return error.BadRecord;
+        var k: [33]u8 = undefined;
+        if (hex.len != 66) return error.BadRecord;
+        _ = std.fmt.hexToBytes(&k, hex) catch return error.BadRecord;
+        return .{ .key_id = key_id, .counterparty = .{ .other = k } };
+    }
+
+    /// Our spendable outputs we hold keys for (the `default` basket), largest first.
+    fn spendableInputs(self: *Wallet) ![]builder.Input {
+        var out: std.ArrayList(builder.Input) = .empty;
+        for (try self.listOutputs("default", false)) |o| {
+            const key = (try self.keyOf(o.record)) orelse continue;
+            try out.append(self.arena, .{ .source_txid = o.txid, .vout = o.vout, .satoshis = o.satoshis, .locking_script = o.locking_script, .key = key });
+        }
+        std.mem.sort(builder.Input, out.items, {}, struct {
+            fn lt(_: void, x: builder.Input, y: builder.Input) bool {
+                if (x.satoshis != y.satoshis) return x.satoshis > y.satoshis;
+                const kx = store_mod.outpointKey(x.source_txid, x.vout);
+                const ky = store_mod.outpointKey(y.source_txid, y.vout);
+                return std.mem.order(u8, &kx, &ky) == .lt;
+            }
+        }.lt);
+        return out.items;
+    }
+
+    /// Inputs for these outputs: the largest spendable first, until they cover the outputs and the fee.
+    pub fn selectInputs(self: *Wallet, outputs: []const builder.Output, sats_per_kb: u64) ![]builder.Input {
+        const all = try self.spendableInputs();
+        var need: u64 = 0;
+        for (outputs) |o| need += o.satoshis;
+        var have: u64 = 0;
+        for (all, 1..) |in, n| {
+            have += in.satoshis;
+            if (have >= need + try builder.estimateFee(self.arena, n, outputs, 25, sats_per_kb)) return all[0..n];
+        }
+        return error.InsufficientFunds;
+    }
+
+    pub const CreateOutput = struct {
+        satoshis: u64,
+        locking_script: []const u8,
+        description: []const u8 = "",
+        basket: ?[]const u8 = null,
+        tags: []const []const u8 = &.{},
+        custom_instructions: ?[]const u8 = null,
+    };
+
+    /// BRC-100 createAction's arguments, as far as the wallet takes them:
+    /// outputs (inputs are chosen from our own spendable outputs), labels,
+    /// options.signAndProcess / options.noSend.
+    pub const CreateArgs = struct {
+        description: []const u8,
+        outputs: []const CreateOutput,
+        labels: []const []const u8 = &.{},
+        sign_and_process: bool = true,
+        no_send: bool = false,
+    };
+
+    pub const Created = struct {
+        txid: [32]u8,
+        /// Atomic BEEF: the signed transaction and its ancestry, or the signable draft's.
+        beef: []const u8,
+        /// A signable draft: the draft record's CID (signAction's `reference`).
+        reference: ?[]const u8 = null,
+        no_send: bool = false,
+    };
+
+    /// BRC-100 createAction: choose inputs, build with change to a fresh key of
+    /// ours (derivation prefix and suffix given: the program draws them from
+    /// the thread's random), sign through the oracle and record it — or, with
+    /// signAndProcess false, keep a draft and return it signable.
+    pub fn createAction(self: *Wallet, args: CreateArgs, signer: builder.Signer, change_prefix: []const u8, change_suffix: []const u8, sats_per_kb: u64) !Created {
+        const a = self.arena;
+        if (args.outputs.len == 0) return error.NoOutputs;
+        const outs = try a.alloc(builder.Output, args.outputs.len);
+        for (args.outputs, outs) |o, *x| {
+            if (o.locking_script.len == 0) return error.BadOutput;
+            if (o.basket) |b| if (b.len == 0 or std.mem.eql(u8, b, "default")) return error.BadBasket;
+            x.* = .{ .satoshis = o.satoshis, .locking_script = o.locking_script };
+        }
+        const inputs = try self.selectInputs(outs, sats_per_kb);
+        const change_key = builder.Key{ .key_id = try brc29.keyId(a, change_prefix, change_suffix), .counterparty = .self };
+        const built = try builder.build(a, signer, inputs, outs, change_key, sats_per_kb, args.sign_and_process);
+        if (args.sign_and_process) return self.recordSigned(built, args, change_prefix, change_suffix);
+
+        // A draft: what signAction needs to build the same transaction again, signed.
+        const ops = try a.alloc(Value, inputs.len);
+        for (inputs, ops) |in, *o| o.* = .{ .bytes = try a.dupe(u8, &store_mod.outpointKey(in.source_txid, in.vout)) };
+        const draft = try self.store.putValue(a, .{ .map = &.{
+            .{ .key = "kind", .value = .{ .text = "draft" } },
+            .{ .key = "description", .value = .{ .text = args.description } },
+            .{ .key = "labels", .value = .{ .array = try textArray(a, args.labels) } },
+            .{ .key = "outputs", .value = .{ .array = try encodeOutputs(a, args.outputs) } },
+            .{ .key = "inputs", .value = .{ .array = ops } },
+            .{ .key = "derivationPrefix", .value = .{ .text = change_prefix } },
+            .{ .key = "derivationSuffix", .value = .{ .text = change_suffix } },
+            .{ .key = "satsPerKb", .value = .{ .uint = sats_per_kb } },
+            .{ .key = "noSend", .value = .{ .boolean = args.no_send } },
+        } });
+        return .{ .txid = built.txid, .beef = try self.atomicBeef(built.txid, built.raw, built.tx), .reference = draft, .no_send = args.no_send };
+    }
+
+    /// BRC-100 signAction for a draft of ours: the same inputs (still
+    /// spendable), outputs and change key, now signed through the oracle, and recorded.
+    pub fn signAction(self: *Wallet, reference: []const u8, signer: builder.Signer) !Created {
+        const a = self.arena;
+        const d = self.record(reference) catch return error.UnknownReference;
+        if (!std.mem.eql(u8, d.getText("kind") orelse "", "draft")) return error.UnknownReference;
+        const outputs = try decodeOutputs(a, d.getArray("outputs") orelse return error.BadRecord);
+        try self.rebuildDerived();
+        const ops = d.getArray("inputs") orelse return error.BadRecord;
+        const inputs = try a.alloc(builder.Input, ops.len);
+        for (ops, inputs) |o, *in| {
+            if (o != .bytes) return error.BadRecord;
+            const op = try store_mod.outpointOf(o.bytes);
+            if (try self.map("spent").has(o.bytes)) return error.InputSpent;
+            const rc = (try self.map("outputs").link(o.bytes)) orelse return error.BadRecord;
+            const raw = (try self.txRaw(op.txid)) orelse return error.BadRecord;
+            const src = try bsvz.transaction.Transaction.parse(a, raw);
+            in.* = .{
+                .source_txid = op.txid,
+                .vout = op.vout,
+                .satoshis = @intCast(src.outputs[op.vout].satoshis),
+                .locking_script = src.outputs[op.vout].locking_script.bytes,
+                .key = (try self.keyOf(try self.record(rc))) orelse return error.BadRecord,
+            };
+        }
+        const outs = try a.alloc(builder.Output, outputs.len);
+        for (outputs, outs) |o, *x| x.* = .{ .satoshis = o.satoshis, .locking_script = o.locking_script };
+        const prefix = d.getText("derivationPrefix") orelse return error.BadRecord;
+        const suffix = d.getText("derivationSuffix") orelse return error.BadRecord;
+        const change_key = builder.Key{ .key_id = try brc29.keyId(a, prefix, suffix), .counterparty = .self };
+        const built = try builder.build(a, signer, inputs, outs, change_key, d.getUint("satsPerKb") orelse return error.BadRecord, true);
+        const args = CreateArgs{
+            .description = d.getText("description") orelse "",
+            .outputs = outputs,
+            .labels = try textsOf(a, d.getArray("labels") orelse &.{}),
+            .no_send = d.getBool("noSend") orelse false,
+        };
+        return self.recordSigned(built, args, prefix, suffix);
+    }
+
+    /// Record a signed transaction of ours: the transaction, the action, our
+    /// change output and every output the caller put in a basket.
+    fn recordSigned(self: *Wallet, built: builder.Built, args: CreateArgs, change_prefix: []const u8, change_suffix: []const u8) !Created {
+        const a = self.arena;
+        const tx_cid = try self.putTx(built.txid, built.raw);
+        try self.putAction(built.txid, tx_cid, args.description, args.labels, &.{.{ .key = "noSend", .value = .{ .boolean = args.no_send } }});
+        const txid_hex = try a.dupe(u8, &hdr.toHex(built.txid));
+        if (built.change) |c| {
+            const rc = try self.store.putValue(a, .{ .map = &.{
+                .{ .key = "kind", .value = .{ .text = "output" } },
+                .{ .key = "txid", .value = .{ .text = txid_hex } },
+                .{ .key = "vout", .value = .{ .uint = c.vout } },
+                .{ .key = "tx", .value = .{ .cid = tx_cid } },
+                .{ .key = "basket", .value = .{ .text = "default" } },
+                .{ .key = "protocol", .value = .{ .text = "wallet change" } },
+                .{ .key = "derivationPrefix", .value = .{ .text = change_prefix } },
+                .{ .key = "derivationSuffix", .value = .{ .text = change_suffix } },
+            } });
+            try self.map("outputs").putLink(&store_mod.outpointKey(built.txid, c.vout), rc);
+        }
+        for (args.outputs, 0..) |o, i| {
+            const basket = o.basket orelse continue;
+            var fields: std.ArrayList(cbor.Entry) = .empty;
+            try fields.appendSlice(a, &.{
+                .{ .key = "kind", .value = .{ .text = "output" } },
+                .{ .key = "txid", .value = .{ .text = txid_hex } },
+                .{ .key = "vout", .value = .{ .uint = i } },
+                .{ .key = "tx", .value = .{ .cid = tx_cid } },
+                .{ .key = "basket", .value = .{ .text = basket } },
+                .{ .key = "protocol", .value = .{ .text = "basket insertion" } },
+                .{ .key = "tags", .value = .{ .array = try textArray(a, o.tags) } },
+            });
+            if (o.custom_instructions) |ci| try fields.append(a, .{ .key = "customInstructions", .value = .{ .text = ci } });
+            try self.map("outputs").putLink(&store_mod.outpointKey(built.txid, @intCast(i)), try self.store.putValue(a, .{ .map = fields.items }));
+        }
+        return .{ .txid = built.txid, .beef = try self.atomicBeef(built.txid, built.raw, built.tx), .no_send = args.no_send };
+    }
+
+    /// The Atomic BEEF (BRC-95 over BRC-96) of a transaction: its ancestry
+    /// back to proven transactions (with their BUMPs, merged per block),
+    /// parents first, then the transaction itself.
+    pub fn atomicBeef(self: *Wallet, txid: [32]u8, raw: []const u8, tx: bsvz.transaction.Transaction) ![]const u8 {
+        var acc = BeefAcc{ .w = self };
+        for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
+        try acc.entries.append(self.arena, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
+        return beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .atomic = txid, .bumps = acc.bumps.items, .entries = acc.entries.items });
+    }
+
+    const BeefAcc = struct {
+        w: *Wallet,
+        entries: std.ArrayList(beef_mod.Entry) = .empty,
+        bumps: std.ArrayList(bsvz.spv.MerklePath) = .empty,
+
+        fn visit(acc: *BeefAcc, txid: [32]u8) anyerror!void {
+            const a = acc.w.arena;
+            for (acc.entries.items) |e| if (std.mem.eql(u8, &e.txid, &txid)) return;
+            const raw = (try acc.w.txRaw(txid)) orelse return error.MissingAncestor;
+            const tx = try bsvz.transaction.Transaction.parse(a, raw);
+            if ((try acc.w.status(txid)) == .proven) {
+                const p = try bsvz.spv.MerklePath.parse(a, (try acc.w.proofPath(txid)).?);
+                const idx = for (acc.bumps.items, 0..) |*b, i| {
+                    if (b.block_height != p.block_height) continue;
+                    b.combine(&p, a) catch continue;
+                    break i;
+                } else blk: {
+                    try acc.bumps.append(a, p);
+                    break :blk acc.bumps.items.len - 1;
+                };
+                try acc.entries.append(a, .{ .txid = txid, .format = .raw_with_bump, .bump = idx, .raw = raw, .tx = tx });
+                return;
+            }
+            for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
+            try acc.entries.append(a, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
+        }
+    };
 
     pub fn mapCount(self: *Wallet, comptime name: []const u8) !usize {
         return self.map(name).count();

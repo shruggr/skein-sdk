@@ -8,6 +8,7 @@ pub const chain = @import("chain.zig");
 pub const spv = @import("spv.zig");
 pub const brc29 = @import("brc29.zig");
 pub const wire = @import("wire.zig");
+pub const builder = @import("builder.zig");
 pub const store = @import("store.zig");
 pub const wallet = @import("wallet.zig");
 

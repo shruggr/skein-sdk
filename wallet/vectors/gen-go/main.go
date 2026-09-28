@@ -305,6 +305,7 @@ func gen() error {
 		{"../headers.json", func() (any, error) { return genHeaders(mh) }},
 		{"../brc29.json", func() (any, error) { return genBrc29() }},
 		{"../wire.json", func() (any, error) { return genWire() }},
+		{"../signing.json", genSigning},
 	}
 	for _, s := range steps {
 		v, err := s.f()
