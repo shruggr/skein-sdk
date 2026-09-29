@@ -93,6 +93,47 @@ interface skein {
   edges: func(to: cid, rel: option<string>) -> result<list<u8>, string>;
 }
 
+/// libp2p from a step (#51): answered by the router's libp2p host (the runtime
+/// has no network), each call **recorded on the update like `http`** — request
+/// and result, as the dag-cbor request preview1's `skein.libp2p` import takes
+/// (`{op: "publish" | "dial" | "send" | "receive" | "close", …}`), so replay
+/// serves the recorded result and never touches the network, and a differing
+/// request on replay is a divergence. A host failure (a dial that fails, a
+/// stream that is gone) is recorded too, and is the call's error. Published
+/// messages are signed by GossipSub with the instance's peer key (a child of
+/// the host's master secret, key ID `libp2p:<handle>`), never a wallet key.
+/// Refused in a kernel call (only a step sends) and in the browser build.
+interface libp2p {
+  /// What `receive` found on the stream.
+  variant received {
+    /// The next length-prefixed frame.
+    frame(list<u8>),
+    /// Nothing yet: set a `deadline` and end the step; the thread rests, and
+    /// the router wakes it (a wake entry, before the deadline) when a frame
+    /// arrives, so its next step's `receive` has it.
+    pending,
+    /// The remote closed the stream; nothing more will come.
+    closed,
+  }
+
+  /// Publish `body` on a GossipSub topic (signed with the instance's peer
+  /// key) → the message's seqno.
+  publish: func(topic: string, body: list<u8>) -> result<u64, string>;
+
+  /// Open a stream to a peer (a peer ID, or a multiaddr with /p2p/<id>) on
+  /// `protocol` → its id (the router's, unique across its restarts).
+  dial: func(peer: string, protocol: string) -> result<u64, string>;
+
+  /// Write one length-prefixed frame (unsigned varint length).
+  send: func(stream-id: u64, body: list<u8>) -> result<_, string>;
+
+  /// The next frame, or `pending` (rest; woken when it comes), or `closed`.
+  receive: func(stream-id: u64) -> result<received, string>;
+
+  /// Close the stream (our side), and forget it.
+  close: func(stream-id: u64) -> result<_, string>;
+}
+
 /// What a handler program imports beyond WASI's command world: skein's calls
 /// and outgoing HTTP (`wasi:http`, #15). A program built for
 /// preview1 WASI (Zig, C, Rust `wasm32-wasip1`) embeds this world with
@@ -101,6 +142,7 @@ interface skein {
 /// the `wasi:cli/run` export: the result targets `handler`.
 world program {
   import skein;
+  import libp2p;
   import wasi:http/outgoing-handler@0.2.12;
 }
 
@@ -119,6 +161,9 @@ world program {
 ///   recorded-call shape of `skein.http` and answered by the host; request and
 ///   response are recorded on the step's update, so replay reads the answer
 ///   and never touches the network. Bodies are buffered; no trailers.
+/// - `skein:kernel/libp2p` (#51): each call serialized into the recorded
+///   request of preview1's `skein.libp2p` and answered by the router's libp2p
+///   host; recorded on the update, so replay never touches the network.
 /// No sockets, no incoming handler.
 world handler {
   import wasi:cli/environment@0.2.12;
@@ -144,6 +189,7 @@ world handler {
   import wasi:http/types@0.2.12;
   import wasi:http/outgoing-handler@0.2.12;
   import skein;
+  import libp2p;
 
   export wasi:cli/run@0.2.12;
 }

@@ -50,6 +50,23 @@ extern void __wasm_import_skein_kernel_skein_call(uint8_t *, size_t, uint8_t *, 
 __attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("edges")))
 extern void __wasm_import_skein_kernel_skein_edges(uint8_t *, size_t, int32_t, uint8_t *, size_t, uint8_t *);
 
+// Imported Functions from `skein:kernel/libp2p@0.1.0`
+
+__attribute__((__import_module__("skein:kernel/libp2p@0.1.0"), __import_name__("publish")))
+extern void __wasm_import_skein_kernel_libp2p_publish(uint8_t *, size_t, uint8_t *, size_t, uint8_t *);
+
+__attribute__((__import_module__("skein:kernel/libp2p@0.1.0"), __import_name__("dial")))
+extern void __wasm_import_skein_kernel_libp2p_dial(uint8_t *, size_t, uint8_t *, size_t, uint8_t *);
+
+__attribute__((__import_module__("skein:kernel/libp2p@0.1.0"), __import_name__("send")))
+extern void __wasm_import_skein_kernel_libp2p_send(int64_t, uint8_t *, size_t, uint8_t *);
+
+__attribute__((__import_module__("skein:kernel/libp2p@0.1.0"), __import_name__("receive")))
+extern void __wasm_import_skein_kernel_libp2p_receive(int64_t, uint8_t *);
+
+__attribute__((__import_module__("skein:kernel/libp2p@0.1.0"), __import_name__("close")))
+extern void __wasm_import_skein_kernel_libp2p_close(int64_t, uint8_t *);
+
 // Imported Functions from `wasi:io/poll@0.2.12`
 
 __attribute__((__import_module__("wasi:io/poll@0.2.12"), __import_name__("[method]pollable.ready")))
@@ -360,6 +377,30 @@ void skein_kernel_skein_result_option_cid_string_free(skein_kernel_skein_result_
 void program_option_string_free(program_option_string_t *ptr) {
   if (ptr->is_some) {
     program_string_free(&ptr->val);
+  }
+}
+
+void skein_kernel_libp2p_received_free(skein_kernel_libp2p_received_t *ptr) {
+  switch ((int32_t) ptr->tag) {
+    case 0: {
+      program_list_u8_free(&ptr->val.frame);
+      break;
+    }
+  }
+}
+
+void skein_kernel_libp2p_result_u64_string_free(skein_kernel_libp2p_result_u64_string_t *ptr) {
+  if (!ptr->is_err) {
+  } else {
+    program_string_free(&ptr->val.err);
+  }
+}
+
+void skein_kernel_libp2p_result_received_string_free(skein_kernel_libp2p_result_received_string_t *ptr) {
+  if (!ptr->is_err) {
+    skein_kernel_libp2p_received_free(&ptr->val.ok);
+  } else {
+    program_string_free(&ptr->val.err);
   }
 }
 
@@ -1376,6 +1417,152 @@ bool skein_kernel_skein_edges(skein_kernel_skein_cid_t *to, program_string_t *ma
   }
   if (!result.is_err) {
     *ret = result.val.ok;
+    return 1;
+  } else {
+    *err = result.val.err;
+    return 0;
+  }
+}
+
+bool skein_kernel_libp2p_publish(program_string_t *topic, program_list_u8_t *body, uint64_t *ret, program_string_t *err) {
+  __attribute__((__aligned__(8)))
+  uint8_t ret_area[(8+2*sizeof(void*))];
+  uint8_t *ptr = (uint8_t *) &ret_area;
+  __wasm_import_skein_kernel_libp2p_publish((uint8_t *) (*topic).ptr, (*topic).len, (uint8_t *) (*body).ptr, (*body).len, ptr);
+  skein_kernel_libp2p_result_u64_string_t result;
+  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
+    case 0: {
+      result.is_err = false;
+      result.val.ok = (uint64_t) (*((int64_t*) (ptr + 8)));
+      break;
+    }
+    case 1: {
+      result.is_err = true;
+      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + 8))), (*((size_t*) (ptr + (8+1*sizeof(void*))))) };
+      break;
+    }
+  }
+  if (!result.is_err) {
+    *ret = result.val.ok;
+    return 1;
+  } else {
+    *err = result.val.err;
+    return 0;
+  }
+}
+
+bool skein_kernel_libp2p_dial(program_string_t *peer, program_string_t *protocol, uint64_t *ret, program_string_t *err) {
+  __attribute__((__aligned__(8)))
+  uint8_t ret_area[(8+2*sizeof(void*))];
+  uint8_t *ptr = (uint8_t *) &ret_area;
+  __wasm_import_skein_kernel_libp2p_dial((uint8_t *) (*peer).ptr, (*peer).len, (uint8_t *) (*protocol).ptr, (*protocol).len, ptr);
+  skein_kernel_libp2p_result_u64_string_t result;
+  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
+    case 0: {
+      result.is_err = false;
+      result.val.ok = (uint64_t) (*((int64_t*) (ptr + 8)));
+      break;
+    }
+    case 1: {
+      result.is_err = true;
+      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + 8))), (*((size_t*) (ptr + (8+1*sizeof(void*))))) };
+      break;
+    }
+  }
+  if (!result.is_err) {
+    *ret = result.val.ok;
+    return 1;
+  } else {
+    *err = result.val.err;
+    return 0;
+  }
+}
+
+bool skein_kernel_libp2p_send(uint64_t stream_id, program_list_u8_t *body, program_string_t *err) {
+  __attribute__((__aligned__(sizeof(void*))))
+  uint8_t ret_area[(3*sizeof(void*))];
+  uint8_t *ptr = (uint8_t *) &ret_area;
+  __wasm_import_skein_kernel_libp2p_send((int64_t) (stream_id), (uint8_t *) (*body).ptr, (*body).len, ptr);
+  skein_kernel_skein_result_void_string_t result;
+  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
+    case 0: {
+      result.is_err = false;
+      break;
+    }
+    case 1: {
+      result.is_err = true;
+      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
+      break;
+    }
+  }
+  if (!result.is_err) {
+    return 1;
+  } else {
+    *err = result.val.err;
+    return 0;
+  }
+}
+
+bool skein_kernel_libp2p_receive(uint64_t stream_id, skein_kernel_libp2p_received_t *ret, program_string_t *err) {
+  __attribute__((__aligned__(sizeof(void*))))
+  uint8_t ret_area[(4*sizeof(void*))];
+  uint8_t *ptr = (uint8_t *) &ret_area;
+  __wasm_import_skein_kernel_libp2p_receive((int64_t) (stream_id), ptr);
+  skein_kernel_libp2p_result_received_string_t result;
+  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
+    case 0: {
+      result.is_err = false;
+      skein_kernel_libp2p_received_t variant;
+      variant.tag = (int32_t) *((uint8_t*) (ptr + sizeof(void*)));
+      switch ((int32_t) variant.tag) {
+        case 0: {
+          variant.val.frame = (program_list_u8_t) { (uint8_t*)(*((uint8_t **) (ptr + (2*sizeof(void*))))), (*((size_t*) (ptr + (3*sizeof(void*))))) };
+          break;
+        }
+        case 1: {
+          break;
+        }
+        case 2: {
+          break;
+        }
+      }
+
+      result.val.ok = variant;
+      break;
+    }
+    case 1: {
+      result.is_err = true;
+      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
+      break;
+    }
+  }
+  if (!result.is_err) {
+    *ret = result.val.ok;
+    return 1;
+  } else {
+    *err = result.val.err;
+    return 0;
+  }
+}
+
+bool skein_kernel_libp2p_close(uint64_t stream_id, program_string_t *err) {
+  __attribute__((__aligned__(sizeof(void*))))
+  uint8_t ret_area[(3*sizeof(void*))];
+  uint8_t *ptr = (uint8_t *) &ret_area;
+  __wasm_import_skein_kernel_libp2p_close((int64_t) (stream_id), ptr);
+  skein_kernel_skein_result_void_string_t result;
+  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
+    case 0: {
+      result.is_err = false;
+      break;
+    }
+    case 1: {
+      result.is_err = true;
+      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
+      break;
+    }
+  }
+  if (!result.is_err) {
     return 1;
   } else {
     *err = result.val.err;

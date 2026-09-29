@@ -21,6 +21,7 @@ pub const raw = struct {
     pub extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
     pub extern "skein" fn wallet(frame: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn libp2p(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn deadline(until_ms: i64) i32;
     pub extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
@@ -123,6 +124,14 @@ pub fn wallet(a: Allocator, frame: []const u8) ![]u8 {
 pub fn http(a: Allocator, req: Value) !Value {
     const bytes = try cbor.encode(a, req);
     return cbor.decode(a, try result(a, raw.http, .{ bytes.ptr, n32(bytes.len) }));
+}
+
+/// One libp2p request (#51) {op: "publish" | "dial" | "send" | "receive" | "close", …}
+/// → its result, answered by the router's libp2p host and recorded; a failure
+/// (the host's {error}) is the import's error, `lastError()`.
+pub fn libp2p(a: Allocator, req: Value) !Value {
+    const bytes = try cbor.encode(a, req);
+    return cbor.decode(a, try result(a, raw.libp2p, .{ bytes.ptr, n32(bytes.len) }));
 }
 
 pub fn deadline(until_ms: i64) !void {

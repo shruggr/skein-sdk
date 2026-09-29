@@ -66,6 +66,39 @@ typedef struct {
   program_string_t val;
 } program_option_string_t;
 
+// What `receive` found on the stream.
+typedef struct skein_kernel_libp2p_received_t {
+  uint8_t tag;
+  union {
+    program_list_u8_t     frame;
+  } val;
+} skein_kernel_libp2p_received_t;
+
+// The next length-prefixed frame.
+#define SKEIN_KERNEL_LIBP2P_RECEIVED_FRAME 0
+// Nothing yet: set a `deadline` and end the step; the thread rests, and
+// the router wakes it (a wake entry, before the deadline) when a frame
+// arrives, so its next step's `receive` has it.
+#define SKEIN_KERNEL_LIBP2P_RECEIVED_PENDING 1
+// The remote closed the stream; nothing more will come.
+#define SKEIN_KERNEL_LIBP2P_RECEIVED_CLOSED 2
+
+typedef struct {
+  bool is_err;
+  union {
+    uint64_t ok;
+    program_string_t err;
+  } val;
+} skein_kernel_libp2p_result_u64_string_t;
+
+typedef struct {
+  bool is_err;
+  union {
+    skein_kernel_libp2p_received_t ok;
+    program_string_t err;
+  } val;
+} skein_kernel_libp2p_result_received_string_t;
+
 typedef struct wasi_io_poll_own_pollable_t {
   int32_t __handle;
 } wasi_io_poll_own_pollable_t;
@@ -669,6 +702,20 @@ extern bool skein_kernel_skein_call(skein_kernel_skein_cid_t *program, program_s
 // bitcoin blocks this step kept so far.
 extern bool skein_kernel_skein_edges(skein_kernel_skein_cid_t *to, program_string_t *maybe_rel, program_list_u8_t *ret, program_string_t *err);
 
+// Imported Functions from `skein:kernel/libp2p@0.1.0`
+// Publish `body` on a GossipSub topic (signed with the instance's peer
+// key) → the message's seqno.
+extern bool skein_kernel_libp2p_publish(program_string_t *topic, program_list_u8_t *body, uint64_t *ret, program_string_t *err);
+// Open a stream to a peer (a peer ID, or a multiaddr with /p2p/<id>) on
+// `protocol` → its id (the router's, unique across its restarts).
+extern bool skein_kernel_libp2p_dial(program_string_t *peer, program_string_t *protocol, uint64_t *ret, program_string_t *err);
+// Write one length-prefixed frame (unsigned varint length).
+extern bool skein_kernel_libp2p_send(uint64_t stream_id, program_list_u8_t *body, program_string_t *err);
+// The next frame, or `pending` (rest; woken when it comes), or `closed`.
+extern bool skein_kernel_libp2p_receive(uint64_t stream_id, skein_kernel_libp2p_received_t *ret, program_string_t *err);
+// Close the stream (our side), and forget it.
+extern bool skein_kernel_libp2p_close(uint64_t stream_id, program_string_t *err);
+
 // Imported Functions from `wasi:io/poll@0.2.12`
 // Return the readiness of a pollable. This function never blocks.
 // 
@@ -1206,6 +1253,12 @@ void skein_kernel_skein_option_cid_free(skein_kernel_skein_option_cid_t *ptr);
 void skein_kernel_skein_result_option_cid_string_free(skein_kernel_skein_result_option_cid_string_t *ptr);
 
 void program_option_string_free(program_option_string_t *ptr);
+
+void skein_kernel_libp2p_received_free(skein_kernel_libp2p_received_t *ptr);
+
+void skein_kernel_libp2p_result_u64_string_free(skein_kernel_libp2p_result_u64_string_t *ptr);
+
+void skein_kernel_libp2p_result_received_string_free(skein_kernel_libp2p_result_received_string_t *ptr);
 
 extern void wasi_io_poll_pollable_drop_own(wasi_io_poll_own_pollable_t handle);
 
