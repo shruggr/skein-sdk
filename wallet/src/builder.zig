@@ -165,6 +165,7 @@ pub const KeySigner = struct {
     fn cp(key: Key) !bsvz.primitives.key_deriver.Counterparty {
         return switch (key.counterparty) {
             .self => .{ .type_ = .self },
+            .anyone => .{ .type_ = .anyone },
             .other => |k| .{ .type_ = .other, .public_key = try bsvz.primitives.ec.PublicKey.fromSec1(&k) },
         };
     }

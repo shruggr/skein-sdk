@@ -513,6 +513,50 @@ test "vectors: BRC-100 getPublicKey wire frames (go-sdk serializer)" {
     }
 }
 
+// #56: the `anyone` counterparty (BRC-100 wire code 12), removed by #37's
+// cleanup (c6a923c) and restored — amm-poc's validator key derivation and
+// liveness attestation need it. There is no go-sdk vector for it (go-sdk's
+// vectors never exercised `anyone`), so the expected bytes here are the
+// pre-c6a923c encoding worked out by hand from keyParams (unchanged except
+// for the counterparty byte) and cross-checked against amm-poc-zig016's own
+// copy of the frame (programs/amm-topic/src/frames.zig, counterparty_anyone
+// = 12, the same field order).
+test "wire: the anyone counterparty (BRC-100 code 12) encodes byte-identically to the pre-#37 encoding; round-trips through the mock oracle" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // getPublicKey(level 1, protocol "amm live", keyID "1", counterparty anyone, forSelf true):
+    // 08 00 (call, empty originator) 00 (identityKey: false)
+    // 01 08 "amm live" (level, protocol) 01 "1" (keyID) 0c (anyone) 00 ff (privileged, reason)
+    // 01 (forSelf) 00 (seekPermission).
+    const gp = try lib.wire.getPublicKeyFrameFor(a, 1, "amm live", "1", .anyone, true);
+    try std.testing.expectEqualStrings("0800000108616d6d206c69766501310c00ff0100", try hexOf(a, gp));
+
+    // createSignature over a 32-byte hash with the same key: 0f 00, the same
+    // keyParams, 02 (hashToDirectlySign) + the hash, 00 (seekPermission).
+    var digest: [32]u8 = undefined;
+    for (&digest, 0..) |*b, i| b.* = @intCast(i);
+    const cs = try lib.wire.createSignatureFrame(a, 1, "amm live", "1", .anyone, digest);
+    try std.testing.expectEqualStrings("0f000108616d6d206c69766501310c00ff02000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00", try hexOf(a, cs));
+
+    // Round-trips through the mock oracle used by the wire tests (VectorOracle,
+    // below): registered by the exact anyone-counterparty frame bytes, answered
+    // with real result frames from vectors/wire.json and vectors/signing.json,
+    // and parsed back through wire.zig's own result readers.
+    var vo = VectorOracle{};
+    try vo.frames.put(a, try hexOf(a, gp), "00034da006f958beba78ec54443df4a3f52237253f7ae8cbdb17dccf3feaa57f3126");
+    try vo.frames.put(a, try hexOf(a, cs), "003045022100a505e27dcc4eaf5d750cc3cab726ab9447b5dd2cff49a6a5aa14ce72e79abaa8022077ff248815ec49d20017a1f580b3f51119ec031a254761bd98a26e98b4a64b00");
+
+    const gp_res = try VectorOracle.call(&vo, a, gp);
+    try std.testing.expectEqualStrings("034da006f958beba78ec54443df4a3f52237253f7ae8cbdb17dccf3feaa57f3126", &std.fmt.bytesToHex(try lib.wire.publicKeyResult(gp_res), .lower));
+
+    const cs_res = try VectorOracle.call(&vo, a, cs);
+    try std.testing.expectEqualStrings("3045022100a505e27dcc4eaf5d750cc3cab726ab9447b5dd2cff49a6a5aa14ce72e79abaa8022077ff248815ec49d20017a1f580b3f51119ec031a254761bd98a26e98b4a64b00", try hexOf(a, try lib.wire.signatureResult(cs_res)));
+    try std.testing.expectEqual(@as(usize, 2), vo.calls);
+    counts.wire += 4;
+}
+
 // ---------------------------------------------------------------- signing through the oracle
 
 /// The oracle as go-sdk's ProtoWallet answered it: every request frame must be one
