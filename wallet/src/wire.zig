@@ -9,9 +9,10 @@ const VarInt = @import("bsvz").primitives.varint.VarInt;
 pub const call_get_public_key: u8 = 8;
 pub const call_create_signature: u8 = 15;
 
-/// A counterparty: another party's identity key, or ourselves (wire code 11).
+/// A counterparty: another party's identity key, ourselves (wire code 11), or anyone (12).
 pub const Counterparty = union(enum) {
     self,
+    anyone,
     other: [33]u8,
 };
 
@@ -34,6 +35,7 @@ fn keyParams(arena: std.mem.Allocator, out: *std.ArrayList(u8), level: u8, proto
     try out.appendSlice(arena, key_id);
     switch (counterparty) {
         .self => try out.append(arena, 11),
+        .anyone => try out.append(arena, 12),
         .other => |k| try out.appendSlice(arena, &k),
     }
     try out.append(arena, 0); // privileged: false
