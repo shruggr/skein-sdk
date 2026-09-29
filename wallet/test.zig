@@ -1134,6 +1134,25 @@ fn spend(a: std.mem.Allocator, ins: []const struct { *const bsvz.transaction.Tra
     return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
 }
 
+/// The maintained `byTopic` is exactly `admitted` joined to the spends edge (`spent`), key for key (#36, #41).
+fn joinHolds(a: std.mem.Allocator, w: *lib.wallet.Wallet) !void {
+    var want: std.ArrayList([]const u8) = .empty;
+    for (try w.map("admitted").prefixed("")) |kv| {
+        const tl = 1 + @as(usize, kv.key[0]);
+        const state: u8 = if (try w.map("spent").has(kv.key[tl..])) 1 else 0;
+        try want.append(a, try std.mem.concat(a, u8, &.{ kv.key[0..tl], &.{state}, kv.key[tl..] }));
+    }
+    std.mem.sort([]const u8, want.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    const have = try w.map("byTopic").prefixed("");
+    try std.testing.expectEqual(want.items.len, have.len);
+    for (want.items, have) |x, y| try std.testing.expectEqualSlices(u8, x, y.key);
+    try std.testing.expectEqual(have.len, try w.map("byScript").count());
+}
+
 test "overlay: submit and admit, spend with retained coins, lookups with valid BEEF, a rejected spend restores" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1188,6 +1207,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     const other = try ov.apply(&w, sub1, "tm_other", &.{}, .{});
     try std.testing.expect(!other.dupe and other.records.len == 0);
     const s1 = try w.save();
+    try joinHolds(a, &w);
     try std.testing.expect(try ov.isApplied(&w, "tm_demo", t1.txid));
     try std.testing.expect(!(try ov.isApplied(&w, "tm_other", t1.txid)));
     const adm = (try w.record(a1.records[0]));
@@ -1231,14 +1251,18 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     try std.testing.expectEqual(@as(usize, 0), a2.coins_removed.len);
     try std.testing.expect((try ov.apply(&w, sub2, "tm_demo", prev2, .{})).dupe);
     const s2 = try w.save();
+    try joinHolds(a, &w);
     {
         const live = try ov.inTopic(&w, "tm_demo", false);
         try std.testing.expectEqual(@as(usize, 1), live.len);
         try std.testing.expectEqualSlices(u8, &t2.txid, &live[0].txid);
         const all = try ov.inTopic(&w, "tm_demo", true);
         try std.testing.expectEqual(@as(usize, 2), all.len);
-        const sp = (try w.map("spentAdmitted").get(try std.mem.concat(a, u8, &.{ try ov.topicPrefix(a, "tm_demo"), &lib.store.outpointKey(t1.txid, 0) }))).?;
-        try std.testing.expectEqualSlices(u8, &(t2.txid ++ .{1}), sp.bytes); // spent by T2, retained
+        // Spent within the topic = admitted ⋈ the spends edge; retained = T2's judgement (`applied`).
+        const sp = (try ov.spender(&w, "tm_demo", t1.txid, 0)).?;
+        try std.testing.expectEqualSlices(u8, &t2.txid, &sp.txid);
+        try std.testing.expect(sp.retained and sp.judged);
+        try std.testing.expect((try ov.spender(&w, "tm_demo", t2.txid, 0)) == null);
         // The answer for T2 carries its unmined ancestry down to the proven funding.
         const ans = try beef.parse(a, try ov.beefFor(&w, t2.txid));
         try std.testing.expectEqual(fund.entries.len + 2, ans.entries.len);
@@ -1250,6 +1274,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     w.now = 3000;
     try std.testing.expectEqual(lib.wallet.Wallet.Outcome.rejected, try w.applyStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null));
     const s3 = try w.save();
+    try joinHolds(a, &w);
     {
         const live = try ov.inTopic(&w, "tm_demo", true);
         try std.testing.expectEqual(@as(usize, 1), live.len);
@@ -1270,6 +1295,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     w4.now = 3000;
     try std.testing.expectEqual(@as(usize, 2), (try w4.reject(t1.txid, "REJECTED")).len);
     _ = try w4.save();
+    try joinHolds(a, &w4);
     try std.testing.expectEqual(@as(usize, 0), (try ov.inTopic(&w4, "tm_demo", true)).len);
     try std.testing.expectEqual(@as(usize, 0), try w4.map("admitted").count());
     counts.wallet += 1;

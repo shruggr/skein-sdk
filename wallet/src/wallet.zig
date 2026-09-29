@@ -71,12 +71,10 @@ pub const Oracle = struct {
 /// The overlay's (#36, overlay.zig), in the same state record: one chain and
 /// one settlement for a wallet and an overlay in one instance.
 ///   admitted  len ‖ topic ‖ outpoint → admittance record      outputs admitted into a topic
-///   consumed  len ‖ topic ‖ outpoint ‖ spending txid → retained (bool)   admitted outputs a later admitted tx spends
-///   applied   len ‖ topic ‖ txid → applied record             transactions a topic judged (dupes)
-///   spentAdmitted  len ‖ topic ‖ outpoint → spender ‖ retained   derived: consumed by a tx that is not rejected
-///   byTopic   len ‖ topic ‖ 0|1 ‖ outpoint → null             derived: 0 unspent, 1 spent
+///   applied   len ‖ topic ‖ txid → applied record             a topic's judgement of a tx (dupes; retention)
+///   byTopic   len ‖ topic ‖ 0|1 ‖ outpoint → null             derived: 0 unspent, 1 spent (admitted ⋈ `spent`)
 ///   byScript  sha256(script) ‖ len ‖ topic ‖ 0|1 ‖ outpoint → null   derived: by locking script hash
-pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "spenders", "dependents", "rejected", "proofHeights", "drafts", "watchers", "unproven", "admitted", "consumed", "applied", "spentAdmitted", "byTopic", "byScript" };
+pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "spenders", "dependents", "rejected", "proofHeights", "drafts", "watchers", "unproven", "admitted", "applied", "byTopic", "byScript" };
 
 pub const Status = enum { proven, unproven, rejected };
 
@@ -281,7 +279,10 @@ pub const Wallet = struct {
         if (first) |f| {
             try self.map("spent").put(&op, .{ .bytes = try self.arena.dupe(u8, &f) });
         } else _ = try self.map("spent").remove(&op);
-        if (was != (first != null)) try self.placeInBasket(op);
+        if (was != (first != null)) {
+            try self.placeInBasket(op);
+            try overlay.spentChanged(self, op); // the topics that admitted it (#36)
+        }
     }
 
     /// `op`'s `byBasket` key, for its output record's basket and whether it is spent (none without a record).
@@ -422,8 +423,6 @@ pub const Wallet = struct {
         var queue: std.ArrayList([32]u8) = .empty;
         try queue.append(a, root);
         var out: std.ArrayList([32]u8) = .empty;
-        // The `applied` keys (topic ‖ txid) of judgements that vanished.
-        var judged: std.ArrayList([]const u8) = .empty;
         var i: usize = 0;
         while (i < queue.items.len) : (i += 1) {
             const t = queue.items[i];
@@ -457,10 +456,7 @@ pub const Wallet = struct {
                     .draft => try self.map("drafts").putLink(d.id, rec),
                     // An overlay's admittance and judgement vanish with it (#36).
                     .admitted => try overlay.unadmit(self, d.id),
-                    .applied => {
-                        _ = try self.map("applied").remove(d.id);
-                        try judged.append(a, d.id);
-                    },
+                    .applied => _ = try self.map("applied").remove(d.id),
                     .action, .record => {}, // an action's status is computed; a record is only reported
                 }
             }
@@ -471,7 +467,6 @@ pub const Wallet = struct {
             const tx = try bsvz.transaction.Transaction.parse(a, raw);
             for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
         }
-        try overlay.unjudged(self, judged.items);
         return out.items;
     }
 
