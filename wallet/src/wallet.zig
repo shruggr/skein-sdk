@@ -71,7 +71,6 @@ pub const Oracle = struct {
 ///   rejected  txid → settlement record                      transactions that will never be mined
 ///   proofHeights  height (u32 BE) ‖ txid → null             proofs by block height (what a reorg reverts)
 ///   drafts    draft CID → null | settlement record          signable drafts (rejected with an input)
-///   watchers  identity key (33 bytes) → null                who is sent settlement changes (the `settlement` box)
 ///   unproven  txid → null                                   derived, sparse: transactions we hold that are
 ///                                                           neither proven nor rejected (the settlement index:
 ///                                                           proven ones leave it, rejected ones are in `rejected`)
@@ -80,7 +79,7 @@ pub const Oracle = struct {
 ///   admitted  len ‖ topic ‖ outpoint → admittance record      outputs admitted into a topic
 ///   applied   len ‖ topic ‖ txid → applied record             a topic's judgement of a tx (dupes; retention)
 ///   byTopic   len ‖ topic ‖ 0|1 ‖ outpoint → null             derived: 0 unspent, 1 spent (admitted ⋈ `spent`)
-pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "dependents", "rejected", "proofHeights", "drafts", "watchers", "unproven", "admitted", "applied", "byTopic" };
+pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "dependents", "rejected", "proofHeights", "drafts", "unproven", "admitted", "applied", "byTopic" };
 
 pub const Status = enum { proven, unproven, rejected };
 
@@ -113,9 +112,6 @@ pub const Tag = enum(u8) { tx = 't', action = 'a', output = 'o', draft = 'd', re
 /// A topic's judgement of a transaction that a rejection removed (#50): the
 /// topic's lookup services are told (`rejected`, overlay.hookRejected).
 pub const Unapplied = struct { topic: []const u8, txid: [32]u8 };
-
-/// One settlement change in a step (what the `settlement` box is sent).
-pub const Change = struct { txid: [32]u8, status: Status, reason: []const u8, cause: ?[32]u8 = null };
 
 pub const PaymentRemittance = struct { derivation_prefix: []const u8, derivation_suffix: []const u8, sender_identity_key: [33]u8 };
 pub const InsertionRemittance = struct { basket: []const u8, custom_instructions: ?[]const u8 = null, tags: []const []const u8 = &.{} };
@@ -199,8 +195,6 @@ pub const Wallet = struct {
     m: [map_names.len]Map,
     /// The step's time (ms): settlement records and broadcasts are stamped with it.
     now: i64 = 0,
-    /// Settlement changes this step made (in order), for the `settlement` box.
-    changes: std.ArrayList(Change) = .empty,
     /// Transactions of ours a reorg this step turned back to unproven: to be asked about again.
     reverted: std.ArrayList([32]u8) = .empty,
     /// Topics' judgements rejections removed this step, in the walk's order (#50).
@@ -512,7 +506,6 @@ pub const Wallet = struct {
             try self.resettle(t);
             _ = try self.map("awaiting").remove(&t);
             try out.append(a, t);
-            if (try self.map("actions").has(&t)) try self.changes.append(a, .{ .txid = t, .status = .rejected, .reason = if (by) "input-rejected" else reason, .cause = if (by) root else null });
             for (try self.dependentsOf(t)) |d| {
                 const rel = d.rel orelse continue;
                 if (!rel.propagates()) continue;
@@ -594,24 +587,7 @@ pub const Wallet = struct {
             for (self.reverted.items) |r| dup = dup or std.mem.eql(u8, &r, &txid);
             if (dup) continue;
             try self.reverted.append(self.arena, txid);
-            try self.changes.append(self.arena, .{ .txid = txid, .status = .unproven, .reason = "reorg" });
         }
-    }
-
-    // ------------------------------------------------------------ watchers (the `settlement` box)
-
-    pub fn watch(self: *Wallet, identity: [33]u8, on: bool) !void {
-        if (on) try self.map("watchers").add(&identity) else _ = try self.map("watchers").remove(&identity);
-    }
-
-    pub fn watchers(self: *Wallet) ![][33]u8 {
-        const kvs = try self.map("watchers").prefixed("");
-        const out = try self.arena.alloc([33]u8, kvs.len);
-        for (kvs, out) |kv, *o| {
-            if (kv.key.len != 33) return error.BadIndex;
-            o.* = kv.key[0..33].*;
-        }
-        return out;
     }
 
     // ------------------------------------------------------------ operations
@@ -636,7 +612,6 @@ pub const Wallet = struct {
         const before = try self.status(txid);
         try self.putProof(txid, p);
         if (before == .rejected) return .rejected;
-        if (before != .proven and try self.map("actions").has(&txid)) try self.changes.append(self.arena, .{ .txid = txid, .status = .proven, .reason = "mined" });
         try self.rejectConflicting(txid);
         return .proven;
     }

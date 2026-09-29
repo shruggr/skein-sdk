@@ -8,30 +8,12 @@ const VarInt = @import("bsvz").primitives.varint.VarInt;
 
 pub const call_get_public_key: u8 = 8;
 pub const call_create_signature: u8 = 15;
-pub const call_encrypt: u8 = 11;
 
-/// A counterparty: another party's identity key, ourselves (wire code 11), or anyone (12).
+/// A counterparty: another party's identity key, or ourselves (wire code 11).
 pub const Counterparty = union(enum) {
     self,
-    anyone,
     other: [33]u8,
 };
-
-/// getPublicKey for the identity key itself (not privileged, no permission prompt).
-pub fn identityKeyFrame(arena: std.mem.Allocator) ![]u8 {
-    return arena.dupe(u8, &.{ call_get_public_key, 0, 1, 0, 0xff, 0 });
-}
-
-/// encrypt (call 11): plaintext under protocol, keyID, counterparty (go-sdk SerializeEncryptArgs).
-pub fn encryptFrame(arena: std.mem.Allocator, level: u8, protocol: []const u8, key_id: []const u8, counterparty: Counterparty, plaintext: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, &.{ call_encrypt, 0 });
-    try keyParams(arena, &out, level, protocol, key_id, counterparty);
-    try varint(arena, &out, plaintext.len);
-    try out.appendSlice(arena, plaintext);
-    try out.append(arena, 0); // seekPermission: false
-    return out.toOwnedSlice(arena);
-}
 
 fn varint(arena: std.mem.Allocator, out: *std.ArrayList(u8), v: u64) !void {
     var b: [9]u8 = undefined;
@@ -52,7 +34,6 @@ fn keyParams(arena: std.mem.Allocator, out: *std.ArrayList(u8), level: u8, proto
     try out.appendSlice(arena, key_id);
     switch (counterparty) {
         .self => try out.append(arena, 11),
-        .anyone => try out.append(arena, 12),
         .other => |k| try out.appendSlice(arena, &k),
     }
     try out.append(arena, 0); // privileged: false
