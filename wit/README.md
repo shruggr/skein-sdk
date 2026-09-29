@@ -56,6 +56,12 @@ its messagebox program's `send` over `http`, and looks a handle up with its
   the same path: request and response recorded on the update, replay never
   touching the network (`docs/VM.md`, "Outgoing HTTP").
 - **`wallet`** takes BRC-100 wire frames as bytes, for now.
+- **`skein:kernel/libp2p`** (#51), a second interface: `publish`, `dial`,
+  `send`, `receive` (a `received` variant: `frame`, `pending`, `closed`),
+  `close`. Each typed call becomes the dag-cbor request of preview1's
+  `skein.libp2p` import (`{op, …}`), answered by the router's libp2p host and
+  recorded on the update like `http` (`docs/VM.md`, "libp2p"). Both worlds
+  import it; `programs/p2p-component` is a component that calls it.
 
 ## The worlds
 
