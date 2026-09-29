@@ -138,7 +138,6 @@ pub fn previousCoins(w: *Wallet, topic: []const u8, tx: Transaction) ![]u32 {
 /// any other we hold: blocks, `txs`, `spenders`, `spends` relations. → the
 /// subject's CID.
 pub fn hold(w: *Wallet, sub: Submission) ![]const u8 {
-    const a = w.arena;
     var subject_cid: []const u8 = "";
     for (sub.beef.entries, sub.proven) |e, proven| {
         const raw = e.raw orelse continue;
@@ -146,7 +145,7 @@ pub fn hold(w: *Wallet, sub: Submission) ![]const u8 {
         if (std.mem.eql(u8, &e.txid, &sub.txid)) subject_cid = c;
         if (!proven or (try w.map("proofs").has(&e.txid))) continue;
         for (sub.beef.bumps) |p| if (beef_mod.bumpHas(p, e.txid)) {
-            try w.putProof(e.txid, p.block_height, try p.bytes(a));
+            try w.putProof(e.txid, p);
             break;
         };
     }

@@ -197,6 +197,138 @@ test "vectors: BRC-74 merkle paths and roots against mainnet headers (go-sdk)" {
     }
 }
 
+// ---------------------------------------------------------------- the merkle tree as IPLD nodes (#29)
+
+/// The bitcoin-merkle blocks a MemStore holds, as sorted hex CIDs.
+fn merkleBlocks(a: std.mem.Allocator, ms: *lib.store.MemStore) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = ms.blocks.keyIterator();
+    while (it.next()) |k| if (k.len == 37 and k.*[1] == 0xb3) try out.append(a, try hexOf(a, k.*));
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    return out.items;
+}
+
+test "merkle nodes: every vector path's nodes stored; each leaf's BUMP rebuilt from them gives the root" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const v = try load(a, "merkle_path.json");
+    for (arr(v, "cases")) |c| {
+        var ms = lib.store.MemStore.init(std.testing.allocator);
+        defer ms.deinit();
+        const p = try bsvz.spv.MerklePath.parse(a, try unhex(a, str(c, "hex")));
+        const rev = try lib.merkle.reveal(a, p);
+        try lib.merkle.putNodes(ms.store(), rev.nodes);
+        for (arr(c, "leaves")) |l| {
+            const txid = try hdr.fromHex(str(l, "txid"));
+            try std.testing.expectEqualStrings(str(l, "root"), &hdr.toHex(rev.root));
+            const rebuilt = (try lib.merkle.pathFor(a, ms.store(), rev.root, p.block_height, txid)) orelse return error.NotRebuilt;
+            try std.testing.expectEqual(p.block_height, rebuilt.block_height);
+            try std.testing.expectEqualSlices(u8, &rev.root, &(beef.rootFor(a, rebuilt, txid) orelse return error.NoRoot));
+            counts.path += 1;
+        }
+    }
+}
+
+/// A block of `n` transactions (synthetic txids): every level of its merkle tree, leaves first.
+fn fullTree(a: std.mem.Allocator, leaves: []const [32]u8) ![]const []const [32]u8 {
+    var levels: std.ArrayList([]const [32]u8) = .empty;
+    try levels.append(a, leaves);
+    while (levels.items[levels.items.len - 1].len > 1) {
+        const cur = levels.items[levels.items.len - 1];
+        const up = try a.alloc([32]u8, (cur.len + 1) / 2);
+        for (up, 0..) |*u, i| {
+            const l = cur[2 * i];
+            const r = if (2 * i + 1 < cur.len) cur[2 * i + 1] else l;
+            u.* = lib.store.dblSha256(&(l ++ r));
+        }
+        try levels.append(a, up);
+    }
+    return levels.items;
+}
+
+/// The minimal BUMP for leaf `i` of a tree (sorted by offset; a missing right sibling is a duplicate).
+fn bumpFor(a: std.mem.Allocator, tree: []const []const [32]u8, height: u32, i: u64) !bsvz.spv.MerklePath {
+    const PE = std.meta.Elem(std.meta.Elem(@FieldType(bsvz.spv.MerklePath, "path")));
+    const h = tree.len - 1;
+    const levels = try a.alloc([]PE, h);
+    for (levels, 0..) |*lv, k| {
+        const so = (i >> @intCast(k)) ^ 1;
+        const sib: PE = if (so < tree[k].len) .{ .offset = so, .hash = .{ .bytes = tree[k][@intCast(so)] } } else .{ .offset = so, .duplicate = true };
+        if (k == 0) {
+            const leaf: PE = .{ .offset = i, .hash = .{ .bytes = tree[0][@intCast(i)] }, .txid = true };
+            lv.* = try a.dupe(PE, if (i & 1 == 0) &.{ leaf, sib } else &.{ sib, leaf });
+        } else lv.* = try a.dupe(PE, &.{sib});
+    }
+    return .{ .block_height = height, .path = levels };
+}
+
+test "merkle nodes: three transactions of one regtest block, proven by separate BUMPs, in any order: one node set; each BUMP rebuilt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Seven transactions (the odd level ends duplicate their last node): prove 1, 4 and 6.
+    var leaves: [7][32]u8 = undefined;
+    for (&leaves, 0..) |*l, i| l.* = lib.store.dblSha256(&.{ 'l', @as(u8, @intCast(i)) });
+    const tree = try fullTree(a, &leaves);
+    const root = tree[tree.len - 1][0];
+    const chain = try regtestChain(a, 1002, &.{.{ 1002, root }});
+    const picks = [_]u64{ 1, 4, 6 };
+    var bumps: [3]bsvz.spv.MerklePath = undefined;
+    for (&bumps, picks) |*b, i| b.* = try bumpFor(a, tree, 1002, i);
+    const orders = [_][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 }, .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 } };
+    var first_nodes: ?[]const []const u8 = null;
+    var first_state: ?[]const u8 = null;
+    for (orders) |ord| {
+        var ms = lib.store.MemStore.init(std.testing.allocator);
+        defer ms.deinit();
+        var w = try lib.wallet.Wallet.load(a, ms.store(), null, .regtest);
+        _ = try w.addHeaders(try slices(a, chain));
+        for (ord) |k| try w.putProof(leaves[@intCast(picks[k])], bumps[k]);
+        const state = try w.save();
+        const nodes = try merkleBlocks(a, &ms);
+        if (first_nodes) |f| {
+            try std.testing.expectEqual(f.len, nodes.len);
+            for (f, nodes) |x, y| try std.testing.expectEqualStrings(x, y);
+            try std.testing.expectEqualStrings(first_state.?, state);
+        } else {
+            first_nodes = nodes;
+            first_state = state;
+        }
+        // Each BUMP rebuilt from the nodes: byte for byte the minimal one, and it proves the header's root.
+        for (picks, bumps) |i, b| {
+            const got = (try w.proofFor(leaves[@intCast(i)])).?;
+            try std.testing.expectEqualStrings(try hexOf(a, try b.bytes(a)), try hexOf(a, try got.bytes(a)));
+            try std.testing.expectEqualSlices(u8, &root, &beef.rootFor(a, got, leaves[@intCast(i)]).?);
+        }
+        try std.testing.expect((try w.proofFor(leaves[0])) == null); // never proven here
+    }
+    // Only the paths to the three: the root, the level below it, and the nodes above the three leaves.
+    // Levels 7 → 4 → 2 → 1: the leaf pairs of 1, 4, 6 (three nodes), both nodes above them, the root.
+    try std.testing.expectEqual(@as(usize, 1 + 2 + 3), first_nodes.?.len);
+
+    // Refusals: a path whose sibling is wrong proves another root; a path that gives a node
+    // at a position with another hash than its children make is a conflicting node.
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try lib.wallet.Wallet.load(a, ms.store(), null, .regtest);
+    _ = try w.addHeaders(try slices(a, chain));
+    var bad = try bumps[0].clone(a);
+    bad.path[1][0].hash.?.bytes[0] ^= 1;
+    try std.testing.expectError(error.RootMismatch, w.putProof(leaves[1], bad));
+    try std.testing.expectEqual(@as(usize, 0), (try merkleBlocks(a, &ms)).len);
+    // Leaves 0 and 1 given, and their parent given too, wrongly: the same position, another hash.
+    var conflict = try bumps[0].clone(a);
+    const PE = std.meta.Elem(std.meta.Elem(@FieldType(bsvz.spv.MerklePath, "path")));
+    conflict.path[1] = try a.dupe(PE, &.{ .{ .offset = 0, .hash = .{ .bytes = .{9} ** 32 } }, conflict.path[1][0] });
+    try std.testing.expectError(error.ConflictingNode, lib.merkle.reveal(a, conflict));
+    counts.path += 3;
+}
+
 // ---------------------------------------------------------------- headers
 
 test "vectors: headers — fields, hash, target, work, PoW, links (go-sdk, go-chaintracks, TS toolbox)" {

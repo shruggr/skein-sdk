@@ -34,6 +34,7 @@ const chain_mod = @import("chain.zig");
 const store_mod = @import("store.zig");
 const builder = @import("builder.zig");
 const overlay = @import("overlay.zig");
+const merkle = @import("merkle.zig");
 
 const Store = store_mod.Store;
 const Map = store_mod.Map;
@@ -52,7 +53,7 @@ pub const Oracle = struct {
 ///   headers   height (u32 BE) → header (bitcoin-block)       the best chain
 ///   heights   block hash → height                           the best chain, backwards
 ///   txs       txid → transaction (bitcoin-tx)               every transaction we hold
-///   proofs    txid → proof record                           proof by txid
+///   proofs    txid → header (bitcoin-block link)             the block whose merkle tree holds it (merkle.zig)
 ///   actions   txid → action record                          our transactions
 ///   outputs   txid ‖ vout (u32 BE) → output record           output by outpoint
 ///   awaiting  txid → broadcast record                       transactions awaiting a status callback
@@ -340,24 +341,39 @@ pub const Wallet = struct {
         return out;
     }
 
-    pub fn putProof(self: *Wallet, txid: [32]u8, height: u32, path: []const u8) !void {
-        const key = hdr.toHex(txid);
-        const cid = try self.store.putValue(self.arena, .{ .map = &.{
-            .{ .key = "kind", .value = .{ .text = "proof" } },
-            .{ .key = "txid", .value = .{ .text = &key } },
-            .{ .key = "height", .value = .{ .uint = height } },
-            .{ .key = "path", .value = .{ .bytes = path } },
-        } });
-        try self.map("proofs").putLink(&txid, cid);
-        try self.map("proofHeights").add(&(store_mod.be32(height) ++ txid));
+    /// A merkle path proving `txid` (#29, merkle.zig): the nodes it reveals
+    /// are put as bitcoin-merkle blocks (shared with every other path of the
+    /// block; nothing rewritten), and `proofs` names the block's header. The
+    /// path's root must be our best-chain header's at its height.
+    pub fn putProof(self: *Wallet, txid: [32]u8, p: merkle.MerklePath) !void {
+        const got = beef_mod.rootFor(self.arena, p, txid) orelse return error.BadProof;
+        const at = (try self.chain().at(p.block_height)) orelse return error.UnknownHeader;
+        const want = (try hdr.Header.parse(&at.raw)).merkle_root;
+        if (!std.mem.eql(u8, &got, &want)) return error.RootMismatch;
+        const rev = try merkle.reveal(self.arena, p);
+        if (!std.mem.eql(u8, &rev.root, &want)) return error.RootMismatch;
+        try merkle.putNodes(self.store, rev.nodes);
+        try self.map("proofs").putLink(&txid, &store_mod.hashCid(.block, at.hash));
+        try self.map("proofHeights").add(&(store_mod.be32(p.block_height) ++ txid));
         try self.resettle(txid);
     }
 
-    /// The proof we hold for a txid (its BRC-74 bytes), or null.
-    pub fn proofPath(self: *Wallet, txid: [32]u8) !?[]const u8 {
+    /// The block hash of the proof we hold for a txid, or null.
+    pub fn proofBlock(self: *Wallet, txid: [32]u8) !?[32]u8 {
         const c = (try self.map("proofs").link(&txid)) orelse return null;
-        const rec = try self.store.getValue(self.arena, c);
-        return rec.getBytes("path") orelse error.BadRecord;
+        return store_mod.bitcoinHash(c) orelse error.BadIndex;
+    }
+
+    /// The BUMP for a txid, rebuilt from the tree's nodes (merkle.pathFor),
+    /// when its proof's block is on our best chain; else null.
+    pub fn proofFor(self: *Wallet, txid: [32]u8) !?merkle.MerklePath {
+        const c = (try self.map("proofs").link(&txid)) orelse return null;
+        const hash = store_mod.bitcoinHash(c) orelse return error.BadIndex;
+        const height = (try self.chain().heightOf(hash)) orelse return null;
+        const raw = try self.store.get(self.arena, c);
+        if (raw.len != hdr.size) return error.BadRecord;
+        const root = (try hdr.Header.parse(raw[0..hdr.size])).merkle_root;
+        return merkle.pathFor(self.arena, self.store, root, height, txid);
     }
 
     pub fn record(self: *Wallet, cid: []const u8) !Value {
@@ -367,9 +383,10 @@ pub const Wallet = struct {
     // ------------------------------------------------------------ status (computed)
 
     /// rejected: a settlement record says the transaction will never be
-    /// mined (it stays so). proven: we hold a merkle proof for the txid whose
-    /// root is our best-chain header's at its height. Anything else is
-    /// unproven — a reorg that drops the block turns it back, with nothing to update.
+    /// mined (it stays so). proven: the block our proof names (checked when
+    /// the path arrived: its root is that header's) is on our best chain.
+    /// Anything else is unproven — a reorg that drops the block turns it
+    /// back, with nothing to update.
     pub fn status(self: *Wallet, txid: [32]u8) !Status {
         if (try self.map("rejected").has(&txid)) return .rejected;
         return self.minedStatus(txid);
@@ -382,11 +399,8 @@ pub const Wallet = struct {
     }
 
     pub fn minedStatus(self: *Wallet, txid: [32]u8) !Status {
-        const path = (try self.proofPath(txid)) orelse return .unproven;
-        const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return .unproven;
-        const root = beef_mod.rootFor(self.arena, p, txid) orelse return .unproven;
-        const want = (try self.chain().rootAt(p.block_height)) orelse return .unproven;
-        return if (std.mem.eql(u8, &root, &want)) .proven else .unproven;
+        const block = (try self.proofBlock(txid)) orelse return .unproven;
+        return if ((try self.chain().heightOf(block)) != null) .proven else .unproven;
     }
 
     // ------------------------------------------------------------ settlement
@@ -504,10 +518,8 @@ pub const Wallet = struct {
         for (try self.map("proofHeights").from(&store_mod.be32(start))) |kv| {
             if (kv.key.len != 36) return error.BadIndex;
             const txid: [32]u8 = kv.key[4..36].*;
-            const c = (try self.map("proofs").link(&txid)) orelse continue;
-            const rec = try self.record(c);
-            if (rec.getUint("height") != std.mem.readInt(u32, kv.key[0..4], .big)) continue; // a later proof replaced it
-            if ((try self.status(txid)) != .unproven) continue;
+            if (!(try self.map("proofs").has(&txid))) continue;
+            if ((try self.status(txid)) != .unproven) continue; // a later proof on the new chain holds
             if (!(try self.map("actions").has(&txid))) continue;
             var dup = false;
             for (self.reverted.items) |r| dup = dup or std.mem.eql(u8, &r, &txid);
@@ -552,11 +564,8 @@ pub const Wallet = struct {
     pub fn addProof(self: *Wallet, txid: [32]u8, path: []const u8) !Status {
         if ((try self.txRaw(txid)) == null) return error.UnknownTransaction;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return error.BadProof;
-        const root = beef_mod.rootFor(self.arena, p, txid) orelse return error.BadProof;
-        const want = (try self.chain().rootAt(p.block_height)) orelse return error.UnknownHeader;
-        if (!std.mem.eql(u8, &root, &want)) return error.RootMismatch;
         const before = try self.status(txid);
-        try self.putProof(txid, p.block_height, path);
+        try self.putProof(txid, p);
         if (before == .rejected) return .rejected;
         if (before != .proven and try self.map("actions").has(&txid)) try self.changes.append(self.arena, .{ .txid = txid, .status = .proven, .reason = "mined" });
         try self.rejectConflicting(txid);
@@ -636,7 +645,7 @@ pub const Wallet = struct {
             if (std.mem.eql(u8, &e.txid, &subject)) tx_cid = c;
             if (proven) {
                 for (b.bumps) |p| if (beef_mod.bumpHas(p, e.txid)) {
-                    try self.putProof(e.txid, p.block_height, try p.bytes(a));
+                    try self.putProof(e.txid, p);
                     break;
                 };
             }
@@ -914,6 +923,7 @@ pub const Wallet = struct {
         var acc = BeefAcc{ .w = self };
         for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
         try acc.entries.append(self.arena, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
+        acc.flagLeaves();
         return beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .atomic = txid, .bumps = acc.bumps.items, .entries = acc.entries.items });
     }
 
@@ -928,6 +938,7 @@ pub const Wallet = struct {
     pub fn beefOfMany(self: *Wallet, txids: []const [32]u8) ![]const u8 {
         var acc = BeefAcc{ .w = self };
         for (txids) |t| try acc.visit(t);
+        acc.flagLeaves();
         return beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .bumps = acc.bumps.items, .entries = acc.entries.items });
     }
 
@@ -942,7 +953,7 @@ pub const Wallet = struct {
             const raw = (try acc.w.txRaw(txid)) orelse return error.MissingAncestor;
             const tx = try bsvz.transaction.Transaction.parse(a, raw);
             if ((try acc.w.status(txid)) == .proven) {
-                const p = try bsvz.spv.MerklePath.parse(a, (try acc.w.proofPath(txid)).?);
+                const p = (try acc.w.proofFor(txid)) orelse return error.MissingProof;
                 const idx = for (acc.bumps.items, 0..) |*b, i| {
                     if (b.block_height != p.block_height) continue;
                     b.combine(&p, a) catch continue;
@@ -956,6 +967,18 @@ pub const Wallet = struct {
             }
             for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
             try acc.entries.append(a, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
+        }
+
+        /// bsvz's `combine` keeps one element per offset without merging
+        /// flags, so a later path of the same block can drop an earlier leaf's
+        /// txid flag: flag every proven entry's leaf in its BUMP again.
+        fn flagLeaves(acc: *BeefAcc) void {
+            for (acc.entries.items) |e| {
+                const bi = e.bump orelse continue;
+                for (acc.bumps.items[bi].path[0]) |*l| if (l.hash) |h| if (std.mem.eql(u8, &h.bytes, &e.txid)) {
+                    l.txid = true;
+                };
+            }
         }
     };
 

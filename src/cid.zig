@@ -13,6 +13,14 @@ pub const SHA2_256: u64 = 0x12;
 /// order in the digest (the display form is that reversed).
 pub const BITCOIN_BLOCK: u64 = 0xb0; // an 80-byte block header
 pub const BITCOIN_TX: u64 = 0xb1; // a transaction's standard serialization
+/// A node of a block's transaction merkle tree (#29): the 64 bytes left hash ‖
+/// right hash, so its CID is its merkle hash. The header's merkle root names
+/// the root node; each node names its two children (nodes, or at the bottom
+/// transactions: bitcoin-tx). Not in the multicodec table: 0xb2 there is
+/// bitcoin-witness-commitment, and IPLD's own bitcoin codecs put merkle nodes
+/// under bitcoin-tx (by their length); 0xb3, the next free code of the bitcoin
+/// range, keeps a node's kind in its CID (see kernel-zig/README.md).
+pub const BITCOIN_MERKLE: u64 = 0xb3;
 pub const DBL_SHA2_256: u64 = 0x56;
 
 const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
@@ -172,13 +180,14 @@ pub fn short(buf: *[8]u8, c: []const u8) []const u8 {
 }
 
 /// Does `bytes` hash to `c`? git-raw/sha1, raw/sha2-256 and dag-cbor/sha2-256
-/// (scheduler.ts hashMatches), and, here only, bitcoin-tx and bitcoin-block
-/// (an 80-byte header) with dbl-sha2-256.
+/// (scheduler.ts hashMatches), and, here only, bitcoin-tx, bitcoin-block (an
+/// 80-byte header) and bitcoin-merkle (a 64-byte node) with dbl-sha2-256.
 pub fn hashMatches(c: []const u8, bytes: []const u8) bool {
     const p = parts(c) catch return false;
-    if (p.codec == BITCOIN_TX or p.codec == BITCOIN_BLOCK) {
+    if (p.codec == BITCOIN_TX or p.codec == BITCOIN_BLOCK or p.codec == BITCOIN_MERKLE) {
         if (p.mh != DBL_SHA2_256 or p.digest.len != 32) return false;
         if (p.codec == BITCOIN_BLOCK and bytes.len != 80) return false;
+        if (p.codec == BITCOIN_MERKLE and bytes.len != 64) return false;
         return std.mem.eql(u8, &dblSha256(bytes), p.digest);
     }
     if (p.codec != GIT_RAW and p.codec != RAW and p.codec != DAG_CBOR) return false;
@@ -203,7 +212,7 @@ pub fn dblSha256(bytes: []const u8) [32]u8 {
     return b;
 }
 
-/// The CID of a transaction (bitcoin-tx) or a block header (bitcoin-block).
+/// The CID of a transaction (bitcoin-tx), a block header (bitcoin-block) or a merkle node (bitcoin-merkle).
 pub fn ofBitcoin(alloc: std.mem.Allocator, codec: u64, bytes: []const u8) ![]u8 {
     return create(alloc, codec, DBL_SHA2_256, &dblSha256(bytes));
 }
@@ -248,6 +257,36 @@ test "bitcoin-tx and bitcoin-block: the CID is the txid / the block hash" {
         defer a.free(back);
         try std.testing.expectEqualSlices(u8, c, back);
     }
+}
+
+test "bitcoin-merkle: a node's CID is its merkle hash, 64 bytes only" {
+    const a = std.testing.allocator;
+    // Mainnet block 170 (the first with two transactions): its merkle root is the node of its two txids.
+    var left: [32]u8 = undefined;
+    var right: [32]u8 = undefined;
+    var root: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&left, "b1fea52486ce0c62bb442b530a3f0132b826c74e473d1f2c220bfa78111c5082");
+    _ = try std.fmt.hexToBytes(&right, "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16");
+    _ = try std.fmt.hexToBytes(&root, "7dac2c5666815c17a3b36427de37bb9d2e2c5ccec3f8633eb91a4205cb4c10ff");
+    std.mem.reverse(u8, &left);
+    std.mem.reverse(u8, &right);
+    std.mem.reverse(u8, &root);
+    const node = left ++ right;
+    const c = try ofBitcoin(a, BITCOIN_MERKLE, &node);
+    defer a.free(c);
+    try std.testing.expectEqualSlices(u8, &root, (try parts(c)).digest);
+    try std.testing.expect(hashMatches(c, &node));
+    try std.testing.expect(!hashMatches(c, node[0..63]));
+    var off = node;
+    off[0] ^= 1;
+    try std.testing.expect(!hashMatches(c, &off));
+    // The same digest under bitcoin-tx takes the bytes too (IPLD's convention); under bitcoin-block not.
+    const as_tx = try create(a, BITCOIN_TX, DBL_SHA2_256, &root);
+    defer a.free(as_tx);
+    try std.testing.expect(hashMatches(as_tx, &node));
+    const as_block = try create(a, BITCOIN_BLOCK, DBL_SHA2_256, &root);
+    defer a.free(as_block);
+    try std.testing.expect(!hashMatches(as_block, &node));
 }
 
 test "base32 round trip" {
