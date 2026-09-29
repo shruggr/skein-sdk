@@ -343,7 +343,7 @@ pub const Wallet = struct {
     }
 
     /// A merkle path proving `txid` (#29, merkle.zig): the nodes it reveals
-    /// are put as bitcoin-merkle blocks (shared with every other path of the
+    /// are put as 64-byte bitcoin-tx blocks (shared with every other path of the
     /// block; nothing rewritten), and `proofs` names the block's header. The
     /// path's root must be our best-chain header's at its height.
     pub fn putProof(self: *Wallet, txid: [32]u8, p: merkle.MerklePath) !void {

@@ -1,6 +1,7 @@
 //! A block's transaction merkle tree as IPLD nodes (issue #29, "Proof
 //! structure"). A node is the 64 bytes left hash ‖ right hash, a
-//! `bitcoin-merkle` block (0xb3, dbl-sha2-256): its CID is its merkle hash.
+//! `bitcoin-tx` block of exactly 64 bytes (dbl-sha2-256; IPLD's convention,
+//! #42: the kernel decodes it as [left, right]): its CID is its merkle hash.
 //! The block header's merkle root names the root node; each node names its
 //! two children — nodes, or at the bottom transactions (bitcoin-tx CIDs, the
 //! txids). The tree is sparse: a wallet holds only the nodes on the paths to
@@ -23,9 +24,9 @@ const Store = store_mod.Store;
 pub const MerklePath = bsvz.spv.MerklePath;
 const PathElement = std.meta.Elem(std.meta.Elem(@FieldType(MerklePath, "path")));
 
-/// A node's CID: bitcoin-merkle over its hash.
+/// A node's CID: bitcoin-tx over its hash (a leaf's is its txid: the same codec).
 pub fn nodeCid(hash: [32]u8) [37]u8 {
-    return store_mod.hashCid(.merkle, hash);
+    return store_mod.hashCid(.tx, hash);
 }
 
 pub const Node = struct { hash: [32]u8, bytes: [64]u8 };
@@ -101,10 +102,11 @@ pub fn putNodes(s: Store, nodes: []const Node) !void {
     for (nodes) |n| try s.putBlock(&nodeCid(n.hash), &n.bytes);
 }
 
-/// A node we hold (its 64 bytes), or null.
+/// A node we hold (its 64 bytes), or null — also for a transaction we hold
+/// (a leaf: under bitcoin-tx too, and never 64 bytes).
 pub fn node(a: std.mem.Allocator, s: Store, hash: [32]u8) !?[64]u8 {
     const b = s.tryGet(a, &nodeCid(hash)) orelse return null;
-    if (b.len != 64) return error.BadNode;
+    if (b.len != 64) return null;
     return b[0..64].*;
 }
 

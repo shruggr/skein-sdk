@@ -13,14 +13,10 @@ pub const SHA2_256: u64 = 0x12;
 /// order in the digest (the display form is that reversed).
 pub const BITCOIN_BLOCK: u64 = 0xb0; // an 80-byte block header
 pub const BITCOIN_TX: u64 = 0xb1; // a transaction's standard serialization
-/// A node of a block's transaction merkle tree (#29): the 64 bytes left hash ‖
-/// right hash, so its CID is its merkle hash. The header's merkle root names
-/// the root node; each node names its two children (nodes, or at the bottom
-/// transactions: bitcoin-tx). Not in the multicodec table: 0xb2 there is
-/// bitcoin-witness-commitment, and IPLD's own bitcoin codecs put merkle nodes
-/// under bitcoin-tx (by their length); 0xb3, the next free code of the bitcoin
-/// range, keeps a node's kind in its CID (see kernel-zig/README.md).
-pub const BITCOIN_MERKLE: u64 = 0xb3;
+// A node of a block's transaction merkle tree (#29, #42) is a bitcoin-tx
+// block of exactly 64 bytes, left hash ‖ right hash — IPLD's convention — so
+// its CID is its merkle hash; bitcoin.zig decodes it as [left, right].
+
 pub const DBL_SHA2_256: u64 = 0x56;
 
 const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
@@ -180,14 +176,13 @@ pub fn short(buf: *[8]u8, c: []const u8) []const u8 {
 }
 
 /// Does `bytes` hash to `c`? git-raw/sha1, raw/sha2-256 and dag-cbor/sha2-256
-/// (scheduler.ts hashMatches), and, here only, bitcoin-tx, bitcoin-block (an
-/// 80-byte header) and bitcoin-merkle (a 64-byte node) with dbl-sha2-256.
+/// (scheduler.ts hashMatches), and, here only, bitcoin-tx (a transaction, or a
+/// 64-byte merkle node) and bitcoin-block (an 80-byte header) with dbl-sha2-256.
 pub fn hashMatches(c: []const u8, bytes: []const u8) bool {
     const p = parts(c) catch return false;
-    if (p.codec == BITCOIN_TX or p.codec == BITCOIN_BLOCK or p.codec == BITCOIN_MERKLE) {
+    if (p.codec == BITCOIN_TX or p.codec == BITCOIN_BLOCK) {
         if (p.mh != DBL_SHA2_256 or p.digest.len != 32) return false;
         if (p.codec == BITCOIN_BLOCK and bytes.len != 80) return false;
-        if (p.codec == BITCOIN_MERKLE and bytes.len != 64) return false;
         return std.mem.eql(u8, &dblSha256(bytes), p.digest);
     }
     if (p.codec != GIT_RAW and p.codec != RAW and p.codec != DAG_CBOR) return false;
@@ -212,7 +207,7 @@ pub fn dblSha256(bytes: []const u8) [32]u8 {
     return b;
 }
 
-/// The CID of a transaction (bitcoin-tx), a block header (bitcoin-block) or a merkle node (bitcoin-merkle).
+/// The CID of a transaction or a merkle node (bitcoin-tx), or a block header (bitcoin-block).
 pub fn ofBitcoin(alloc: std.mem.Allocator, codec: u64, bytes: []const u8) ![]u8 {
     return create(alloc, codec, DBL_SHA2_256, &dblSha256(bytes));
 }
@@ -259,7 +254,7 @@ test "bitcoin-tx and bitcoin-block: the CID is the txid / the block hash" {
     }
 }
 
-test "bitcoin-merkle: a node's CID is its merkle hash, 64 bytes only" {
+test "a merkle node is a 64-byte bitcoin-tx: its CID is its merkle hash" {
     const a = std.testing.allocator;
     // Mainnet block 170 (the first with two transactions): its merkle root is the node of its two txids.
     var left: [32]u8 = undefined;
@@ -272,7 +267,7 @@ test "bitcoin-merkle: a node's CID is its merkle hash, 64 bytes only" {
     std.mem.reverse(u8, &right);
     std.mem.reverse(u8, &root);
     const node = left ++ right;
-    const c = try ofBitcoin(a, BITCOIN_MERKLE, &node);
+    const c = try ofBitcoin(a, BITCOIN_TX, &node);
     defer a.free(c);
     try std.testing.expectEqualSlices(u8, &root, (try parts(c)).digest);
     try std.testing.expect(hashMatches(c, &node));
@@ -280,10 +275,7 @@ test "bitcoin-merkle: a node's CID is its merkle hash, 64 bytes only" {
     var off = node;
     off[0] ^= 1;
     try std.testing.expect(!hashMatches(c, &off));
-    // The same digest under bitcoin-tx takes the bytes too (IPLD's convention); under bitcoin-block not.
-    const as_tx = try create(a, BITCOIN_TX, DBL_SHA2_256, &root);
-    defer a.free(as_tx);
-    try std.testing.expect(hashMatches(as_tx, &node));
+    // Under bitcoin-block (80 bytes only): not.
     const as_block = try create(a, BITCOIN_BLOCK, DBL_SHA2_256, &root);
     defer a.free(as_block);
     try std.testing.expect(!hashMatches(as_block, &node));

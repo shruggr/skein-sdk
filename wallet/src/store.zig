@@ -49,11 +49,11 @@ pub const Store = struct {
     }
 };
 
-/// bitcoin-block (an 80-byte header), bitcoin-tx, bitcoin-merkle (a 64-byte
-/// merkle node, #29: kernel-zig/src/cid.zig).
-pub const Codec = enum(u8) { block = 0xb0, tx = 0xb1, merkle = 0xb3 };
+/// bitcoin-block (an 80-byte header), bitcoin-tx (a transaction, or a 64-byte
+/// merkle node: IPLD's convention, #42; kernel-zig/src/bitcoin.zig).
+pub const Codec = enum(u8) { block = 0xb0, tx = 0xb1 };
 
-/// CIDv1, bitcoin-tx (0xb1), bitcoin-block (0xb0) or bitcoin-merkle (0xb3),
+/// CIDv1, bitcoin-tx (0xb1) or bitcoin-block (0xb0),
 /// dbl-sha2-256 (0x56): the digest is the txid / block hash / merkle hash in
 /// internal byte order.
 pub fn bitcoinCid(codec: Codec, bytes: []const u8) [37]u8 {
@@ -67,7 +67,7 @@ pub fn hashCid(codec: Codec, hash: [32]u8) [37]u8 {
 
 /// The txid / block hash / merkle hash a bitcoin CID names, or null for any other CID.
 pub fn bitcoinHash(cid: []const u8) ?[32]u8 {
-    if (cid.len != 37 or cid[0] != 1 or (cid[1] != 0xb0 and cid[1] != 0xb1 and cid[1] != 0xb3) or cid[2] != 1 or cid[3] != 0x56 or cid[4] != 0x20) return null;
+    if (cid.len != 37 or cid[0] != 1 or (cid[1] != 0xb0 and cid[1] != 0xb1) or cid[2] != 1 or cid[3] != 0x56 or cid[4] != 0x20) return null;
     return cid[5..37].*;
 }
 
@@ -114,12 +114,11 @@ pub const MemStore = struct {
         return arena.dupe(u8, &cid);
     }
     /// As the kernel's putblock: the bytes must hash to the CID (bitcoin-tx,
-    /// bitcoin-block, bitcoin-merkle, or dag-cbor sha2-256 — index nodes).
+    /// bitcoin-block, or dag-cbor sha2-256 — index nodes).
     fn putBlockImpl(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
         const self: *MemStore = @ptrCast(@alignCast(ptr));
         if (bitcoinHash(cid)) |h| {
             if (cid[1] == 0xb0 and bytes.len != 80) return error.HashMismatch;
-            if (cid[1] == 0xb3 and bytes.len != 64) return error.HashMismatch;
             if (!std.mem.eql(u8, &h, &dblSha256(bytes))) return error.HashMismatch;
         } else if (cid.len == 36 and std.mem.eql(u8, cid[0..4], &.{ 0x01, 0x71, 0x12, 0x20 })) {
             if (!std.mem.eql(u8, cid, &cbor.cidOf(bytes))) return error.HashMismatch;
