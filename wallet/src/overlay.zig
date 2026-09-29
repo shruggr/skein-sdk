@@ -12,7 +12,10 @@
 //!   admitted       tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, refs}
 //!   applied        tp ‖ txid → applied record {kind: "applied", topic, txid, outputsToAdmit, coinsToRetain, coinsRemoved, at, tx, refs}
 //!   byTopic        tp ‖ 0 (unspent) | 1 (spent) ‖ outpoint → null         derived
-//!   byScript       sha256(script) ‖ tp ‖ 0 | 1 ‖ outpoint → null          derived
+//!
+//! Indexes for answering queries are not here: each lookup service keeps its
+//! own, under its own head, through the hooks the engine calls (#50: `Caller`,
+//! `hookAdmitted`, `hookRejected`; programs/overlay/src/lookup.zig).
 //!
 //! Spent within a topic (#36 notes) is not a table of its own: it is
 //! `admitted` joined to the spends edge — the wallet's `spent[outpoint]`, the
@@ -106,12 +109,6 @@ pub fn topicPrefix(a: std.mem.Allocator, topic: []const u8) ![]u8 {
 
 fn cat(a: std.mem.Allocator, parts: []const []const u8) ![]u8 {
     return std.mem.concat(a, u8, parts);
-}
-
-fn scriptHash(script: []const u8) [32]u8 {
-    var h: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(script, &h, .{});
-    return h;
 }
 
 // ---------------------------------------------------------------- submit (BRC-22)
@@ -436,32 +433,27 @@ pub fn apply(w: *Wallet, sub: Subject, topic: []const u8, previous: []const u32,
 
 // ---------------------------------------------------------------- derived, maintained (#41)
 
-/// An admitted output's `byTopic` / `byScript` keys (key = tp ‖ outpoint),
-/// under whether the outpoint is spent (the wallet's `spent`: a spender we
-/// hold that is not rejected).
+/// An admitted output's `byTopic` key (key = tp ‖ outpoint), under whether
+/// the outpoint is spent (the wallet's `spent`: a spender we hold that is not
+/// rejected).
 pub fn refreshAdmitted(w: *Wallet, key: []const u8) !void {
     const a = w.arena;
-    const rc = (try w.map("admitted").link(key)) orelse return;
+    if (!(try w.map("admitted").has(key))) return;
     const tl = 1 + @as(usize, key[0]);
     if (key.len != tl + 36) return error.BadIndex;
     const state: u8 = if (try w.map("spent").has(key[tl..])) 1 else 0;
-    const sh = scriptHash((try w.record(rc)).getBytes("script") orelse return error.BadRecord);
     _ = try w.map("byTopic").remove(try cat(a, &.{ key[0..tl], &.{1 - state}, key[tl..] }));
     try w.map("byTopic").add(try cat(a, &.{ key[0..tl], &.{state}, key[tl..] }));
-    _ = try w.map("byScript").remove(try cat(a, &.{ &sh, key[0..tl], &.{1 - state}, key[tl..] }));
-    try w.map("byScript").add(try cat(a, &.{ &sh, key[0..tl], &.{state}, key[tl..] }));
 }
 
 /// An admittance vanishes (its transaction was rejected): the record and every derived key of it.
 pub fn unadmit(w: *Wallet, key: []const u8) !void {
     const a = w.arena;
-    const rc = (try w.map("admitted").link(key)) orelse return;
+    if (!(try w.map("admitted").has(key))) return;
     const tl = 1 + @as(usize, key[0]);
     if (key.len != tl + 36) return error.BadIndex;
-    const sh = scriptHash((try w.record(rc)).getBytes("script") orelse return error.BadRecord);
     for ([_]u8{ 0, 1 }) |state| {
         _ = try w.map("byTopic").remove(try cat(a, &.{ key[0..tl], &.{state}, key[tl..] }));
-        _ = try w.map("byScript").remove(try cat(a, &.{ &sh, key[0..tl], &.{state}, key[tl..] }));
     }
     _ = try w.map("admitted").remove(key);
 }
@@ -625,23 +617,6 @@ pub fn inTopic(w: *Wallet, topic: []const u8, include_spent: bool) ![]Admitted {
     for ([_]u8{ 0, 1 }) |state| {
         if (state == 1 and !include_spent) continue;
         for (try w.map("byTopic").prefixed(try cat(a, &.{ tp, &.{state} }))) |kv| try out.append(a, try admittedAt(w, tp, kv.key[tp.len + 1 ..], state == 1));
-    }
-    return out.items;
-}
-
-/// The admitted outputs whose locking script hashes (sha256) to `hash`, in
-/// one topic or in any: unspent only unless `include_spent`.
-pub fn byScriptHash(w: *Wallet, hash: [32]u8, topic: ?[]const u8, include_spent: bool) ![]Admitted {
-    const a = w.arena;
-    const prefix = if (topic) |t| try cat(a, &.{ &hash, try topicPrefix(a, t) }) else try a.dupe(u8, &hash);
-    var out: std.ArrayList(Admitted) = .empty;
-    for (try w.map("byScript").prefixed(prefix)) |kv| {
-        const rest = kv.key[32..];
-        const tl = 1 + @as(usize, rest[0]);
-        if (rest.len != tl + 1 + 36) return error.BadIndex;
-        const spent = rest[tl] == 1;
-        if (spent and !include_spent) continue;
-        try out.append(a, try admittedAt(w, rest[0..tl], rest[tl + 1 ..], spent));
     }
     return out.items;
 }

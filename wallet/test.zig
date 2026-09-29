@@ -1169,7 +1169,6 @@ fn joinHolds(a: std.mem.Allocator, w: *lib.wallet.Wallet) !void {
     const have = try w.map("byTopic").prefixed("");
     try std.testing.expectEqual(want.items.len, have.len);
     for (want.items, have) |x, y| try std.testing.expectEqualSlices(u8, x, y.key);
-    try std.testing.expectEqual(have.len, try w.map("byScript").count());
 }
 
 test "overlay: submit and admit, spend with retained coins, lookups with valid BEEF, a rejected spend restores" {
@@ -1238,16 +1237,11 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     for (try w.dependentsOf(t1.txid)) |d| rel_ok = rel_ok or (d.tag == .admitted and d.rel == .admits);
     try std.testing.expect(rel_ok);
 
-    // Lookups: by topic and by script hash; the answer's BEEF verifies against our chain.
+    // In the topic; the BEEF a lookup answer carries verifies against our chain.
     {
         const live = try ov.inTopic(&w, "tm_demo", false);
         try std.testing.expectEqual(@as(usize, 1), live.len);
         try std.testing.expectEqualSlices(u8, &t1.txid, &live[0].txid);
-        var sh: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(&token, &sh, .{});
-        try std.testing.expectEqual(@as(usize, 1), (try ov.byScriptHash(&w, sh, "tm_demo", false)).len);
-        try std.testing.expectEqual(@as(usize, 1), (try ov.byScriptHash(&w, sh, null, false)).len);
-        try std.testing.expectEqual(@as(usize, 0), (try ov.byScriptHash(&w, sh, "tm_other", false)).len);
         const ans = try beef.parse(a, try ov.beefFor(&w, t1.txid));
         try std.testing.expectEqualSlices(u8, &t1.txid, &ans.atomic.?);
         var fresh = try lib.wallet.Wallet.load(a, s, empty, .regtest); // verified by a node holding only the headers
@@ -1292,6 +1286,10 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     w = try lib.wallet.Wallet.load(a, s, s2, .regtest);
     w.now = 3000;
     try std.testing.expectEqual(lib.wallet.Wallet.Outcome.rejected, try w.applyStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null));
+    // The judgement it removed, for the topic's lookup services (#50: `rejected`).
+    try std.testing.expectEqual(@as(usize, 1), w.unapplied.items.len);
+    try std.testing.expectEqualStrings("tm_demo", w.unapplied.items[0].topic);
+    try std.testing.expectEqualSlices(u8, &t2.txid, &w.unapplied.items[0].txid);
     const s3 = try w.save();
     try joinHolds(a, &w);
     {
@@ -1313,6 +1311,10 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     var w4 = try lib.wallet.Wallet.load(a, s, s2, .regtest);
     w4.now = 3000;
     try std.testing.expectEqual(@as(usize, 2), (try w4.reject(t1.txid, "REJECTED")).len);
+    // Both judgements removed, in the walk's order.
+    try std.testing.expectEqual(@as(usize, 2), w4.unapplied.items.len);
+    try std.testing.expectEqualSlices(u8, &t1.txid, &w4.unapplied.items[0].txid);
+    try std.testing.expectEqualSlices(u8, &t2.txid, &w4.unapplied.items[1].txid);
     _ = try w4.save();
     try joinHolds(a, &w4);
     try std.testing.expectEqual(@as(usize, 0), (try ov.inTopic(&w4, "tm_demo", true)).len);

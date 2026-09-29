@@ -77,8 +77,7 @@ pub const Oracle = struct {
 ///   admitted  len ‖ topic ‖ outpoint → admittance record      outputs admitted into a topic
 ///   applied   len ‖ topic ‖ txid → applied record             a topic's judgement of a tx (dupes; retention)
 ///   byTopic   len ‖ topic ‖ 0|1 ‖ outpoint → null             derived: 0 unspent, 1 spent (admitted ⋈ `spent`)
-///   byScript  sha256(script) ‖ len ‖ topic ‖ 0|1 ‖ outpoint → null   derived: by locking script hash
-pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "dependents", "rejected", "proofHeights", "drafts", "watchers", "unproven", "admitted", "applied", "byTopic", "byScript" };
+pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "actions", "outputs", "awaiting", "spent", "byBasket", "dependents", "rejected", "proofHeights", "drafts", "watchers", "unproven", "admitted", "applied", "byTopic" };
 
 pub const Status = enum { proven, unproven, rejected };
 
@@ -107,6 +106,10 @@ pub const Rel = enum {
 /// an overlay's admitted output (its `admitted` key) or judgement (its
 /// `applied` key, #36), or any other record (its CID).
 pub const Tag = enum(u8) { tx = 't', action = 'a', output = 'o', draft = 'd', record = 'r', admitted = 'm', applied = 'p' };
+
+/// A topic's judgement of a transaction that a rejection removed (#50): the
+/// topic's lookup services are told (`rejected`, overlay.hookRejected).
+pub const Unapplied = struct { topic: []const u8, txid: [32]u8 };
 
 /// One settlement change in a step (what the `settlement` box is sent).
 pub const Change = struct { txid: [32]u8, status: Status, reason: []const u8, cause: ?[32]u8 = null };
@@ -197,6 +200,8 @@ pub const Wallet = struct {
     changes: std.ArrayList(Change) = .empty,
     /// Transactions of ours a reorg this step turned back to unproven: to be asked about again.
     reverted: std.ArrayList([32]u8) = .empty,
+    /// Topics' judgements rejections removed this step, in the walk's order (#50).
+    unapplied: std.ArrayList(Unapplied) = .empty,
 
     /// The wallet the state record names (null: a new one) on `network`; a
     /// state made for another network is refused.
@@ -491,7 +496,12 @@ pub const Wallet = struct {
                     .draft => try self.map("drafts").putLink(d.id, rec),
                     // An overlay's admittance and judgement vanish with it (#36).
                     .admitted => try overlay.unadmit(self, d.id),
-                    .applied => _ = try self.map("applied").remove(d.id),
+                    .applied => {
+                        if (try self.map("applied").remove(d.id)) {
+                            const tl = 1 + @as(usize, if (d.id.len > 0) d.id[0] else 0);
+                            if (d.id.len == tl + 32) try self.unapplied.append(a, .{ .topic = d.id[1..tl], .txid = t });
+                        }
+                    },
                     .action, .record => {}, // an action's status is computed; a record is only reported
                 }
             }

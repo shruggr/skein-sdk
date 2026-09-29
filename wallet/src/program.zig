@@ -134,6 +134,19 @@ const VmOracle = struct {
     }
 };
 
+/// In-VM calls (#40) for the overlay's lookup services (#50: a rejection
+/// here tells each topic's services, `rejected`).
+const VmCaller = struct {
+    var dummy: u8 = 0;
+    fn call(_: *anyopaque, arena: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value {
+        const bytes = try cbor.encode(arena, arg);
+        return cbor.decode(arena, try result(arena, sk.call, .{ program.ptr, @as(u32, @intCast(program.len)), func.ptr, @as(u32, @intCast(func.len)), bytes.ptr, @as(u32, @intCast(bytes.len)) }));
+    }
+    fn caller() w.overlay.Caller {
+        return .{ .ctx = &dummy, .callFn = call };
+    }
+};
+
 const head_name = "wallet";
 
 pub fn main() u8 {
@@ -419,6 +432,9 @@ fn run(a: std.mem.Allocator) !void {
     } else if (state_cid.len > 0) {
         try out.append(a, .{ .key = "state", .value = .{ .cid = state_cid } });
     }
+    // Topics' judgements the rejections removed (an instance that is also an
+    // overlay): each topic's lookup services are told, in this step (#50).
+    if (wal.unapplied.items.len > 0) try w.overlay.hookRejected(a, VmCaller.caller(), step, wal.unapplied.items);
     if (await_txs.items.len > 0) {
         // Rest until a `status` / `proof` entry for one of these transactions (a CID is its txid), or the deadline.
         const hexes = try a.alloc(Value, await_txs.items.len);
