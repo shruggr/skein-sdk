@@ -478,6 +478,126 @@ pub fn spentChanged(w: *Wallet, op: [36]u8) !void {
     }
 }
 
+// ---------------------------------------------------------------- programs: topics and lookup services (#50)
+
+/// An in-VM call (#40) as the overlay makes it: `program`'s function `func`
+/// on `arg` → its answer. The VM's `call` import in a program; a dispatch
+/// table in the native tests.
+pub const Caller = struct {
+    ctx: *anyopaque,
+    callFn: *const fn (ctx: *anyopaque, a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value,
+
+    pub fn call(self: Caller, a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) !Value {
+        return self.callFn(self.ctx, a, program, func, arg);
+    }
+};
+
+/// A genesis config map (defaults.<key>: a JSON object in a string).
+pub fn configObject(a: std.mem.Allocator, in: Value, key: []const u8) !std.json.ObjectMap {
+    const text = if (in.get("defaults")) |d| d.getText(key) orelse "{}" else "{}";
+    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;
+    if (j != .object) return error.BadConfig;
+    return j.object;
+}
+
+/// A program record by its genesis name (the step's or call's `programs`).
+pub fn programNamed(in: Value, name: []const u8) !?[]const u8 {
+    const progs = in.get("programs") orelse return error.BadConfig;
+    return progs.getCid(name) orelse {
+        std.log.err("config names program {s}, not in the genesis programs", .{name});
+        return error.BadConfig;
+    };
+}
+
+/// A configured name's program: the value is the `bin/` program name, or
+/// (defaults.overlayLookups) an object `{program, topics?}`.
+pub fn configuredProgram(in: Value, map: std.json.ObjectMap, name: []const u8) !?[]const u8 {
+    const v = map.get(name) orelse return null;
+    const prog = switch (v) {
+        .string => |s| s,
+        .object => |o| if (o.get("program")) |p| (if (p == .string) p.string else return error.BadConfig) else return error.BadConfig,
+        else => return error.BadConfig,
+    };
+    return programNamed(in, prog);
+}
+
+/// A lookup service that listens to a topic.
+pub const Listener = struct { service: []const u8, program: []const u8 };
+
+/// The lookup services listening to `topic` (defaults.overlayLookups, #50):
+/// `{"ls_x": {"program": "<bin/ name>", "topics": ["tm_x", …]}}`; the short
+/// form `{"ls_x": "<bin/ name>"}` listens to every topic the instance serves
+/// (defaults.overlayTopics). In the config's order.
+pub fn listeners(a: std.mem.Allocator, in: Value, topic: []const u8) ![]Listener {
+    const lookups = try configObject(a, in, "overlayLookups");
+    const topics = try configObject(a, in, "overlayTopics");
+    var out: std.ArrayList(Listener) = .empty;
+    var it = lookups.iterator();
+    while (it.next()) |e| {
+        const listens = switch (e.value_ptr.*) {
+            .string => topics.contains(topic),
+            .object => |o| blk: {
+                const ts = o.get("topics") orelse break :blk topics.contains(topic);
+                if (ts != .array) return error.BadConfig;
+                for (ts.array.items) |t| {
+                    if (t != .string) return error.BadConfig;
+                    if (std.mem.eql(u8, t.string, topic)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => return error.BadConfig,
+        };
+        if (!listens) continue;
+        try out.append(a, .{ .service = e.key_ptr.*, .program = (try configuredProgram(in, lookups, e.key_ptr.*)).? });
+    }
+    return out.items;
+}
+
+fn hookArg(a: std.mem.Allocator, service: []const u8, topic: []const u8, rest: []const cbor.Entry) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
+        .{ .key = "service", .value = .{ .text = service } },
+        .{ .key = "topic", .value = .{ .text = topic } },
+    });
+    try es.appendSlice(a, rest);
+    return .{ .map = es.items };
+}
+
+/// A topic admitted a transaction (in the step that recorded it): each of
+/// its lookup services' `admitted(topic, tx, outputsToAdmit, coinsRetained)`,
+/// then `spent(topic, outpoint, spendingTx)` for each previous coin it consumed.
+pub fn hookAdmitted(a: std.mem.Allocator, caller: Caller, in: Value, topic: []const u8, sub: Subject, previous: []const u32, applied: Applied) !void {
+    for (try listeners(a, in, topic)) |l| {
+        _ = try caller.call(a, l.program, "admitted", try hookArg(a, l.service, topic, &.{
+            .{ .key = "tx", .value = .{ .cid = sub.cid } },
+            .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
+            .{ .key = "coinsRetained", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
+        }));
+        for (previous) |p| {
+            const in_ = sub.tx.inputs[p];
+            _ = try caller.call(a, l.program, "spent", try hookArg(a, l.service, topic, &.{
+                .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+                    .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &store_mod.hashCid(.tx, in_.previous_outpoint.txid.bytes)) } },
+                    .{ .key = "vout", .value = .{ .uint = in_.previous_outpoint.index } },
+                }) } },
+                .{ .key = "spendingTx", .value = .{ .cid = sub.cid } },
+            }));
+        }
+    }
+}
+
+/// The topics' judgements a rejection removed (Wallet.reject → `unapplied`,
+/// in the walk's order): each topic's lookup services' `rejected(topic, tx)`.
+pub fn hookRejected(a: std.mem.Allocator, caller: Caller, in: Value, gone: []const wallet_mod.Unapplied) !void {
+    for (gone) |g| {
+        const cid = try a.dupe(u8, &store_mod.hashCid(.tx, g.txid));
+        for (try listeners(a, in, g.topic)) |l| {
+            _ = try caller.call(a, l.program, "rejected", try hookArg(a, l.service, g.topic, &.{.{ .key = "tx", .value = .{ .cid = cid } }}));
+        }
+    }
+}
+
 // ---------------------------------------------------------------- lookup (BRC-24)
 
 /// An admitted output as a lookup sees it.
