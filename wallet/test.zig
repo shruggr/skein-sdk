@@ -15,7 +15,7 @@ test {
 }
 
 /// Counts of vector checks, printed at the end of the run.
-var counts = struct { sign: usize = 0, tx: usize = 0, fee: usize = 0, beef: usize = 0, path: usize = 0, header: usize = 0, brc29: usize = 0, wire: usize = 0, wallet: usize = 0 }{};
+var counts = struct { sign: usize = 0, tx: usize = 0, fee: usize = 0, beef: usize = 0, path: usize = 0, header: usize = 0, brc29: usize = 0, wire: usize = 0, wallet: usize = 0, chronicle: usize = 0 }{};
 
 fn load(arena: std.mem.Allocator, comptime name: []const u8) !J {
     return std.json.parseFromSliceLeaky(J, arena, @embedFile("vectors/" ++ name), .{});
@@ -610,6 +610,42 @@ test "vectors: spends signed through the oracle — frames, sighash, fee, change
     const in0 = arr(c0, "inputs")[0];
     const src0 = try bsvz.transaction.Transaction.parse(a, try unhex(a, str(in0, "sourceTx")));
     try std.testing.expectError(error.InsufficientFunds, lib.builder.build(a, ks.signer(), &.{.{ .source_txid = try hdr.fromHex(str(in0, "sourceTxid")), .vout = 1, .satoshis = 30000, .locking_script = src0.outputs[1].locking_script.bytes, .key = try keyOf(in0) }}, &.{.{ .satoshis = 30000, .locking_script = &.{0x51} }}, .{ .key_id = "x", .counterparty = .self }, 1, true));
+}
+
+// ---------------------------------------------------------------- Chronicle script rules (#53)
+
+test "vectors: Rúnar AMM pool spends execute OP_2MUL — verified under Chronicle rules (the default), refused before them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try load(a, "chronicle.json");
+    const txs = v.object.get("txs").?;
+    for (arr(v, "spends")) |s| {
+        const tx = try bsvz.transaction.Transaction.parse(a, try unhex(a, str(txs, str(s, "name"))));
+        const src = try bsvz.transaction.Transaction.parse(a, try unhex(a, str(txs, str(s, "source"))));
+        const i: usize = @intCast(int(s, "input"));
+        const vout: u32 = @intCast(int(s, "vout"));
+        try std.testing.expectEqualSlices(u8, &(try src.txid(a)).bytes, &tx.inputs[i].previous_outpoint.txid.bytes);
+        try std.testing.expectEqual(vout, tx.inputs[i].previous_outpoint.index);
+        const ctx = bsvz.script.interpreter.PrevoutSpendContext{
+            .allocator = a,
+            .tx = &tx,
+            .input_index = i,
+            .previous_output = src.outputs[vout],
+            .unlocking_script = tx.inputs[i].unlocking_script,
+        };
+        // ExecutionFlags{}: current mainnet rules, Chronicle on (the flags the wallet and the overlay verify with).
+        try std.testing.expect(try bsvz.script.interpreter.verifyPrevout(ctx));
+        // Before Chronicle OP_2MUL is a disabled opcode.
+        var pre = ctx;
+        pre.flags = bsvz.script.interpreter.ExecutionFlags.postGenesisBsv();
+        try std.testing.expectError(error.UnknownOpcode, bsvz.script.interpreter.verifyPrevout(pre));
+        var legacy = ctx;
+        legacy.flags = bsvz.script.interpreter.ExecutionFlags.legacyReference();
+        try std.testing.expect(!(bsvz.script.interpreter.verifyPrevout(legacy) catch false));
+        counts.chronicle += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), counts.chronicle);
 }
 
 // ---------------------------------------------------------------- the wallet over records
@@ -1443,5 +1479,5 @@ fn cbor_cid(b: u8) [36]u8 {
 }
 
 test "zz: vector counts" {
-    std.debug.print("\nvectors passed: tx {d} (fees {d}), beef {d}, merkle {d}, headers {d}, brc29 {d}, wire {d}, signing {d}; wallet scenarios {d}\n", .{ counts.tx, counts.fee, counts.beef, counts.path, counts.header, counts.brc29, counts.wire, counts.sign, counts.wallet });
+    std.debug.print("\nvectors passed: tx {d} (fees {d}), beef {d}, merkle {d}, headers {d}, brc29 {d}, wire {d}, signing {d}, chronicle {d}; wallet scenarios {d}\n", .{ counts.tx, counts.fee, counts.beef, counts.path, counts.header, counts.brc29, counts.wire, counts.sign, counts.chronicle, counts.wallet });
 }
