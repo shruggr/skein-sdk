@@ -312,8 +312,8 @@ pub fn spender(w: *Wallet, topic: []const u8, txid: [32]u8, vout: u32) !?struct 
 
 /// Hold a submission's decoded records (#50), in the step that admits it,
 /// like any other transactions we hold: each transaction's block kept
-/// (`spends` edges, #42) and in `txs`; the merkle nodes kept (`child`
-/// edges); each proven transaction's proof recorded (`proofs`, from the
+/// (`spends` edges, #42) and in `txs`; the merkle nodes kept (no edges:
+/// a proof reads down from the root); each proven transaction's proof recorded (`proofs`, from the
 /// header its nodes reach). `txs` are block bytes, `nodes` 64-byte merkle
 /// nodes: the records the submit entry carries, not a BEEF.
 pub fn holdDecoded(w: *Wallet, txs: []const []const u8, nodes: []const []const u8, proven: []const Proven) !void {

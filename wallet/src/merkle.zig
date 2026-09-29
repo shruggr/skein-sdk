@@ -98,7 +98,8 @@ fn take(m: *std.AutoArrayHashMap(u64, [32]u8), dup: *std.AutoHashMap(u64, void),
 }
 
 /// Put the nodes (hash-checked by the store; one already held is the same
-/// block) and keep them: their `child` links are in the kernel's edges (#42).
+/// block) and keep them. They contribute no edges (#42, decided 2026-09-30):
+/// a proof is read downward from the root, never up from a leaf.
 pub fn putNodes(s: Store, nodes: []const Node) !void {
     for (nodes) |n| {
         const c = nodeCid(n.hash);
