@@ -2,7 +2,7 @@
 //! and the same settlement as the wallet. An overlay is the transaction graph
 //! the wallet holds, judged and indexed differently: a submitted transaction
 //! (BRC-22) is SPV-checked against the chain the wallet tracks and held like
-//! any other (`txs`, `proofs`, `spenders`, a `spends` relation per input);
+//! any other (`txs`, `proofs`, kept: a `spends` edge per input, #42);
 //! what a topic's program decided is recorded here as index maps in the
 //! wallet's own state record (wallet.zig `map_names`), so one instance can be
 //! a wallet and an overlay at once and a transaction's settlement (#37) is one
@@ -171,7 +171,7 @@ pub fn spender(w: *Wallet, topic: []const u8, txid: [32]u8, vout: u32) !?struct 
 }
 
 /// Hold the submission's transactions (and the proofs its BUMPs carry) like
-/// any other we hold: blocks, `txs`, `spenders`, `spends` relations. → the
+/// any other we hold: blocks (kept: `spends` edges, #42), `txs`. → the
 /// subject's CID.
 pub fn hold(w: *Wallet, sub: Submission) ![]const u8 {
     var subject_cid: []const u8 = "";

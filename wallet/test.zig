@@ -1001,12 +1001,15 @@ test "settlement: a rejection bubbles through spends and drafts; inputs freed; m
     _ = try w.save();
     const d = try w.createAction(.{ .description = "D", .sign_and_process = false, .outputs = &.{.{ .satoshis = 100, .locking_script = &payee }} }, signer.signer(), "ZA==", "MQ==", 100);
     const before = try w.save();
-    // The relations as written: B spends A; A's action and outputs derive from A; D from B.
-    var spends_a = false;
-    for (try w.dependentsOf(ca.txid)) |dep| {
-        if (dep.tag == .tx and std.mem.eql(u8, dep.id, &cb.txid)) spends_a = dep.rel == .spends;
-    }
-    try std.testing.expect(spends_a);
+    // The relations as written: B spends A (a `spends` edge, #42: B kept, its input
+    // an edge into A's CID with locator = A's change vout); A's action and outputs derive from A; D from B.
+    const spenders_a = try w.spendersOfTx(ca.txid);
+    try std.testing.expectEqual(@as(usize, 1), spenders_a.len);
+    try std.testing.expectEqualSlices(u8, &cb.txid, &spenders_a[0]);
+    const e = try s.edges(a, &lib.store.hashCid(.tx, ca.txid), "spends");
+    try std.testing.expectEqual(@as(usize, 1), e.len);
+    try std.testing.expectEqualSlices(u8, &lib.store.hashCid(.tx, cb.txid), e[0].from);
+    for (try w.dependentsOf(ca.txid)) |dep| try std.testing.expect(dep.rel != .spends); // no longer a dependents entry
     try std.testing.expectEqual(@as(usize, 1), (try w.listOutputs("default", false)).len); // B's change only
     try std.testing.expectEqual(@as(usize, 1), (try w.listOutputs("tokens", false)).len);
     // Something that merely mentions A (another transaction, and a record naming it).
