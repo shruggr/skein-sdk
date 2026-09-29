@@ -25,7 +25,16 @@ pub const raw = struct {
     pub extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
 };
+
+/// The edges into `to` (#42): dag-cbor [{from, seq, rel, locator}] from the
+/// kernel's index, `rel` only if given (who spent txid:vout: `spends` into
+/// the transaction's CID, locator = vout).
+pub fn edges(a: Allocator, to: []const u8, rel: ?[]const u8) !Value {
+    const r = rel orelse "";
+    return cbor.decode(a, try result(a, raw.edges, .{ to.ptr, n32(to.len), r.ptr, n32(r.len) }));
+}
 
 var last_error: [2048]u8 = undefined;
 var last_error_len: usize = 0;

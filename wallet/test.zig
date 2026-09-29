@@ -1308,11 +1308,20 @@ const CountingStore = struct {
     inner: lib.store.Store,
     puts: usize = 0,
     fn store(self: *CountingStore) lib.store.Store {
-        return .{ .ptr = self, .getFn = get, .putFn = put, .putBlockFn = putBlock };
+        return .{ .ptr = self, .getFn = get, .putFn = put, .putBlockFn = putBlock, .keepFn = keep, .edgesFn = edges };
     }
     fn get(ptr: *anyopaque, arena: std.mem.Allocator, cid: []const u8) anyerror![]const u8 {
         const self: *CountingStore = @ptrCast(@alignCast(ptr));
         return self.inner.get(arena, cid);
+    }
+    // Keeping writes no block (the kernel's edges are its index, not the wallet's).
+    fn keep(ptr: *anyopaque, cid: []const u8) anyerror!void {
+        const self: *CountingStore = @ptrCast(@alignCast(ptr));
+        return self.inner.keep(cid);
+    }
+    fn edges(ptr: *anyopaque, arena: std.mem.Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const lib.store.Edge {
+        const self: *CountingStore = @ptrCast(@alignCast(ptr));
+        return self.inner.edges(arena, to, rel);
     }
     fn put(ptr: *anyopaque, arena: std.mem.Allocator, bytes: []const u8) anyerror![]const u8 {
         const self: *CountingStore = @ptrCast(@alignCast(ptr));

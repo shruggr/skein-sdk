@@ -83,6 +83,14 @@ interface skein {
   /// From a step, the callee is part of the step (its recorded calls, records
   /// and head moves are the step's); from the kernel's `call`, it only reads.
   call: func(program: cid, fn: string, arg: list<u8>) -> result<list<u8>, string>;
+
+  /// The edges into a record (#42): who points at `to`, from the kernel's
+  /// index, `rel` only if given — dag-cbor [{from, seq, rel, locator}] in key
+  /// order (from, seq, ord). Who spent txid:vout is `spends` into the
+  /// transaction's CID with locator = vout (from each kept spending
+  /// transaction, seq 0). A read, a pure function of the log plus the
+  /// bitcoin blocks this step kept so far.
+  edges: func(to: cid, rel: option<string>) -> result<list<u8>, string>;
 }
 
 /// What a handler program imports beyond WASI's command world: skein's calls

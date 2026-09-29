@@ -107,8 +107,7 @@ pub fn verify(w: *Wallet, bytes: []const u8) !Submission {
     if (try w.map("rejected").has(&subject)) return error.TransactionRejected;
     for (tx.inputs) |in| {
         const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
-        for (try w.map("spenders").prefixed(&op)) |kv| {
-            const other: [32]u8 = kv.key[36..68].*;
+        for (try w.spendersOf(op)) |other| {
             if (std.mem.eql(u8, &other, &subject)) continue;
             if ((try w.status(other)) == .proven) return error.DoubleSpend;
         }
@@ -140,9 +139,7 @@ pub fn previousCoins(w: *Wallet, topic: []const u8, tx: Transaction) ![]u32 {
 
 /// Whether a transaction we hold other than `tx`, not rejected, spends `op`.
 fn spentByOther(w: *Wallet, op: [36]u8, tx: [32]u8) !bool {
-    for (try w.map("spenders").prefixed(&op)) |kv| {
-        if (kv.key.len != 68) return error.BadIndex;
-        const sp: [32]u8 = kv.key[36..68].*;
+    for (try w.spendersOf(op)) |sp| {
         if (std.mem.eql(u8, &sp, &tx)) continue;
         if (!(try w.map("rejected").has(&sp))) return true;
     }

@@ -112,6 +112,19 @@ pub fn wallet(frame: [*]const u8, n: u32, out: [*]u8, cap: u32) i32 {
     return hold(r, out, cap);
 }
 
+/// The edges into `to` (#42); rel_len = 0: any rel.
+pub fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32 {
+    var k = cid(to, to_len);
+    var r: c.program_list_u8_t = undefined;
+    var e: c.program_string_t = undefined;
+    const ok = if (rel_len > 0) blk: {
+        var s = str(rel, rel_len);
+        break :blk c.skein_kernel_skein_edges(&k, &s, &r, &e);
+    } else c.skein_kernel_skein_edges(&k, null, &r, &e);
+    if (!ok) return fail(&e);
+    return hold(r, out, cap);
+}
+
 pub fn deadline(until: i64) i32 {
     var e: c.program_string_t = undefined;
     if (!c.skein_kernel_skein_deadline(until, &e)) return fail(&e);

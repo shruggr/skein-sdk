@@ -661,6 +661,13 @@ extern bool skein_kernel_skein_deadline(int64_t until_ms, program_string_t *err)
 // From a step, the callee is part of the step (its recorded calls, records
 // and head moves are the step's); from the kernel's `call`, it only reads.
 extern bool skein_kernel_skein_call(skein_kernel_skein_cid_t *program, program_string_t *fn, program_list_u8_t *arg, program_list_u8_t *ret, program_string_t *err);
+// The edges into a record (#42): who points at `to`, from the kernel's
+// index, `rel` only if given — dag-cbor [{from, seq, rel, locator}] in key
+// order (from, seq, ord). Who spent txid:vout is `spends` into the
+// transaction's CID with locator = vout (from each kept spending
+// transaction, seq 0). A read, a pure function of the log plus the
+// bitcoin blocks this step kept so far.
+extern bool skein_kernel_skein_edges(skein_kernel_skein_cid_t *to, program_string_t *maybe_rel, program_list_u8_t *ret, program_string_t *err);
 
 // Imported Functions from `wasi:io/poll@0.2.12`
 // Return the readiness of a pollable. This function never blocks.

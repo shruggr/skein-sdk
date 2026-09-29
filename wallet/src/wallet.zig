@@ -268,9 +268,7 @@ pub const Wallet = struct {
     /// the outpoint spent or unspent, its `byBasket` key moves.
     fn refreshSpent(self: *Wallet, op: [36]u8) !void {
         var first: ?[32]u8 = null;
-        for (try self.map("spenders").prefixed(&op)) |kv| {
-            if (kv.key.len != 68) return error.BadIndex;
-            const sp: [32]u8 = kv.key[36..68].*;
+        for (try self.spendersOf(op)) |sp| {
             if (try self.map("rejected").has(&sp)) continue;
             first = sp;
             break;
@@ -318,6 +316,36 @@ pub const Wallet = struct {
             if (kv.key.len != 36) return error.BadIndex;
             try self.resettle(kv.key[4..36].*);
         }
+    }
+
+    /// The transactions we hold that spend `op`, lowest txid first: the
+    /// kernel's `spends` edges into its transaction with locator = its vout
+    /// (#42: every input of every transaction held, which the wallet keeps).
+    pub fn spendersOf(self: *Wallet, op: [36]u8) ![][32]u8 {
+        var held: std.ArrayList([32]u8) = .empty;
+        for (try self.store.spendersOf(self.arena, op[0..32].*, std.mem.readInt(u32, op[32..36], .big))) |sp| {
+            if (try self.map("txs").has(&sp)) try held.append(self.arena, sp);
+        }
+        const out = held.items;
+        // TEMPORARY (#42 cross-check): the edges answer = the old `spenders` map's.
+        var old: std.ArrayList([32]u8) = .empty;
+        for (try self.map("spenders").prefixed(&op)) |kv| try old.append(self.arena, kv.key[36..68].*);
+        if (old.items.len != out.len) return error.SpendersDiffer;
+        for (old.items, out) |x, y| if (!std.mem.eql(u8, &x, &y)) return error.SpendersDiffer;
+        return out;
+    }
+
+    /// The transactions we hold that spend any output of `txid`, lowest txid
+    /// first (its `spends` edges, whatever the vout).
+    pub fn spendersOfTx(self: *Wallet, txid: [32]u8) ![][32]u8 {
+        var out: std.ArrayList([32]u8) = .empty;
+        for (try self.store.edges(self.arena, &store_mod.hashCid(.tx, txid), "spends")) |e| {
+            const h = store_mod.bitcoinHash(e.from) orelse continue;
+            if (out.items.len > 0 and std.mem.eql(u8, &out.items[out.items.len - 1], &h)) continue; // one per spender (edges come in `from` order)
+            if (!(try self.map("txs").has(&h))) continue;
+            try out.append(self.arena, h);
+        }
+        return out.items;
     }
 
     /// A relation from a dependent record to the transaction it names (`dependents`).
@@ -460,6 +488,8 @@ pub const Wallet = struct {
                     .action, .record => {}, // an action's status is computed; a record is only reported
                 }
             }
+            // What spends it: the `spends` edges into it (#42), in txid order.
+            for (try self.spendersOfTx(t)) |s| try queue.append(a, s);
         }
         // What the rejected transactions consumed: spendable again unless another spender stands.
         for (out.items) |t| {
@@ -478,8 +508,7 @@ pub const Wallet = struct {
         const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
         for (tx.inputs) |in| {
             const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
-            for (try self.map("spenders").prefixed(&op)) |kv| {
-                const other: [32]u8 = kv.key[36..68].*;
+            for (try self.spendersOf(op)) |other| {
                 if (std.mem.eql(u8, &other, &txid)) continue;
                 _ = try self.reject(other, "double-spent");
             }
@@ -493,8 +522,7 @@ pub const Wallet = struct {
         const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
         for (tx.inputs) |in| {
             const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
-            for (try self.map("spenders").prefixed(&op)) |kv| {
-                const other: [32]u8 = kv.key[36..68].*;
+            for (try self.spendersOf(op)) |other| {
                 if (std.mem.eql(u8, &other, &txid)) continue;
                 if ((try self.status(other)) == .proven) {
                     _ = try self.reject(txid, "double-spent");
