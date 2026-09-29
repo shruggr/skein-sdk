@@ -36,7 +36,8 @@ the adapter and the canonical-ABI glue are instructions too. Every other
 field of an update is the same.
 
 The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `await`,
-`head`, `advance`, `subscribe`, `wallet`, `http`, `deadline` and `call`.
+`head`, `advance`, `subscribe`, `wallet`, `http`, `deadline`, `call` and
+`edges` (#42: the edges into a record, from the kernel's index; docs/VM.md "Edges").
 `emit` and `resolve` are gone (#40): an instance delivers a message itself,
 its messagebox program's `send` over `http`, and looks a handle up with its
 `resolve` program; both are reached through `call`.
