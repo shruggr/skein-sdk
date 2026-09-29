@@ -944,11 +944,6 @@ fn soloPath(a: std.mem.Allocator, height: u32, txid: [32]u8) ![]const u8 {
     return path.items;
 }
 
-fn hasChange(w: *lib.wallet.Wallet, txid: [32]u8, st: lib.wallet.Status, reason: []const u8) bool {
-    for (w.changes.items) |c| if (std.mem.eql(u8, &c.txid, &txid) and c.status == st and std.mem.eql(u8, c.reason, reason)) return true;
-    return false;
-}
-
 test "settlement: unproven → proven; reorg → unproven (reverted) → re-proven" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -961,11 +956,10 @@ test "settlement: unproven → proven; reorg → unproven (reverted) → re-prov
     var w = try lib.wallet.Wallet.load(a, s, p.state, .regtest);
     try std.testing.expectEqual(lib.wallet.Status.unproven, try w.status(p.pay_txid));
     try std.testing.expect(try w.map("unproven").has(&p.pay_txid));
-    // Mined alone at 1002: proven, and a settlement change for the watchers.
+    // Mined alone at 1002: proven.
     const h1002 = mine(hdr.hash(&p.h1001), p.pay_txid, 1_700_001_800);
     _ = try w.addHeaders(&.{&h1002});
     try std.testing.expectEqual(lib.wallet.Status.proven, try w.addProof(p.pay_txid, try soloPath(a, 1002, p.pay_txid)));
-    try std.testing.expect(hasChange(&w, p.pay_txid, .proven, "mined"));
     const proven_state = try w.save();
     try std.testing.expect(!(try w.map("unproven").has(&p.pay_txid))); // proven: it leaves the settlement index
 
@@ -977,7 +971,6 @@ test "settlement: unproven → proven; reorg → unproven (reverted) → re-prov
     try std.testing.expectEqual(lib.wallet.Status.unproven, try w2.status(p.pay_txid));
     try std.testing.expectEqual(@as(usize, 1), w2.reverted.items.len);
     try std.testing.expectEqualSlices(u8, &p.pay_txid, &w2.reverted.items[0]);
-    try std.testing.expect(hasChange(&w2, p.pay_txid, .unproven, "reorg"));
     _ = try w2.save();
     try std.testing.expect(try w2.map("unproven").has(&p.pay_txid)); // reverted: back in it
     // The old proof is no longer accepted against the new chain; the new block's is.
@@ -985,7 +978,6 @@ test "settlement: unproven → proven; reorg → unproven (reverted) → re-prov
     const alt3 = mine(hdr.hash(&alt2), p.pay_txid, 1_700_001_803);
     _ = try w2.addHeaders(&.{&alt3});
     try std.testing.expectEqual(lib.wallet.Status.proven, try w2.addProof(p.pay_txid, try soloPath(a, 1004, p.pay_txid)));
-    try std.testing.expect(hasChange(&w2, p.pay_txid, .proven, "mined"));
     // A proven transaction is never rejected.
     try std.testing.expectEqual(@as(usize, 0), (try w2.reject(p.pay_txid, "REJECTED")).len);
     try std.testing.expectEqual(lib.wallet.Status.proven, try w2.status(p.pay_txid));
@@ -1044,8 +1036,6 @@ test "settlement: a rejection bubbles through spends and drafts; inputs freed; m
     try std.testing.expectEqualStrings("input-rejected", sb.getText("reason").?);
     try std.testing.expectEqualStrings(&hdr.toHex(ca.txid), sb.getText("cause").?);
     try std.testing.expectEqual(@as(u64, 5000), sb.getUint("at").?);
-    try std.testing.expect(hasChange(&w, ca.txid, .rejected, "DOUBLE_SPEND_ATTEMPTED"));
-    try std.testing.expect(hasChange(&w, cb.txid, .rejected, "input-rejected"));
     const after = try w.save();
     const def = try w.listOutputs("default", true);
     try std.testing.expectEqual(@as(usize, 1), def.len);

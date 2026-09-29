@@ -19,7 +19,6 @@
 //!   {op: "createAction", description, outputs, labels?, options?: {signAndProcess?, noSend?}}   BRC-100 createAction
 //!   {op: "signAction", reference}                BRC-100 signAction for a draft (signAndProcess: false)
 //!   {op: "list", basket?, includeSpent?}        our outputs in a basket (default "default")
-//!   {op: "watch", settlement?: bool}            the sender opts in (default) or out of settlement messages
 //!
 //! Plain entries (docs/WALLET.md): {kind: "header", raw}, {kind: "proof",
 //! subject, txid, path}, {kind: "status", subject, txid, txStatus, merklePath?}.
@@ -33,12 +32,12 @@
 //! defaults.walletAbandonMs of its broadcast is abandoned (rejected); a reorg
 //! that turns ours back to unproven broadcasts them again and awaits them.
 //!
-//! Settlement (#37): every change of a transaction of ours (proven,
-//! unproven after a reorg, rejected — with what the rejection bubbled to) is
-//! sent as a `{kind: "settlement", txid, status, reason, cause?}` message to
-//! each identity that opted in (`watch`), in its `settlement` box. A
-//! result record names the transactions it is about as `refs` with rel
-//! `mentions` (kernel edges; a mention never propagates a rejection).
+//! Settlement (#37) is state to read, not an event to deliver: a `status`
+//! entry that rejects a transaction writes its settlement record and walks
+//! what depended on it (wallet.zig `reject`); nothing is sent anywhere —
+//! whoever cares reads the state when it next acts. A result record names
+//! the transactions it is about as `refs` with rel `mentions` (kernel
+//! edges; a mention never propagates a rejection).
 const std = @import("std");
 const w = @import("wallet");
 
@@ -413,13 +412,6 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "outputs", .value = .{ .array = items } },
             .{ .key = "total", .value = .{ .uint = total } },
         });
-    } else if (std.mem.eql(u8, op, "watch")) {
-        // The sender opts in (or out) of settlement messages in its `settlement` box.
-        const sender = args.getBytes("sender") orelse return error.BadBody;
-        if (sender.len != 33) return error.BadBody;
-        const on = body.getBool("settlement") orelse true;
-        try wal.watch(sender[0..33].*, on);
-        try out.append(a, .{ .key = "settlement", .value = .{ .boolean = on } });
     } else {
         std.log.err("unknown op {s}", .{op});
         return error.BadBody;
@@ -450,18 +442,6 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "awaiting", .value = .{ .boolean = true } },
         });
     }
-    // Settlement changes: in the result, and to each watcher's `settlement` box.
-    if (wal.changes.items.len > 0) {
-        const items = try a.alloc(Value, wal.changes.items.len);
-        for (wal.changes.items, items) |c, *it| it.* = try settlementBody(a, c);
-        try out.append(a, .{ .key = "settlement", .value = .{ .array = items } });
-        const watchers = try wal.watchers();
-        var sent: u64 = 0;
-        for (watchers) |to| for (items) |it| {
-            if (try sendTo(a, s, step, to, "settlement", it)) sent += 1;
-        };
-        if (watchers.len > 0) try out.append(a, .{ .key = "sent", .value = .{ .uint = sent } });
-    }
     // The transactions this result is about, as `mentions` (kernel edges from the thread).
     {
         var named: std.ArrayList([32]u8) = .empty;
@@ -469,7 +449,6 @@ fn run(a: std.mem.Allocator) !void {
             const t = w.header.fromHex(e.value.text) catch continue;
             if (!contains(named.items, t)) try named.append(a, t);
         };
-        for (wal.changes.items) |c| if (!contains(named.items, c.txid)) try named.append(a, c.txid);
         if (named.items.len > 0) {
             const refs = try a.alloc(Value, named.items.len);
             for (named.items, refs) |t, *r| r.* = .{ .map = try a.dupe(cbor.Entry, &.{
@@ -546,67 +525,6 @@ fn rebroadcast(a: std.mem.Allocator, wal: *w.wallet.Wallet, arc_url: ?[]const u8
         const ans = try arcCall(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), beef);
         if ((try wal.applyStatus(t, ans.tx_status, ans.merkle_path)) == .pending and !contains(await_txs.items, t)) try await_txs.append(a, t);
     }
-}
-
-/// What the `settlement` box is sent: {kind: "settlement", txid, status, reason, cause?}.
-fn settlementBody(a: std.mem.Allocator, c: w.wallet.Change) !Value {
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.appendSlice(a, &.{
-        .{ .key = "kind", .value = .{ .text = "settlement" } },
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(c.txid)) } },
-        .{ .key = "status", .value = .{ .text = @tagName(c.status) } },
-        .{ .key = "reason", .value = .{ .text = c.reason } },
-    });
-    if (c.cause) |x| try es.append(a, .{ .key = "cause", .value = .{ .text = try a.dupe(u8, &w.header.toHex(x)) } });
-    return .{ .map = es.items };
-}
-
-var identity_key: ?[33]u8 = null;
-
-/// This instance's identity key, from the oracle (once per step).
-fn identity(a: std.mem.Allocator) ![33]u8 {
-    if (identity_key) |k| return k;
-    const frame = try w.wire.identityKeyFrame(a);
-    const res = try result(a, sk.wallet, .{ frame.ptr, @as(u32, @intCast(frame.len)) });
-    identity_key = try w.wire.publicKeyResult(res);
-    return identity_key.?;
-}
-
-/// ISO 8601 of a time in ms since the epoch (as JavaScript's toISOString).
-fn isoTime(a: std.mem.Allocator, ms: i64) ![]u8 {
-    const secs: u64 = @intCast(@divFloor(ms, 1000));
-    const es = std.time.epoch.EpochSeconds{ .secs = secs };
-    const yd = es.getEpochDay().calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = es.getDaySeconds();
-    return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{ yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(), @as(u64, @intCast(@mod(ms, 1000))) });
-}
-
-/// Send `body` to identity `to` in `box` (#40): the messagebox program
-/// delivers it over http (an in-VM call; its http calls are this step's,
-/// recorded). True if it was delivered; a failure is logged on stderr and the
-/// step goes on (a watcher that cannot be reached misses a settlement message).
-fn sendTo(a: std.mem.Allocator, s: w.store.Store, step: Value, to: [33]u8, box: []const u8, body: Value) !bool {
-    const bc = try s.putValue(a, body);
-    const plain = try s.get(a, bc);
-    const progs = step.get("programs") orelse return false;
-    const mb = switch (progs.get("messagebox") orelse return false) {
-        .cid => |x| x,
-        else => return false,
-    };
-    const arg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "to", .value = .{ .bytes = try a.dupe(u8, &to) } },
-        .{ .key = "box", .value = .{ .text = box } },
-        .{ .key = "body", .value = .{ .bytes = plain } },
-    }) });
-    _ = result(a, sk.call, .{ mb.ptr, @as(u32, @intCast(mb.len)), "send".ptr, @as(u32, 4), arg.ptr, @as(u32, @intCast(arg.len)) }) catch |err| {
-        if (err != error.ImportFailed) return err;
-        var buf: [1200]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "wallet: {s} to {s}: {s}\n", .{ box, std.fmt.bytesToHex(to, .lower)[58..], last_error[0..last_error_len] }) catch "wallet: send failed\n";
-        std.fs.File.stderr().writeAll(line) catch {};
-        return false;
-    };
-    return true;
 }
 
 const ArcAnswer = struct {
