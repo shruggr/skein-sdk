@@ -1,8 +1,11 @@
 //! The `skein` import namespace for the Zig programs (the front door, the
-//! messagebox, resolve): preview1 imports with f(…, out, cap) → n and `take`
-//! for a result that did not fit (kernel-zig/src/program.zig), wrapped so a
-//! program says `sk.get(a, cid)` and gets the bytes or an error whose
-//! message `lastError()` holds.
+//! messagebox, resolve, and the handlers: run, objects, head, subscribe, the
+//! loop): preview1 imports with f(…, out, cap) → n and `take` for a result
+//! that did not fit (kernel-zig/src/program.zig), wrapped so a program says
+//! `sk.get(a, cid)` and gets the bytes or an error whose message
+//! `lastError()` holds. Below the imports, what a handler builds on them:
+//! its thread's kept records, messages, delivery through the messagebox's
+//! `send`, the address book and resolving a handle, and trees.
 const std = @import("std");
 const cbor = @import("cbor");
 
@@ -24,6 +27,7 @@ pub const raw = struct {
     pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
     pub extern "skein" fn head(name: [*]const u8, name_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
+    pub extern "skein" fn subscribe(op: [*]const u8, op_len: u32, sender: [*]const u8, sender_len: u32, box: [*]const u8, box_len: u32, handler: [*]const u8, handler_len: u32) i32;
     pub extern "skein" fn wallet(frame: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn libp2p(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
@@ -102,6 +106,8 @@ pub fn putBlock(c: []const u8, bytes: []const u8) !void {
     if (raw.putblock(c.ptr, n32(c.len), bytes.ptr, n32(bytes.len)) < 0) return failed();
 }
 
+/// Keep a stored record in the thread's state: it is listed in this step's
+/// update, so later steps find it with `kept` from the step's tip.
 pub fn keep(c: []const u8) !void {
     if (raw.keep(c.ptr, n32(c.len)) < 0) return failed();
 }
@@ -118,6 +124,22 @@ pub fn head(a: Allocator, name: []const u8) !?[]u8 {
 
 pub fn advance(name: []const u8, c: []const u8) !void {
     if (raw.advance(name.ptr, n32(name.len), c.ptr, n32(c.len)) < 0) return failed();
+}
+
+/// Launch a thread running `prog` (a program record) with the record `args`
+/// as its arguments; its origin CID. The thread starts when this step ends,
+/// and this step's thread then waits on it.
+pub fn launch(a: Allocator, prog: []const u8, args: []const u8) ![]u8 {
+    return result(a, raw.launch, .{ prog.ptr, n32(prog.len), args.ptr, n32(args.len) });
+}
+
+/// Change the instance's subscriptions when this step ends without error
+/// (docs/VM.md, "Subscriptions"): op "add" appends the rule (sender, box) →
+/// handler, "remove" deletes it. No sender is any sender (else the identity
+/// key's 33 bytes); the handler is a program record in the store.
+pub fn subscribe(op: []const u8, sender: ?[]const u8, box: []const u8, handler: []const u8) !void {
+    const s = sender orelse "";
+    if (raw.subscribe(op.ptr, n32(op.len), s.ptr, n32(s.len), box.ptr, n32(box.len), handler.ptr, n32(handler.len)) < 0) return failed();
 }
 
 /// A BRC-100 wire frame to the oracle → its result frame.
@@ -206,4 +228,256 @@ var reported: []const u8 = "";
 pub fn report(msg: []const u8) error{Reported} {
     reported = msg;
     return error.Reported;
+}
+
+/// The message of an error from this lib: an import's (`lastError`), a
+/// report's, else the error's name.
+pub fn errorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ImportFailed => lastError(),
+        error.Reported => reported,
+        else => @errorName(err),
+    };
+}
+
+/// Fail with "prefix: <err's message>" (a wrapped error).
+pub fn wrap(a: Allocator, prefix: []const u8, err: anyerror) anyerror {
+    if (err == error.OutOfMemory) return err;
+    return report(try std.fmt.allocPrint(a, "{s}: {s}", .{ prefix, errorText(err) }));
+}
+
+/// An import's failure as the program's error: its message alone.
+pub fn plain(err: anyerror) anyerror {
+    return if (err == error.ImportFailed) report(lastError()) else err;
+}
+
+// ---------------------------------------------------------------- a thread's own records
+
+/// Every record the thread's steps kept, walking its chain from `tip` (the
+/// input's `tip`) back to its origin, oldest first.
+pub fn kept(a: Allocator, tip: []const u8) ![]const []const u8 {
+    var chain = std.array_list.Managed([]const Value).init(a);
+    var c: []const u8 = tip;
+    while (c.len > 0) {
+        const u = try get(a, c);
+        const seq = Value.intOf(u.get("seq")) orelse 0;
+        if (seq < 1) break; // the origin
+        try chain.append(if (u.get("kept")) |k| (if (k == .array) k.array else &.{}) else &.{});
+        c = Value.cidOf(u.get("prev")) orelse "";
+    }
+    var out = std.array_list.Managed([]const u8).init(a);
+    var i = chain.items.len;
+    while (i > 0) {
+        i -= 1;
+        for (chain.items[i]) |k| if (Value.cidOf(k)) |x| try out.append(x);
+    }
+    return out.items;
+}
+
+// ---------------------------------------------------------------- messages
+
+/// An identity key as records hold it (#33): its 33 bytes, or hex text (a
+/// JSON-form sender, kept as the sender made it); null when absent or null.
+pub fn keyOf(a: Allocator, v: ?Value) !?[]const u8 {
+    const x = v orelse return null;
+    return switch (x) {
+        .null => null,
+        .bytes => |b| b,
+        .string => |s| unhex(a, s) orelse report(try std.fmt.allocPrint(a, "identity key \"{s}\": not hex", .{s})),
+        else => report("identity key: want bytes or hex"),
+    };
+}
+
+/// A message record (#40): {kind, op, sender, recipient, box, body, json?}.
+/// Its CID is the message's id, what a reply's replyTo names.
+pub fn readMessage(a: Allocator, message: []const u8) !Value {
+    const b = getBytes(a, message) catch |e| return wrap(a, "get message", e);
+    const m = cbor.decode(a, b) catch return report("message record: not dag-cbor");
+    if (m != .map) return report("message record: not a map");
+    return m;
+}
+
+/// A message's body record (dag-cbor), after reading the message itself.
+pub fn readBody(a: Allocator, message: []const u8, body: []const u8) !Value {
+    _ = try readMessage(a, message);
+    const b = getBytes(a, body) catch |e| return wrap(a, "get body", e);
+    return cbor.decode(a, b) catch report("body: not dag-cbor");
+}
+
+/// Whether a delivery failed for a reason that may pass (no answer, 5xx,
+/// 408, 425, 429): the messagebox and resolve mark those "transient: …".
+pub fn transient(msg: []const u8) bool {
+    return std.mem.indexOf(u8, msg, "transient: ") != null;
+}
+
+/// Deliver `body` to identity `to` in `box`: the messagebox program's `send`
+/// over http (#40), recorded with this step. The peer's messagebox URL comes
+/// from the address book; `handle`/`domain`, when the handle is given,
+/// resolve it on first contact. Its answer is the message's id — the record
+/// a reply's replyTo names, which the caller may `awaitRecord`.
+pub fn send(a: Allocator, in: Value, to: []const u8, box: []const u8, body: Value, handle: []const u8, domain: []const u8) ![]const u8 {
+    const mb = program(in, "messagebox") orelse return report("send: no messagebox program in the genesis");
+    var arg = cbor.MapBuilder.init(a);
+    try arg.put("to", .{ .bytes = to });
+    try arg.put("box", .{ .string = box });
+    try arg.put("body", .{ .bytes = try cbor.encode(a, body) });
+    if (handle.len > 0) {
+        try arg.put("handle", .{ .string = handle });
+        try arg.put("domain", .{ .string = domain });
+    }
+    const out = try call(a, mb, "send", try cbor.encode(a, arg.value()));
+    const r = cbor.decode(a, out) catch return report("send: the answer is not dag-cbor");
+    return Value.cidOf(r.get("id")) orelse report("send: the answer names no id");
+}
+
+/// The address book (#40, the head `peers`, written by the resolve program):
+/// its peer records {kind: "peer", key, url, handle?, domain?, since,
+/// source}, this step's own writes included.
+pub fn peers(a: Allocator) ![]const Value {
+    const root = (try head(a, "peers")) orelse return &.{};
+    const t = try get(a, root);
+    const list = t.get("peers") orelse return &.{};
+    if (list != .array) return report("peers: not a list");
+    const out = try a.alloc(Value, list.array.len);
+    for (list.array, out) |x, *o| {
+        o.* = try get(a, Value.cidOf(x.get("peer")) orelse return report("peers: an entry names no peer record"));
+    }
+    return out;
+}
+
+/// Resolve a BRC-169 handle to its identity key: the address book's record
+/// for it, else the resolve program's lookup (an in-VM call whose http calls
+/// are recorded with this step, and which writes the peer record).
+pub fn resolve(a: Allocator, in: Value, handle: []const u8, domain: []const u8) ![]const u8 {
+    for (try peers(a)) |p| {
+        if (std.mem.eql(u8, Value.str(p.get("handle")) orelse "", handle) and std.mem.eql(u8, Value.str(p.get("domain")) orelse "", domain)) {
+            if (try keyOf(a, p.get("key"))) |k| return k;
+        }
+    }
+    const rp = program(in, "resolve") orelse return report(try std.fmt.allocPrint(a, "resolve @{s}@{s}: no resolve program in the genesis", .{ handle, domain }));
+    var q = cbor.MapBuilder.init(a);
+    try q.put("handle", .{ .string = handle });
+    try q.put("domain", .{ .string = domain });
+    const p = try callValue(a, rp, "resolve", q.value());
+    return (try keyOf(a, p.get("key"))) orelse report("resolve: the peer record names no key");
+}
+
+// ---------------------------------------------------------------- trees
+
+// Trees are git objects byte for byte (kernel-zig/src/tree.zig): "tree
+// <len>\0" then entries "<mode> <name>\0<20-byte sha1>"; a file is "blob
+// <len>\0<bytes>". An entry's CID is CIDv1 git-raw (0x78) sha1 (0x11) over
+// its sha1.
+
+/// The empty tree: the object "tree 0\0" under CIDv1(git-raw, sha1).
+pub const empty_tree_object = "tree 0\x00";
+pub const empty_tree = [_]u8{ 0x01, 0x78, 0x11, 0x14 } ++ [_]u8{ 0x4b, 0x82, 0x5d, 0xc6, 0x42, 0xcb, 0x6e, 0xb9, 0xa0, 0x60, 0xe5, 0x4b, 0xf8, 0xd6, 0x92, 0x88, 0xfb, 0xee, 0x49, 0x04 };
+
+/// Put the empty tree into the store (so it can be run over).
+pub fn putEmptyTree() !void {
+    try putBlock(&empty_tree, empty_tree_object);
+}
+
+/// The tree a `run` that names none starts from: the `main` head's, else
+/// the empty tree (put into the store).
+pub fn startTree(a: Allocator) ![]const u8 {
+    if (try head(a, "main")) |t| return t;
+    try putEmptyTree();
+    return &empty_tree;
+}
+
+/// A git object's body, after checking its header "<kind> <len>\0".
+fn gitBody(obj: []const u8, kind: []const u8) ?[]const u8 {
+    const nul = std.mem.indexOfScalar(u8, obj, 0) orelse return null;
+    const h = obj[0..nul];
+    if (!std.mem.startsWith(u8, h, kind) or h.len < kind.len + 2 or h[kind.len] != ' ') return null;
+    const digits = h[kind.len + 1 ..];
+    for (digits) |d| if (d < '0' or d > '9') return null;
+    const n = std.fmt.parseInt(usize, digits, 10) catch return null;
+    if (n != obj.len - nul - 1) return null;
+    return obj[nul + 1 ..];
+}
+
+pub const TreeEntry = struct { mode: []const u8, name: []const u8, cid: []const u8 };
+
+/// A tree record's entries.
+pub fn readTree(a: Allocator, tree: []const u8) ![]const TreeEntry {
+    var b = gitBody(try getBytes(a, tree), "tree") orelse return report("not a git tree");
+    var out = std.array_list.Managed(TreeEntry).init(a);
+    while (b.len > 0) {
+        const sp = std.mem.indexOfScalar(u8, b, ' ') orelse return report("truncated git tree");
+        const z = std.mem.indexOfScalar(u8, b, 0) orelse return report("truncated git tree");
+        if (z < sp or z + 21 > b.len) return report("truncated git tree");
+        const c = try a.alloc(u8, 24);
+        @memcpy(c[0..4], empty_tree[0..4]);
+        @memcpy(c[4..], b[z + 1 .. z + 21]);
+        try out.append(.{ .mode = b[0..sp], .name = b[sp + 1 .. z], .cid = c });
+        b = b[z + 21 ..];
+    }
+    return out.items;
+}
+
+/// The content of the regular file at `path` ("a/b.md") in `tree`; null when
+/// there is no such file (a missing entry, or not a file).
+pub fn readFile(a: Allocator, tree: []const u8, path: []const u8) !?[]const u8 {
+    var at = tree;
+    var segs = std.mem.splitScalar(u8, std.mem.trim(u8, path, "/"), '/');
+    while (segs.next()) |seg| {
+        const last = segs.peek() == null;
+        const found = for (try readTree(a, at)) |e| {
+            if (std.mem.eql(u8, e.name, seg)) break e;
+        } else return null;
+        if (!last and !std.mem.eql(u8, found.mode, "40000")) return null;
+        if (last and !std.mem.eql(u8, found.mode, "100644") and !std.mem.eql(u8, found.mode, "100755")) return null;
+        at = found.cid;
+    }
+    return gitBody(try getBytes(a, at), "blob") orelse report("not a git blob");
+}
+
+// ---------------------------------------------------------------- reading records as the handlers' shapes
+
+/// A text field of a record: "" when absent or null; another type is an error.
+pub fn textField(v: Value, key: []const u8) ![]const u8 {
+    const x = v.get(key) orelse return "";
+    return switch (x) {
+        .null => "",
+        .string => |s| s,
+        else => fieldError(key, "a string"),
+    };
+}
+
+/// A link field of a record: its CID, "" when absent or null; another type is an error.
+pub fn linkField(v: Value, key: []const u8) ![]const u8 {
+    const x = v.get(key) orelse return "";
+    return switch (x) {
+        .null => "",
+        .cid => |c| c,
+        else => fieldError(key, "a CID"),
+    };
+}
+
+/// An integer field of a record: 0 when absent or null; another type is an error.
+pub fn intField(v: Value, key: []const u8) !i128 {
+    const x = v.get(key) orelse return 0;
+    return switch (x) {
+        .null => 0,
+        .int => |i| i,
+        else => fieldError(key, "an integer"),
+    };
+}
+
+/// A list field of a record: empty when absent or null; another type is an error.
+pub fn listField(v: Value, key: []const u8) ![]const Value {
+    const x = v.get(key) orelse return &.{};
+    return switch (x) {
+        .null => &.{},
+        .array => |l| l,
+        else => fieldError(key, "a list"),
+    };
+}
+
+var field_error: [160]u8 = undefined;
+
+fn fieldError(key: []const u8, want: []const u8) error{Reported} {
+    return report(std.fmt.bufPrint(&field_error, "{s}: not {s}", .{ key[0..@min(key.len, 100)], want }) catch "a field of the wrong type");
 }
