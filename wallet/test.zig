@@ -226,7 +226,8 @@ test "merkle nodes: every vector path's nodes stored; each leaf's BUMP rebuilt f
         for (arr(c, "leaves")) |l| {
             const txid = try hdr.fromHex(str(l, "txid"));
             try std.testing.expectEqualStrings(str(l, "root"), &hdr.toHex(rev.root));
-            const rebuilt = (try lib.merkle.pathFor(a, ms.store(), rev.root, p.block_height, txid)) orelse return error.NotRebuilt;
+            const pos = lib.merkle.positionIn(p, txid) orelse return error.NotInPath;
+            const rebuilt = (try lib.merkle.pathFor(a, ms.store(), rev.root, p.block_height, txid, pos)) orelse return error.NotRebuilt;
             try std.testing.expectEqual(p.block_height, rebuilt.block_height);
             try std.testing.expectEqualSlices(u8, &rev.root, &(beef.rootFor(a, rebuilt, txid) orelse return error.NoRoot));
             counts.path += 1;
@@ -306,6 +307,19 @@ test "merkle nodes: three transactions of one regtest block, proven by separate 
             try std.testing.expectEqualSlices(u8, &root, &beef.rootFor(a, got, leaves[@intCast(i)]).?);
         }
         try std.testing.expect((try w.proofFor(leaves[0])) == null); // never proven here
+        // The proof record holds the leaf's position (#42, decided 2026-09-30): the descent from the
+        // root turns by its bits, one node read per level (the tree's depth, 3), no search — and the
+        // siblings read are the BUMP, byte for byte.
+        for (picks, bumps) |i, b| {
+            const rec = (try w.proofRecord(leaves[@intCast(i)])).?;
+            try std.testing.expectEqual(lib.merkle.Position{ .depth = 3, .offset = i }, rec.pos);
+            var cs = CountingStore{ .inner = ms.store() };
+            const got = (try lib.merkle.pathFor(a, cs.store(), root, 1002, leaves[@intCast(i)], rec.pos)).?;
+            try std.testing.expectEqual(tree.len - 1, cs.reads);
+            try std.testing.expectEqualStrings(try hexOf(a, try b.bytes(a)), try hexOf(a, try got.bytes(a)));
+            // Another position is not this transaction's: the descent ends elsewhere (or at a node not held).
+            try std.testing.expect((try lib.merkle.pathFor(a, ms.store(), root, 1002, leaves[@intCast(i)], .{ .depth = 3, .offset = i ^ 2 })) == null);
+        }
     }
     // Only the paths to the three: the root, the level below it, and the nodes above the three leaves.
     // Levels 7 → 4 → 2 → 1: the leaf pairs of 1, 4, 6 (three nodes), both nodes above them, the root.
@@ -1324,15 +1338,18 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
 
 // ---------------------------------------------------------------- index cost (#41)
 
-/// A store that counts what is written through it (every put / putblock call).
+/// A store that counts what is written through it (every put / putblock
+/// call) and what is read (every get).
 const CountingStore = struct {
     inner: lib.store.Store,
     puts: usize = 0,
+    reads: usize = 0,
     fn store(self: *CountingStore) lib.store.Store {
         return .{ .ptr = self, .getFn = get, .putFn = put, .putBlockFn = putBlock, .keepFn = keep, .edgesFn = edges };
     }
     fn get(ptr: *anyopaque, arena: std.mem.Allocator, cid: []const u8) anyerror![]const u8 {
         const self: *CountingStore = @ptrCast(@alignCast(ptr));
+        self.reads += 1;
         return self.inner.get(arena, cid);
     }
     // Keeping writes no block (the kernel's edges are its index, not the wallet's).

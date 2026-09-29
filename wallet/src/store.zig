@@ -37,29 +37,21 @@ pub fn decodeEdges(arena: std.mem.Allocator, bytes: []const u8) ![]const Edge {
     return out;
 }
 
-/// The links of a bitcoin block (kernel-zig/src/bitcoin.zig `links`, #42) —
-/// for MemStore, which stands in for the kernel's index in native tests:
-/// inputs `spends` (locator = vout; a coinbase input links nothing), a
-/// header `prev` / `merkleroot`, a merkle node `child` 0 / 1. None for a
-/// block that is not bitcoin or does not parse.
+/// The edges a kept bitcoin block contributes (kernel-zig/src/bitcoin.zig
+/// `edgesOf`, #42) — for MemStore, which stands in for the kernel's index in
+/// native tests: a transaction's inputs `spends` (locator = vout; a coinbase
+/// input links nothing). None for a header or a merkle node (#42 decided
+/// 2026-09-30: nothing asks the reverse questions), nor for a block that is
+/// not bitcoin or does not parse.
 pub const Link = struct { to: [37]u8, rel: []const u8, locator: cbor.Value };
-pub fn bitcoinLinks(arena: std.mem.Allocator, cid: []const u8, bytes: []const u8) ![]Link {
+pub fn bitcoinEdges(arena: std.mem.Allocator, cid: []const u8, bytes: []const u8) ![]Link {
     var out: std.ArrayList(Link) = .empty;
-    if (bitcoinHash(cid) == null) return out.items;
-    if (cid[1] == @intFromEnum(Codec.block)) {
-        if (bytes.len != 80) return out.items;
-        if (!std.mem.allEqual(u8, bytes[4..36], 0)) try out.append(arena, .{ .to = hashCid(.block, bytes[4..36].*), .rel = "prev", .locator = .null });
-        try out.append(arena, .{ .to = hashCid(.tx, bytes[36..68].*), .rel = "merkleroot", .locator = .null });
-    } else if (bytes.len == 64) {
-        try out.append(arena, .{ .to = hashCid(.tx, bytes[0..32].*), .rel = "child", .locator = .{ .uint = 0 } });
-        try out.append(arena, .{ .to = hashCid(.tx, bytes[32..64].*), .rel = "child", .locator = .{ .uint = 1 } });
-    } else {
-        const tx = bsvz.transaction.Transaction.parse(arena, bytes) catch return out.items;
-        for (tx.inputs) |in| {
-            const prev = in.previous_outpoint;
-            if (prev.index == 0xffffffff and std.mem.allEqual(u8, &prev.txid.bytes, 0)) continue;
-            try out.append(arena, .{ .to = hashCid(.tx, prev.txid.bytes), .rel = "spends", .locator = .{ .uint = prev.index } });
-        }
+    if (bitcoinHash(cid) == null or cid[1] == @intFromEnum(Codec.block) or bytes.len == 64) return out.items;
+    const tx = bsvz.transaction.Transaction.parse(arena, bytes) catch return out.items;
+    for (tx.inputs) |in| {
+        const prev = in.previous_outpoint;
+        if (prev.index == 0xffffffff and std.mem.allEqual(u8, &prev.txid.bytes, 0)) continue;
+        try out.append(arena, .{ .to = hashCid(.tx, prev.txid.bytes), .rel = "spends", .locator = .{ .uint = prev.index } });
     }
     return out.items;
 }
@@ -193,7 +185,7 @@ pub const MemStore = struct {
         try self.kept.put(self.gpa, try self.gpa.dupe(u8, cid), {});
         var tmp = std.heap.ArenaAllocator.init(self.gpa);
         defer tmp.deinit();
-        for (try bitcoinLinks(tmp.allocator(), cid, self.blocks.get(cid).?), 0..) |l, i| {
+        for (try bitcoinEdges(tmp.allocator(), cid, self.blocks.get(cid).?), 0..) |l, i| {
             // rel is a literal; a locator is a uint or null: nothing borrowed from tmp.
             try self.edge_rows.append(self.gpa, .{ .to = l.to, .from = cid[0..37].*, .ord = @intCast(i), .rel = l.rel, .locator = l.locator });
         }

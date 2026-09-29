@@ -13,8 +13,10 @@
 //!   transaction of the block and every merge: two BUMPs of one block give
 //!   one set of blocks, deduplicated by CID, whatever order they arrive in.
 //! - A proof is rebuilt on demand (`pathFor`): from the root, one node per
-//!   level down to the transaction, emitting each level's sibling — a BUMP
-//!   again, the minimal one for that transaction.
+//!   level down to the transaction, turning by the bits of its leaf position
+//!   (`Position`, recorded in the wallet's `proofs` when the proof arrived:
+//!   #42, decided 2026-09-30) — no search — emitting each level's sibling: a
+//!   BUMP again, the minimal one for that transaction.
 //! - Verification is the DAG itself: a node's hash is the hash of its children.
 const std = @import("std");
 const bsvz = @import("bsvz");
@@ -98,7 +100,8 @@ fn take(m: *std.AutoArrayHashMap(u64, [32]u8), dup: *std.AutoHashMap(u64, void),
 }
 
 /// Put the nodes (hash-checked by the store; one already held is the same
-/// block) and keep them: their `child` links are in the kernel's edges (#42).
+/// block) and keep them. They contribute no edges (#42, decided 2026-09-30):
+/// a proof is read downward from the root, never up from a leaf.
 pub fn putNodes(s: Store, nodes: []const Node) !void {
     for (nodes) |n| {
         const c = nodeCid(n.hash);
@@ -115,29 +118,58 @@ pub fn node(a: std.mem.Allocator, s: Store, hash: [32]u8) !?[64]u8 {
     return b[0..64].*;
 }
 
-const Step = struct { bit: u1, sibling: [32]u8, dup: bool };
+const Step = struct { sibling: [32]u8, dup: bool };
 
-/// The BUMP for `txid` in the block at `block_height` whose merkle root is
-/// `root`, rebuilt from the nodes we hold: from the root, one node per level
-/// (a child we hold is a node; the transaction is a leaf), each level's
-/// sibling emitted; its offset is the path's left/right turns. Null when the
-/// nodes we hold do not reach the transaction.
-pub fn pathFor(a: std.mem.Allocator, s: Store, root: [32]u8, block_height: u32, txid: [32]u8) !?MerklePath {
+/// Where a transaction sits in its block's tree: the BUMP's height (the
+/// tree's depth, its levels below the root) and the leaf's offset (BRC-74:
+/// its index among the block's transactions). Recorded in `proofs` when the
+/// proof arrives (#42, decided 2026-09-30), so a proof is rebuilt by descent.
+pub const Position = struct { depth: u8, offset: u64 };
+
+/// The position a BUMP gives `txid`: its leaf's offset at level 0, the
+/// BUMP's height as the depth. Null when the BUMP does not hold it.
+pub fn positionIn(p: MerklePath, txid: [32]u8) ?Position {
+    if (p.path.len == 0 or p.path.len > 64) return null;
+    for (p.path[0]) |leaf| if (leaf.hash) |h| if (std.mem.eql(u8, &h.bytes, &txid)) return .{ .depth = @intCast(p.path.len), .offset = leaf.offset };
+    return null;
+}
+
+/// The BUMP for `txid` at `pos` in the block at `block_height` whose merkle
+/// root is `root`, rebuilt from the nodes we hold: from the root, one node
+/// read per level, turning by the offset's bits (most significant first), no
+/// search; the siblings read on the way are the BUMP (a right sibling equal
+/// to the left is BRC-74's duplicate). Null when a node on the way is not
+/// held, or the descent does not end at `txid`. A one-transaction block:
+/// the root is the txid, no read.
+pub fn pathFor(a: std.mem.Allocator, s: Store, root: [32]u8, block_height: u32, txid: [32]u8, pos: Position) !?MerklePath {
     if (std.mem.eql(u8, &root, &txid)) {
+        if (pos.offset != 0) return null;
         const level = try a.alloc(PathElement, 1);
         level[0] = .{ .offset = 0, .hash = .{ .bytes = txid }, .txid = true };
         const levels = try a.alloc([]PathElement, 1);
         levels[0] = level;
         return .{ .block_height = block_height, .path = levels };
     }
-    var trail: std.ArrayList(Step) = .empty;
-    if (!try find(a, s, root, txid, &trail)) return null;
-    const h = trail.items.len;
-    var offset: u64 = 0;
-    for (trail.items) |st| offset = offset * 2 + st.bit;
+    const h: usize = pos.depth;
+    if (h == 0 or h > 64) return null;
+    if (h < 64 and pos.offset >> @intCast(h) != 0) return null;
+    const offset = pos.offset;
+    const trail = try a.alloc(Step, h); // root level first
+    var cur = root;
+    for (trail, 0..) |*st, level| {
+        const n = (try node(a, s, cur)) orelse return null;
+        const left: [32]u8 = n[0..32].*;
+        const right: [32]u8 = n[32..64].*;
+        const same = std.mem.eql(u8, &left, &right);
+        const bit: u1 = @truncate(offset >> @intCast(h - 1 - level));
+        if (bit == 1 and same) return null; // the duplicate right is no leaf of its own
+        st.* = .{ .sibling = if (bit == 0) right else left, .dup = bit == 0 and same };
+        cur = if (bit == 0) left else right;
+    }
+    if (!std.mem.eql(u8, &cur, &txid)) return null;
     const levels = try a.alloc([]PathElement, h);
     for (levels, 0..) |*lv, i| {
-        const st = trail.items[h - 1 - i];
+        const st = trail[h - 1 - i];
         const sib_off = (offset >> @intCast(i)) ^ 1;
         const sib: PathElement = if (st.dup) .{ .offset = sib_off, .duplicate = true } else .{ .offset = sib_off, .hash = .{ .bytes = st.sibling } };
         if (i == 0) {
@@ -146,22 +178,4 @@ pub fn pathFor(a: std.mem.Allocator, s: Store, root: [32]u8, block_height: u32, 
         } else lv.* = try a.dupe(PathElement, &.{sib});
     }
     return .{ .block_height = block_height, .path = levels };
-}
-
-/// Depth-first from `h` through the nodes we hold, to the leaf `txid`; the turns taken in `trail`.
-fn find(a: std.mem.Allocator, s: Store, h: [32]u8, txid: [32]u8, trail: *std.ArrayList(Step)) !bool {
-    if (trail.items.len >= 64) return false;
-    const n = (try node(a, s, h)) orelse return false;
-    const left: [32]u8 = n[0..32].*;
-    const right: [32]u8 = n[32..64].*;
-    const same = std.mem.eql(u8, &left, &right);
-    for ([_]u1{ 0, 1 }) |bit| {
-        if (bit == 1 and same) break; // the right is the left again: one subtree
-        const child = if (bit == 0) left else right;
-        try trail.append(a, .{ .bit = bit, .sibling = if (bit == 0) right else left, .dup = bit == 0 and same });
-        if (std.mem.eql(u8, &child, &txid)) return true;
-        if (try find(a, s, child, txid, trail)) return true;
-        _ = trail.pop();
-    }
-    return false;
 }

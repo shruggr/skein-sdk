@@ -56,7 +56,10 @@ pub const Oracle = struct {
 ///   headers   height (u32 BE) → header (bitcoin-block)       the best chain
 ///   heights   block hash → height                           the best chain, backwards
 ///   txs       txid → transaction (bitcoin-tx)               every transaction we hold
-///   proofs    txid → header (bitcoin-block link)             the block whose merkle tree holds it (merkle.zig)
+///   proofs    txid → {block, depth, position}               the block whose merkle tree holds it (a bitcoin-block
+///                                                           link) and where: the tree's depth and the leaf's
+///                                                           offset (uints; merkle.zig `Position`), from the BUMP
+///                                                           when the proof arrives (#42, decided 2026-09-30)
 ///   actions   txid → action record                          our transactions
 ///   outputs   txid ‖ vout (u32 BE) → output record           output by outpoint
 ///   awaiting  txid → broadcast record                       transactions awaiting a status callback
@@ -380,40 +383,66 @@ pub const Wallet = struct {
         const rev = try merkle.reveal(self.arena, p);
         if (!std.mem.eql(u8, &rev.root, &want)) return error.RootMismatch;
         try merkle.putNodes(self.store, rev.nodes);
-        try self.map("proofs").putLink(&txid, &store_mod.hashCid(.block, at.hash));
+        const pos = merkle.positionIn(p, txid) orelse return error.BadProof;
+        try self.putProofRecord(txid, at.hash, pos);
         try self.map("proofHeights").add(&(store_mod.be32(p.block_height) ++ txid));
         try self.resettle(txid);
     }
 
+    const ProofEntry = std.meta.Elem(@FieldType(store_mod.MValue, "map"));
+
+    /// `proofs[txid]` = {block, depth, position} (keys in canonical order).
+    fn putProofRecord(self: *Wallet, txid: [32]u8, block_hash: [32]u8, pos: merkle.Position) !void {
+        const block = try self.arena.dupe(u8, &store_mod.hashCid(.block, block_hash));
+        const es = try self.arena.dupe(ProofEntry, &.{
+            .{ .key = "block", .value = .{ .cid = block } },
+            .{ .key = "depth", .value = .{ .int = pos.depth } },
+            .{ .key = "position", .value = .{ .int = pos.offset } },
+        });
+        try self.map("proofs").put(&txid, .{ .map = es });
+    }
+
+    /// The proof record for a txid: its block's header CID and the leaf's position; null when unproven.
+    pub fn proofRecord(self: *Wallet, txid: [32]u8) !?struct { block: []const u8, pos: merkle.Position } {
+        const v = (try self.map("proofs").get(&txid)) orelse return null;
+        const block = if (v.get("block")) |b| (if (b == .cid) b.cid else return error.BadIndex) else return error.BadIndex;
+        const depth = if (v.get("depth")) |d| (if (d == .int and d.int >= 0 and d.int <= 64) d.int else return error.BadIndex) else return error.BadIndex;
+        const offset = if (v.get("position")) |o| (if (o == .int and o.int >= 0 and o.int <= std.math.maxInt(u64)) o.int else return error.BadIndex) else return error.BadIndex;
+        return .{ .block = block, .pos = .{ .depth = @intCast(depth), .offset = @intCast(offset) } };
+    }
+
     /// A proof whose merkle nodes are already held (#50: a submission's,
-    /// decoded into nodes and kept): the nodes must reach `txid` from our
-    /// best-chain header's merkle root at `height`; `proofs` names that
-    /// header. The same record as `putProof`, from the nodes instead of a path.
-    pub fn putProofAt(self: *Wallet, txid: [32]u8, height: u32) !void {
+    /// decoded into nodes and kept): the nodes must reach `txid` at `pos`
+    /// (its BUMP's) from our best-chain header's merkle root at `height`;
+    /// `proofs` names that header and the position. The same record as
+    /// `putProof`, from the nodes instead of a path.
+    pub fn putProofAt(self: *Wallet, txid: [32]u8, height: u32, pos: merkle.Position) !void {
         const at = (try self.chain().at(height)) orelse return error.UnknownHeader;
         const root = (try hdr.Header.parse(&at.raw)).merkle_root;
-        if ((try merkle.pathFor(self.arena, self.store, root, height, txid)) == null) return error.BadProof;
-        try self.map("proofs").putLink(&txid, &store_mod.hashCid(.block, at.hash));
+        if ((try merkle.pathFor(self.arena, self.store, root, height, txid, pos)) == null) return error.BadProof;
+        try self.putProofRecord(txid, at.hash, pos);
         try self.map("proofHeights").add(&(store_mod.be32(height) ++ txid));
         try self.resettle(txid);
     }
 
     /// The block hash of the proof we hold for a txid, or null.
     pub fn proofBlock(self: *Wallet, txid: [32]u8) !?[32]u8 {
-        const c = (try self.map("proofs").link(&txid)) orelse return null;
-        return store_mod.bitcoinHash(c) orelse error.BadIndex;
+        const r = (try self.proofRecord(txid)) orelse return null;
+        return store_mod.bitcoinHash(r.block) orelse error.BadIndex;
     }
 
-    /// The BUMP for a txid, rebuilt from the tree's nodes (merkle.pathFor),
-    /// when its proof's block is on our best chain; else null.
+    /// The BUMP for a txid, rebuilt from the tree's nodes (merkle.pathFor:
+    /// down from the root by the recorded position, one node per level), when
+    /// its proof's block is on our best chain; else null.
     pub fn proofFor(self: *Wallet, txid: [32]u8) !?merkle.MerklePath {
-        const c = (try self.map("proofs").link(&txid)) orelse return null;
+        const r = (try self.proofRecord(txid)) orelse return null;
+        const c = r.block;
         const hash = store_mod.bitcoinHash(c) orelse return error.BadIndex;
         const height = (try self.chain().heightOf(hash)) orelse return null;
         const raw = try self.store.get(self.arena, c);
         if (raw.len != hdr.size) return error.BadRecord;
         const root = (try hdr.Header.parse(raw[0..hdr.size])).merkle_root;
-        return merkle.pathFor(self.arena, self.store, root, height, txid);
+        return merkle.pathFor(self.arena, self.store, root, height, txid, r.pos);
     }
 
     pub fn record(self: *Wallet, cid: []const u8) !Value {
