@@ -83,7 +83,12 @@ fn readTx(arena: std.mem.Allocator, b: []const u8, pos: *usize) Error!struct { r
     return .{ .raw = raw, .tx = tx, .txid = txidOf(raw) };
 }
 
+/// How many times `parse` ran, in a test build (#50: a submit parses its BEEF
+/// exactly once; programs/overlay's tests read it). Always 0 otherwise.
+pub var parses: usize = 0;
+
 pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Beef {
+    if (@import("builtin").is_test) parses += 1;
     var pos: usize = 0;
     var atomic: ?[32]u8 = null;
     var version = try readU32(bytes, &pos);

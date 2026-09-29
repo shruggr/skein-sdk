@@ -36,7 +36,7 @@ const bsvz = @import("bsvz");
 const cbor = @import("cbor.zig");
 const hdr = @import("header.zig");
 const beef_mod = @import("beef.zig");
-const spv = @import("spv.zig");
+const merkle = @import("merkle.zig");
 const store_mod = @import("store.zig");
 const wallet_mod = @import("wallet.zig");
 
@@ -64,13 +64,39 @@ pub const Applied = struct {
     records: []const []const u8 = &.{},
 };
 
-/// A submitted transaction, verified: its BEEF, the subject, and which
-/// entries a BUMP proved.
-pub const Submission = struct {
-    beef: beef_mod.Beef,
+/// A transaction being judged: its txid, its CID (bitcoin-tx), and the
+/// transaction as its block decodes.
+pub const Subject = struct {
     txid: [32]u8,
+    cid: []const u8,
     tx: Transaction,
-    proven: []const bool,
+};
+
+/// A transaction a submission carried, as decoded: its txid and block bytes.
+pub const DecodedTx = struct { txid: [32]u8, raw: []const u8 };
+/// A BUMP's block, as the submission's merkle nodes reach it: its height and root.
+pub const Bump = struct { height: u32, root: [32]u8 };
+/// A transaction a BUMP proves (flagged as a txid in it), at that BUMP's height.
+pub const Proven = struct { txid: [32]u8, height: u32 };
+
+/// A submitted BEEF decoded into records (#50): each transaction a
+/// `bitcoin-tx` block, each BUMP the merkle nodes it reveals (64-byte
+/// `bitcoin-tx` blocks, merkle.zig). The blocks are put when decoded — in a
+/// front-door call they land in the call's in-memory overlay, and nothing
+/// persists unless the submission is admitted. What is here besides the
+/// blocks is what the BEEF said about them: the order, the subject, which
+/// BUMP proves which transaction, which entries named a txid only.
+pub const Decoded = struct {
+    subject: [32]u8,
+    /// Every transaction with its bytes, in BEEF order (parents first).
+    txs: []const DecodedTx,
+    /// The merkle nodes the BUMPs reveal, each once.
+    nodes: []const merkle.Node,
+    /// The BUMPs that prove something here (a txid-flagged leaf, or one of ours).
+    bumps: []const Bump,
+    proven: []const Proven,
+    /// Entries that named a txid only (they must be held).
+    txid_only: []const [32]u8,
 };
 
 pub fn topicPrefix(a: std.mem.Allocator, topic: []const u8) ![]u8 {
@@ -90,29 +116,146 @@ fn scriptHash(script: []const u8) [32]u8 {
 
 // ---------------------------------------------------------------- submit (BRC-22)
 
-/// Parse a submitted BEEF (V1, V2 or Atomic: the subject is the Atomic
-/// BEEF's, else the last transaction) and verify it against our chain as
-/// `internalize` does: every BUMP's root is our header's at its height (an
-/// unknown height is refused), every unproven transaction's inputs come
-/// earlier or are held, with their scripts verified. A subject already
-/// rejected, or spending an output a proven transaction spends, is refused.
-pub fn verify(w: *Wallet, bytes: []const u8) !Submission {
-    const a = w.arena;
+/// Whether the BUMP flags this txid as a transaction (not just a sibling hash).
+fn flagged(p: merkle.MerklePath, txid: [32]u8) bool {
+    if (p.path.len == 0) return false;
+    for (p.path[0]) |leaf| if (leaf.hash) |h| if (std.mem.eql(u8, &h.bytes, &txid)) return leaf.txid orelse false;
+    return false;
+}
+
+/// Decode a submitted BEEF (V1, V2 or Atomic: the subject is the Atomic
+/// BEEF's, else the last transaction) into records, parsing it once (#50):
+/// each transaction put as its `bitcoin-tx` block, each BUMP as the merkle
+/// nodes it reveals (hash-checked by the store). Nothing is kept here: in a
+/// front-door call the blocks live in the call's overlay; the step that
+/// admits the submission holds them (`holdDecoded`). Structure is checked
+/// (parents first, a BUMP that names a transaction holds it, BUMPs that
+/// agree with themselves); the chain and the scripts are `verifyDecoded`'s.
+pub fn decode(a: std.mem.Allocator, s: store_mod.Store, bytes: []const u8) !Decoded {
     const b = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
     const subject = b.subject() orelse return error.InvalidBeef;
     const entry = b.find(subject) orelse return error.InvalidBeef;
-    const tx = entry.tx orelse return error.InvalidBeef; // a txid-only subject
-    var ctx = Wallet.SpvCtx{ .w = w };
-    const checked = try spv.verify(a, b, .{ .ptr = &ctx, .rootAtFn = Wallet.SpvCtx.rootAt, .knownRawFn = Wallet.SpvCtx.knownRaw });
-    if (try w.map("rejected").has(&subject)) return error.TransactionRejected;
-    for (tx.inputs) |in| {
+    if (entry.raw == null) return error.InvalidBeef; // a txid-only subject
+    if (!beef_mod.parentsFirst(b)) return error.NotParentsFirst;
+
+    // The BUMPs that prove something here: their nodes, and the root they reach.
+    var bumps: std.ArrayList(Bump) = .empty;
+    var nodes: std.ArrayList(merkle.Node) = .empty;
+    const bump_of = try a.alloc(?usize, b.bumps.len); // BEEF bump index → `bumps` index
+    for (b.bumps, bump_of) |p, *bi| {
+        bi.* = null;
+        if (p.path.len == 0) return error.RootMismatch;
+        var relevant = false;
+        for (p.path[0]) |leaf| {
+            const h = leaf.hash orelse continue;
+            relevant = relevant or (leaf.txid orelse false) or b.find(h.bytes) != null;
+        }
+        if (!relevant) continue; // a BUMP proving nothing here is harmless
+        const rev = merkle.reveal(a, p) catch return error.RootMismatch;
+        outer: for (rev.nodes) |n| {
+            for (nodes.items) |m| if (std.mem.eql(u8, &m.hash, &n.hash)) continue :outer;
+            try nodes.append(a, n);
+        }
+        bi.* = bumps.items.len;
+        try bumps.append(a, .{ .height = p.block_height, .root = rev.root });
+    }
+    for (nodes.items) |n| try s.putBlock(&merkle.nodeCid(n.hash), &n.bytes);
+
+    var txs: std.ArrayList(DecodedTx) = .empty;
+    var proven: std.ArrayList(Proven) = .empty;
+    var txid_only: std.ArrayList([32]u8) = .empty;
+    for (b.entries) |e| {
+        switch (e.format) {
+            .txid_only => {
+                try txid_only.append(a, e.txid);
+                continue;
+            },
+            .raw_with_bump => {
+                const i = e.bump.?;
+                if (!beef_mod.bumpHas(b.bumps[i], e.txid)) return error.NotInBump;
+                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[bump_of[i].?].height });
+            },
+            .raw => for (b.bumps, bump_of) |p, bi| {
+                const i = bi orelse continue;
+                if (!flagged(p, e.txid)) continue;
+                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[i].height });
+                break;
+            },
+        }
+        const raw = e.raw.?;
+        try s.putBlock(&store_mod.hashCid(.tx, e.txid), raw);
+        try txs.append(a, .{ .txid = e.txid, .raw = raw });
+    }
+    return .{ .subject = subject, .txs = txs.items, .nodes = nodes.items, .bumps = bumps.items, .proven = proven.items, .txid_only = txid_only.items };
+}
+
+/// A transaction's block, read (`get`: in a call, through its overlay) and decoded.
+pub fn subjectOf(w: *Wallet, txid: [32]u8) !Subject {
+    const c = try w.arena.dupe(u8, &store_mod.hashCid(.tx, txid));
+    const raw = w.store.get(w.arena, c) catch return error.MissingInput;
+    return .{ .txid = txid, .cid = c, .tx = Transaction.parse(w.arena, raw) catch return error.InvalidBeef };
+}
+
+fn provenAt(d: Decoded, txid: [32]u8) ?u32 {
+    for (d.proven) |p| if (std.mem.eql(u8, &p.txid, &txid)) return p.height;
+    return null;
+}
+
+fn rootAtHeight(d: Decoded, height: u32) ?[32]u8 {
+    for (d.bumps) |b| if (b.height == height) return b.root;
+    return null;
+}
+
+/// SPV over the decoded records (#50), against our chain, as `internalize`
+/// does over a BEEF: every BUMP's root is our header's at its height (an
+/// unknown height is refused) and each proven transaction is reached from it
+/// through the merkle nodes; every other transaction's inputs come from a
+/// transaction decoded before it or held, read through `get`, with their
+/// scripts verified; a txid-only entry names a transaction we hold. A
+/// subject already rejected, or spending an output a proven transaction
+/// spends, is refused. → the subject.
+pub fn verifyDecoded(w: *Wallet, d: Decoded) !Subject {
+    const a = w.arena;
+    for (d.bumps) |b| {
+        const want = (try w.chain().rootAt(b.height)) orelse return error.UnknownHeader;
+        if (!std.mem.eql(u8, &want, &b.root)) return error.RootMismatch;
+    }
+    for (d.proven) |p| {
+        const root = rootAtHeight(d, p.height) orelse return error.NotInBump;
+        if ((try merkle.pathFor(a, w.store, root, p.height, p.txid)) == null) return error.NotInBump;
+    }
+    for (d.txid_only) |t| if ((try w.txRaw(t)) == null) return error.UnknownTxidOnly;
+    for (d.txs, 0..) |t, i| {
+        if (provenAt(d, t.txid) != null) continue;
+        const sub = try subjectOf(w, t.txid);
+        for (sub.tx.inputs, 0..) |in, k| {
+            const src_txid = in.previous_outpoint.txid.bytes;
+            const earlier = for (d.txs[0..i]) |x| {
+                if (std.mem.eql(u8, &x.txid, &src_txid)) break true;
+            } else false;
+            if (!earlier and (try w.txRaw(src_txid)) == null) return error.MissingInput;
+            const src = try subjectOf(w, src_txid);
+            if (in.previous_outpoint.index >= src.tx.outputs.len) return error.MissingInput;
+            const ok = bsvz.script.interpreter.verifyPrevout(.{
+                .allocator = a,
+                .tx = &sub.tx,
+                .input_index = k,
+                .previous_output = src.tx.outputs[in.previous_outpoint.index],
+                .unlocking_script = in.unlocking_script,
+            }) catch false;
+            if (!ok) return error.ScriptFailed;
+        }
+    }
+    const subject = try subjectOf(w, d.subject);
+    if (try w.map("rejected").has(&d.subject)) return error.TransactionRejected;
+    for (subject.tx.inputs) |in| {
         const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
         for (try w.spendersOf(op)) |other| {
-            if (std.mem.eql(u8, &other, &subject)) continue;
+            if (std.mem.eql(u8, &other, &d.subject)) continue;
             if ((try w.status(other)) == .proven) return error.DoubleSpend;
         }
     }
-    return .{ .beef = b, .txid = subject, .tx = tx, .proven = checked.proven };
+    return subject;
 }
 
 /// Whether the topic judged this transaction already (a dupe: BRC-22 answers it with nothing new).
@@ -170,22 +313,24 @@ pub fn spender(w: *Wallet, topic: []const u8, txid: [32]u8, vout: u32) !?struct 
     return .{ .txid = sp, .retained = retained, .judged = true };
 }
 
-/// Hold the submission's transactions (and the proofs its BUMPs carry) like
-/// any other we hold: blocks (kept: `spends` edges, #42), `txs`. → the
-/// subject's CID.
-pub fn hold(w: *Wallet, sub: Submission) ![]const u8 {
-    var subject_cid: []const u8 = "";
-    for (sub.beef.entries, sub.proven) |e, proven| {
-        const raw = e.raw orelse continue;
-        const c = try w.putTx(e.txid, raw);
-        if (std.mem.eql(u8, &e.txid, &sub.txid)) subject_cid = c;
-        if (!proven or (try w.map("proofs").has(&e.txid))) continue;
-        for (sub.beef.bumps) |p| if (beef_mod.bumpHas(p, e.txid)) {
-            try w.putProof(e.txid, p);
-            break;
-        };
+/// Hold a submission's decoded records (#50), in the step that admits it,
+/// like any other transactions we hold: each transaction's block kept
+/// (`spends` edges, #42) and in `txs`; the merkle nodes kept (`child`
+/// edges); each proven transaction's proof recorded (`proofs`, from the
+/// header its nodes reach). `txs` are block bytes, `nodes` 64-byte merkle
+/// nodes: the records the submit entry carries, not a BEEF.
+pub fn holdDecoded(w: *Wallet, txs: []const []const u8, nodes: []const []const u8, proven: []const Proven) !void {
+    for (txs) |raw| _ = try w.putTx(store_mod.dblSha256(raw), raw);
+    for (nodes) |n| {
+        if (n.len != 64) return error.BadNode;
+        const c = merkle.nodeCid(store_mod.dblSha256(n));
+        try w.store.putBlock(&c, n);
+        try w.store.keep(&c);
     }
-    return subject_cid;
+    for (proven) |p| {
+        if (try w.map("proofs").has(&p.txid)) continue;
+        try w.putProofAt(p.txid, p.height);
+    }
 }
 
 fn contains(xs: []const u32, x: u32) bool {
@@ -221,23 +366,30 @@ pub fn check(tx: Transaction, previous: []const u32, ins: Instructions) !void {
     }
 }
 
-/// Record a topic's judgement of a verified submission (BRC-22 step 4): the
-/// transactions held (when the topic took anything: an output or a previous
-/// coin), each admitted output as an admittance record in `admitted`, the
-/// judgement (which previous coins it retains, which it removes) in
-/// `applied` — both with rel `admits` on the transaction. The previous coins
-/// are spent by the transaction's own `spends` edges (held here). `previous` is
-/// `previousCoins` for this topic, taken before any judgement of this step.
-/// A transaction the topic judged before is a dupe: nothing is written.
-pub fn apply(w: *Wallet, sub: Submission, topic: []const u8, previous: []const u32, ins: Instructions) !Applied {
+/// Whether a topic's instructions take anything: an output admitted, or a
+/// previous coin consumed (retained or removed). One that takes nothing
+/// records nothing.
+pub fn takes(previous: []const u32, ins: Instructions) bool {
+    return ins.outputs_to_admit.len > 0 or previous.len > 0;
+}
+
+/// Record a topic's judgement of a held submission (BRC-22 step 4; the
+/// step holds the decoded records first, `holdDecoded`): each admitted
+/// output as an admittance record in `admitted`, the judgement (which
+/// previous coins it retains, which it removes) in `applied` — both with rel
+/// `admits` on the transaction. The previous coins are spent by the
+/// transaction's own `spends` edges (held). `previous` is `previousCoins`
+/// for this topic, taken before any judgement of this step. A transaction
+/// the topic judged before is a dupe: nothing is written.
+pub fn apply(w: *Wallet, sub: Subject, topic: []const u8, previous: []const u32, ins: Instructions) !Applied {
     const a = w.arena;
     if (try isApplied(w, topic, sub.txid)) return .{ .dupe = true };
     try check(sub.tx, previous, ins);
     var removed: std.ArrayList(u32) = .empty;
     for (previous) |p| if (!contains(ins.coins_to_retain, p)) try removed.append(a, p);
-    if (ins.outputs_to_admit.len == 0 and previous.len == 0) return .{};
+    if (!takes(previous, ins)) return .{};
 
-    const tx_cid = try hold(w, sub);
+    const tx_cid = sub.cid;
     const tp = try topicPrefix(a, topic);
     const txid_hex = try a.dupe(u8, &hdr.toHex(sub.txid));
     var records: std.ArrayList([]const u8) = .empty;

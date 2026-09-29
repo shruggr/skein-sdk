@@ -1137,6 +1137,22 @@ fn spend(a: std.mem.Allocator, ins: []const struct { *const bsvz.transaction.Tra
     return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
 }
 
+/// A submission as the overlay takes it (#50): the BEEF decoded into
+/// records, SPV over them, and (`hold`) the records held as the admitting
+/// step holds them.
+fn submitted(a: std.mem.Allocator, w: *lib.wallet.Wallet, bytes: []const u8, hold: bool) !lib.overlay.Subject {
+    const d = try lib.overlay.decode(a, w.store, bytes);
+    const sub = try lib.overlay.verifyDecoded(w, d);
+    if (hold) {
+        const raws = try a.alloc([]const u8, d.txs.len);
+        for (d.txs, raws) |t, *r| r.* = t.raw;
+        const nodes = try a.alloc([]const u8, d.nodes.len);
+        for (d.nodes, nodes) |n, *o| o.* = try a.dupe(u8, &n.bytes);
+        try lib.overlay.holdDecoded(w, raws, nodes, d.proven);
+    }
+    return sub;
+}
+
 /// The maintained `byTopic` is exactly `admitted` joined to the spends edge (`spent`), key for key (#36, #41).
 fn joinHolds(a: std.mem.Allocator, w: *lib.wallet.Wallet) !void {
     var want: std.ArrayList([]const u8) = .empty;
@@ -1197,7 +1213,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
 
     w = try lib.wallet.Wallet.load(a, s, empty, .regtest);
     w.now = 1000;
-    const sub1 = try ov.verify(&w, t1_beef);
+    const sub1 = try submitted(a, &w, t1_beef, true);
     try std.testing.expectEqualSlices(u8, &t1.txid, &sub1.txid);
     try std.testing.expectEqual(@as(usize, 0), (try ov.previousCoins(&w, "tm_demo", sub1.tx)).len);
     // Out-of-range or duplicate instructions are refused.
@@ -1246,7 +1262,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     const t2_beef = try beef.serialize(a, .{ .version = beef.V2, .atomic = t2.txid, .bumps = &.{}, .entries = e2 });
     w = try lib.wallet.Wallet.load(a, s, s1, .regtest);
     w.now = 2000;
-    const sub2 = try ov.verify(&w, t2_beef); // its input's source is held
+    const sub2 = try submitted(a, &w, t2_beef, true); // its input's source is held
     const prev2 = try ov.previousCoins(&w, "tm_demo", sub2.tx);
     try std.testing.expectEqualSlices(u32, &.{0}, prev2);
     const a2 = try ov.apply(&w, sub2, "tm_demo", prev2, .{ .outputs_to_admit = &.{0}, .coins_to_retain = &.{0} });
@@ -1285,7 +1301,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
         try std.testing.expect(!live[0].spent);
         try std.testing.expect(!(try ov.isApplied(&w, "tm_demo", t2.txid)));
         // Resubmitting a rejected transaction is refused.
-        try std.testing.expectError(error.TransactionRejected, ov.verify(&w, t2_beef));
+        try std.testing.expectError(error.TransactionRejected, submitted(a, &w, t2_beef, false));
     }
     // Deterministic: the same rejection from the same state gives the same state record.
     var w3 = try lib.wallet.Wallet.load(a, s, s2, .regtest);

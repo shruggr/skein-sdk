@@ -380,6 +380,19 @@ pub const Wallet = struct {
         try self.resettle(txid);
     }
 
+    /// A proof whose merkle nodes are already held (#50: a submission's,
+    /// decoded into nodes and kept): the nodes must reach `txid` from our
+    /// best-chain header's merkle root at `height`; `proofs` names that
+    /// header. The same record as `putProof`, from the nodes instead of a path.
+    pub fn putProofAt(self: *Wallet, txid: [32]u8, height: u32) !void {
+        const at = (try self.chain().at(height)) orelse return error.UnknownHeader;
+        const root = (try hdr.Header.parse(&at.raw)).merkle_root;
+        if ((try merkle.pathFor(self.arena, self.store, root, height, txid)) == null) return error.BadProof;
+        try self.map("proofs").putLink(&txid, &store_mod.hashCid(.block, at.hash));
+        try self.map("proofHeights").add(&(store_mod.be32(height) ++ txid));
+        try self.resettle(txid);
+    }
+
     /// The block hash of the proof we hold for a txid, or null.
     pub fn proofBlock(self: *Wallet, txid: [32]u8) !?[32]u8 {
         const c = (try self.map("proofs").link(&txid)) orelse return null;
