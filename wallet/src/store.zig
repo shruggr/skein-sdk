@@ -12,15 +12,90 @@
 //! IPLD values (links, bytes, numbers, null).
 const std = @import("std");
 const cbor = @import("cbor.zig");
+const bsvz = @import("bsvz");
 pub const mst = @import("mst");
 
 pub const MValue = mst.Value;
+
+/// One edge into a record, as the kernel's `edges` import answers it (#42):
+/// from whom (a chain's origin, or a kept bitcoin block's own CID), at which
+/// step (`seq`; 0 for a bitcoin block), the link's rel and locator (a vout, a
+/// child's side, a record's text locator, or null).
+pub const Edge = struct { from: []const u8, seq: i64, rel: []const u8, locator: cbor.Value };
+
+/// The dag-cbor answer of the `edges` import: [{from, seq, rel, locator}] → edges.
+pub fn decodeEdges(arena: std.mem.Allocator, bytes: []const u8) ![]const Edge {
+    const v = try cbor.decode(arena, bytes);
+    if (v != .array) return error.BadEdges;
+    const out = try arena.alloc(Edge, v.array.len);
+    for (v.array, out) |x, *e| e.* = .{
+        .from = x.getCid("from") orelse return error.BadEdges,
+        .seq = if (x.get("seq")) |s| (if (s == .uint) @intCast(s.uint) else return error.BadEdges) else return error.BadEdges,
+        .rel = x.getText("rel") orelse return error.BadEdges,
+        .locator = x.get("locator") orelse .null,
+    };
+    return out;
+}
+
+/// The links of a bitcoin block (kernel-zig/src/bitcoin.zig `links`, #42) —
+/// for MemStore, which stands in for the kernel's index in native tests:
+/// inputs `spends` (locator = vout; a coinbase input links nothing), a
+/// header `prev` / `merkleroot`, a merkle node `child` 0 / 1. None for a
+/// block that is not bitcoin or does not parse.
+pub const Link = struct { to: [37]u8, rel: []const u8, locator: cbor.Value };
+pub fn bitcoinLinks(arena: std.mem.Allocator, cid: []const u8, bytes: []const u8) ![]Link {
+    var out: std.ArrayList(Link) = .empty;
+    if (bitcoinHash(cid) == null) return out.items;
+    if (cid[1] == @intFromEnum(Codec.block)) {
+        if (bytes.len != 80) return out.items;
+        if (!std.mem.allEqual(u8, bytes[4..36], 0)) try out.append(arena, .{ .to = hashCid(.block, bytes[4..36].*), .rel = "prev", .locator = .null });
+        try out.append(arena, .{ .to = hashCid(.tx, bytes[36..68].*), .rel = "merkleroot", .locator = .null });
+    } else if (bytes.len == 64) {
+        try out.append(arena, .{ .to = hashCid(.tx, bytes[0..32].*), .rel = "child", .locator = .{ .uint = 0 } });
+        try out.append(arena, .{ .to = hashCid(.tx, bytes[32..64].*), .rel = "child", .locator = .{ .uint = 1 } });
+    } else {
+        const tx = bsvz.transaction.Transaction.parse(arena, bytes) catch return out.items;
+        for (tx.inputs) |in| {
+            const prev = in.previous_outpoint;
+            if (prev.index == 0xffffffff and std.mem.allEqual(u8, &prev.txid.bytes, 0)) continue;
+            try out.append(arena, .{ .to = hashCid(.tx, prev.txid.bytes), .rel = "spends", .locator = .{ .uint = prev.index } });
+        }
+    }
+    return out.items;
+}
 
 pub const Store = struct {
     ptr: *anyopaque,
     getFn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, cid: []const u8) anyerror![]const u8,
     putFn: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, bytes: []const u8) anyerror![]const u8,
     putBlockFn: *const fn (ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void,
+    /// Keep a block in the step (the kernel's `keep`): a kept bitcoin block's
+    /// links become edges in the kernel's index (#42). Null: keeping is a no-op.
+    keepFn: ?*const fn (ptr: *anyopaque, cid: []const u8) anyerror!void = null,
+    /// The kernel's edges into `to` (#42, its `edges` import): who points at
+    /// it, with `rel` only if given, in key order (from, seq, ord).
+    edgesFn: ?*const fn (ptr: *anyopaque, arena: std.mem.Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const Edge = null,
+
+    pub fn keep(self: Store, cid: []const u8) !void {
+        if (self.keepFn) |f| try f(self.ptr, cid);
+    }
+    pub fn edges(self: Store, arena: std.mem.Allocator, to: []const u8, rel: ?[]const u8) ![]const Edge {
+        const f = self.edgesFn orelse return error.NoEdges;
+        return f(self.ptr, arena, to, rel);
+    }
+    /// The transactions that spend `txid:vout` (edges `spends` from kept
+    /// transactions, locator = vout), in txid order: every input of every
+    /// transaction held (kept), whatever its settlement.
+    pub fn spendersOf(self: Store, arena: std.mem.Allocator, txid: [32]u8, vout: u32) ![][32]u8 {
+        var out: std.ArrayList([32]u8) = .empty;
+        for (try self.edges(arena, &hashCid(.tx, txid), "spends")) |e| {
+            if (e.locator != .uint or e.locator.uint != vout) continue;
+            const h = bitcoinHash(e.from) orelse continue;
+            if (e.from[1] != @intFromEnum(Codec.tx)) continue;
+            try out.append(arena, h);
+        }
+        return out.items;
+    }
 
     pub fn get(self: Store, arena: std.mem.Allocator, cid: []const u8) ![]const u8 {
         return self.getFn(self.ptr, arena, cid);
@@ -31,10 +106,13 @@ pub const Store = struct {
     pub fn putBlock(self: Store, cid: []const u8, bytes: []const u8) !void {
         return self.putBlockFn(self.ptr, cid, bytes);
     }
-    /// A transaction (bitcoin-tx) or an 80-byte header (bitcoin-block), under its own CID.
+    /// A transaction or a merkle node (bitcoin-tx) or an 80-byte header
+    /// (bitcoin-block), under its own CID, and kept: every bitcoin block a
+    /// wallet holds is kept, so its links are in the kernel's edges (#42).
     pub fn putBitcoin(self: Store, arena: std.mem.Allocator, codec: Codec, bytes: []const u8) ![]const u8 {
         const c = try arena.dupe(u8, &bitcoinCid(codec, bytes));
         try self.putBlock(c, bytes);
+        try self.keep(c);
         return c;
     }
     /// A block's bytes, or null when the store does not hold it (a sparse tree's missing child).
@@ -83,6 +161,12 @@ pub fn dblSha256(bytes: []const u8) [32]u8 {
 pub const MemStore = struct {
     gpa: std.mem.Allocator,
     blocks: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// The bitcoin blocks kept, and their links as edges (the kernel's index,
+    /// index.zig, as a native test sees it: from the block, seq 0).
+    kept: std.StringHashMapUnmanaged(void) = .empty,
+    edge_rows: std.ArrayListUnmanaged(MemEdge) = .empty,
+
+    const MemEdge = struct { to: [37]u8, from: [37]u8, ord: u32, rel: []const u8, locator: cbor.Value };
 
     pub fn init(gpa: std.mem.Allocator) MemStore {
         return .{ .gpa = gpa };
@@ -94,9 +178,46 @@ pub const MemStore = struct {
             self.gpa.free(e.value_ptr.*);
         }
         self.blocks.deinit(self.gpa);
+        var kt = self.kept.keyIterator();
+        while (kt.next()) |k| self.gpa.free(k.*);
+        self.kept.deinit(self.gpa);
+        self.edge_rows.deinit(self.gpa);
     }
     pub fn store(self: *MemStore) Store {
-        return .{ .ptr = self, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl };
+        return .{ .ptr = self, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl, .keepFn = keepImpl, .edgesFn = edgesImpl };
+    }
+    fn keepImpl(ptr: *anyopaque, cid: []const u8) anyerror!void {
+        const self: *MemStore = @ptrCast(@alignCast(ptr));
+        if (!self.blocks.contains(cid)) return error.NotFound;
+        if (bitcoinHash(cid) == null or self.kept.contains(cid)) return;
+        try self.kept.put(self.gpa, try self.gpa.dupe(u8, cid), {});
+        var tmp = std.heap.ArenaAllocator.init(self.gpa);
+        defer tmp.deinit();
+        for (try bitcoinLinks(tmp.allocator(), cid, self.blocks.get(cid).?), 0..) |l, i| {
+            // rel is a literal; a locator is a uint or null: nothing borrowed from tmp.
+            try self.edge_rows.append(self.gpa, .{ .to = l.to, .from = cid[0..37].*, .ord = @intCast(i), .rel = l.rel, .locator = l.locator });
+        }
+    }
+    fn edgesImpl(ptr: *anyopaque, arena: std.mem.Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const Edge {
+        const self: *MemStore = @ptrCast(@alignCast(ptr));
+        var rows: std.ArrayList(MemEdge) = .empty;
+        for (self.edge_rows.items) |r| {
+            if (!std.mem.eql(u8, &r.to, to)) continue;
+            if (rel) |want| if (!std.mem.eql(u8, want, r.rel)) continue;
+            try rows.append(arena, r);
+        }
+        std.mem.sort(MemEdge, rows.items, {}, struct {
+            fn lt(_: void, x: MemEdge, y: MemEdge) bool {
+                return switch (std.mem.order(u8, &x.from, &y.from)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => x.ord < y.ord,
+                };
+            }
+        }.lt);
+        const out = try arena.alloc(Edge, rows.items.len);
+        for (rows.items, out) |r, *e| e.* = .{ .from = try arena.dupe(u8, &r.from), .seq = 0, .rel = r.rel, .locator = r.locator };
+        return out;
     }
     fn getImpl(ptr: *anyopaque, arena: std.mem.Allocator, cid: []const u8) anyerror![]const u8 {
         const self: *MemStore = @ptrCast(@alignCast(ptr));
@@ -110,7 +231,7 @@ pub const MemStore = struct {
         defer tmp.deinit();
         const canon = try cbor.encode(tmp.allocator(), try cbor.decode(tmp.allocator(), bytes));
         const cid = cbor.cidOf(canon);
-        try self.keep(&cid, canon);
+        try self.hold(&cid, canon);
         return arena.dupe(u8, &cid);
     }
     /// As the kernel's putblock: the bytes must hash to the CID (bitcoin-tx,
@@ -123,9 +244,9 @@ pub const MemStore = struct {
         } else if (cid.len == 36 and std.mem.eql(u8, cid[0..4], &.{ 0x01, 0x71, 0x12, 0x20 })) {
             if (!std.mem.eql(u8, cid, &cbor.cidOf(bytes))) return error.HashMismatch;
         } else return error.UnsupportedCid;
-        try self.keep(cid, bytes);
+        try self.hold(cid, bytes);
     }
-    fn keep(self: *MemStore, cid: []const u8, bytes: []const u8) !void {
+    fn hold(self: *MemStore, cid: []const u8, bytes: []const u8) !void {
         if (self.blocks.contains(cid)) return;
         const k = try self.gpa.dupe(u8, cid);
         errdefer self.gpa.free(k);

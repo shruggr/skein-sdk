@@ -97,9 +97,14 @@ fn take(m: *std.AutoArrayHashMap(u64, [32]u8), dup: *std.AutoHashMap(u64, void),
     try m.put(e.offset, h.bytes);
 }
 
-/// Put the nodes (hash-checked by the store; one already held is the same block).
+/// Put the nodes (hash-checked by the store; one already held is the same
+/// block) and keep them: their `child` links are in the kernel's edges (#42).
 pub fn putNodes(s: Store, nodes: []const Node) !void {
-    for (nodes) |n| try s.putBlock(&nodeCid(n.hash), &n.bytes);
+    for (nodes) |n| {
+        const c = nodeCid(n.hash);
+        try s.putBlock(&c, &n.bytes);
+        try s.keep(&c);
+    }
 }
 
 /// A node we hold (its 64 bytes), or null — also for a transaction we hold

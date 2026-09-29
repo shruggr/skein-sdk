@@ -98,9 +98,12 @@ const VmStore = struct {
     fn putBlockImpl(_: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
         if (sk.putblock(cid.ptr, @intCast(cid.len), bytes.ptr, @intCast(bytes.len)) < 0) return failed();
     }
+    fn keepImpl(_: *anyopaque, cid: []const u8) anyerror!void {
+        if (sk.keep(cid.ptr, @intCast(cid.len)) < 0) return failed();
+    }
     var dummy: u8 = 0;
     fn store() w.store.Store {
-        return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl };
+        return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl, .keepFn = keepImpl };
     }
 };
 
