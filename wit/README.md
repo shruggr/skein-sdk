@@ -12,8 +12,7 @@ and the WASI 0.2 packages it depends on.
 ## The interface `skein:kernel/skein`
 
 The interface has the same calls, with the same behaviour, as the preview1
-`skein` import namespace (`src/runtime/wasi/skein-imports.ts`,
-`kernel-zig/src/program.zig`). Only the ABI differs:
+`skein` import namespace (`kernel-zig/src/program.zig`). Only the ABI differs:
 
 | preview1 | WIT |
 |---|---|
