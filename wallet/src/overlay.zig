@@ -16,6 +16,10 @@
 //!   byTopic        tp ‖ 0 (unspent) | 1 (spent) ‖ outpoint → null         derived
 //!   byScript       sha256(script) ‖ tp ‖ 0 | 1 ‖ outpoint → null          derived
 //!
+//! The derived maps are maintained where a fact changes (#41): an admittance
+//! or a consumed coin (`apply`), an admittance that vanishes and a judgement
+//! that vanishes (Wallet.reject → `unadmit`, `unjudged`).
+//!
 //! Relations (the wallet's `dependents`, #37): an admitted output and an
 //! applied record stand on their transaction with rel `admits` (tags `m`,
 //! `p`): a rejected transaction's admittances vanish (Wallet.reject), and
@@ -225,7 +229,9 @@ pub fn apply(w: *Wallet, sub: Submission, topic: []const u8, previous: []const u
         const in = sub.tx.inputs[p];
         const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
         try w.map("consumed").put(try cat(a, &.{ tp, &op, &sub.txid }), .{ .bool = contains(ins.coins_to_retain, p) });
+        try refreshAdmitted(w, try cat(a, &.{ tp, &op }));
     }
+    for (sorted) |vout| try refreshAdmitted(w, try cat(a, &.{ tp, &store_mod.outpointKey(sub.txid, vout) }));
     const retained = try a.dupe(u32, ins.coins_to_retain);
     std.mem.sort(u32, retained, {}, std.sort.asc(u32));
     const applied = try w.store.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
@@ -246,40 +252,64 @@ pub fn apply(w: *Wallet, sub: Submission, topic: []const u8, previous: []const u
     return .{ .outputs_to_admit = sorted, .coins_to_retain = retained, .coins_removed = removed.items, .records = records.items };
 }
 
-// ---------------------------------------------------------------- derived (at every save)
+// ---------------------------------------------------------------- derived, maintained (#41)
 
-/// Rebuild `spentAdmitted`, `byTopic` and `byScript` from `admitted`,
-/// `consumed` and the settlement: a function of the records (same contents,
-/// same roots), recomputed whenever the wallet state is saved — so a
-/// rejection, whichever program learned it, is reflected at once.
-pub fn rebuildDerived(w: *Wallet) !void {
+/// An admitted output's derived keys (key = tp ‖ outpoint): `spentAdmitted`
+/// (the first spender, lowest txid, of the ones this topic judged that is not
+/// rejected), and its `byTopic` / `byScript` keys under that state.
+pub fn refreshAdmitted(w: *Wallet, key: []const u8) !void {
     const a = w.arena;
-    var spent = w.maps.map(null);
-    for (try w.map("consumed").prefixed("")) |kv| {
-        if (kv.key.len < 1 or kv.key.len != 1 + @as(usize, kv.key[0]) + 36 + 32) return error.BadIndex;
-        const split = kv.key.len - 32;
-        const spender: [32]u8 = kv.key[split..][0..32].*;
-        const key = kv.key[0..split];
+    const rc = (try w.map("admitted").link(key)) orelse {
+        _ = try w.map("spentAdmitted").remove(key);
+        return;
+    };
+    var first: ?store_mod.MValue = null;
+    for (try w.map("consumed").prefixed(key)) |kv| {
+        if (kv.key.len != key.len + 32) return error.BadIndex;
+        const spender: [32]u8 = kv.key[key.len..][0..32].*;
         if (try w.map("rejected").has(&spender)) continue;
-        if (!(try w.map("admitted").has(key))) continue;
-        if (try spent.has(key)) continue; // the first spender (lowest txid) names it
         const retained: u8 = if (kv.value == .bool and kv.value.bool) 1 else 0;
-        try spent.put(key, .{ .bytes = try cat(a, &.{ &spender, &.{retained} }) });
+        first = .{ .bytes = try cat(a, &.{ &spender, &.{retained} }) };
+        break;
     }
-    var by_topic = w.maps.map(null);
-    var by_script = w.maps.map(null);
-    for (try w.map("admitted").prefixed("")) |kv| {
-        const tl = 1 + @as(usize, kv.key[0]);
-        if (kv.key.len != tl + 36) return error.BadIndex;
-        const state: u8 = if (try spent.has(kv.key)) 1 else 0;
-        try by_topic.add(try cat(a, &.{ kv.key[0..tl], &.{state}, kv.key[tl..] }));
-        const rec = try w.record(kv.value.cid);
-        const sh = scriptHash(rec.getBytes("script") orelse return error.BadRecord);
-        try by_script.add(try cat(a, &.{ &sh, kv.key[0..tl], &.{state}, kv.key[tl..] }));
+    if (first) |v| try w.map("spentAdmitted").put(key, v) else _ = try w.map("spentAdmitted").remove(key);
+    const state: u8 = if (first != null) 1 else 0;
+    const tl = 1 + @as(usize, key[0]);
+    if (key.len != tl + 36) return error.BadIndex;
+    const sh = scriptHash((try w.record(rc)).getBytes("script") orelse return error.BadRecord);
+    _ = try w.map("byTopic").remove(try cat(a, &.{ key[0..tl], &.{1 - state}, key[tl..] }));
+    try w.map("byTopic").add(try cat(a, &.{ key[0..tl], &.{state}, key[tl..] }));
+    _ = try w.map("byScript").remove(try cat(a, &.{ &sh, key[0..tl], &.{1 - state}, key[tl..] }));
+    try w.map("byScript").add(try cat(a, &.{ &sh, key[0..tl], &.{state}, key[tl..] }));
+}
+
+/// An admittance vanishes (its transaction was rejected): the record and every derived key of it.
+pub fn unadmit(w: *Wallet, key: []const u8) !void {
+    const a = w.arena;
+    const rc = (try w.map("admitted").link(key)) orelse return;
+    const tl = 1 + @as(usize, key[0]);
+    if (key.len != tl + 36) return error.BadIndex;
+    const sh = scriptHash((try w.record(rc)).getBytes("script") orelse return error.BadRecord);
+    for ([_]u8{ 0, 1 }) |state| {
+        _ = try w.map("byTopic").remove(try cat(a, &.{ key[0..tl], &.{state}, key[tl..] }));
+        _ = try w.map("byScript").remove(try cat(a, &.{ &sh, key[0..tl], &.{state}, key[tl..] }));
     }
-    w.map("spentAdmitted").root = spent.root;
-    w.map("byTopic").root = by_topic.root;
-    w.map("byScript").root = by_script.root;
+    _ = try w.map("spentAdmitted").remove(key);
+    _ = try w.map("admitted").remove(key);
+}
+
+/// Judgements that vanished (their transactions rejected; `applied` keys tp ‖
+/// txid): the admitted outputs each consumed in its topic are live again
+/// unless another judged spender stands.
+pub fn unjudged(w: *Wallet, keys: []const []const u8) !void {
+    const a = w.arena;
+    for (keys) |k| {
+        if (k.len < 33) return error.BadIndex;
+        const tp = k[0 .. k.len - 32];
+        const raw = (try w.txRaw(k[k.len - 32 ..][0..32].*)) orelse continue;
+        const tx = try Transaction.parse(a, raw);
+        for (tx.inputs) |in| try refreshAdmitted(w, try cat(a, &.{ tp, &store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index) }));
+    }
 }
 
 // ---------------------------------------------------------------- lookup (BRC-24)

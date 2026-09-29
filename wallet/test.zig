@@ -601,7 +601,7 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     try std.testing.expectEqual(@as(usize, 3), try w2.mapCount("txs"));
     // A transaction's block is its txid: a bitcoin-tx CID.
     try std.testing.expectEqualSlices(u8, &pay_txid, &lib.store.bitcoinHash((try w2.map("txs").link(&pay_txid)).?).?);
-    try std.testing.expect(try w2.map("byStatus").has(&(.{1} ++ pay_txid)));
+    try std.testing.expect(try w2.map("unproven").has(&pay_txid));
 
     // The payment is mined at 1002: a single-transaction block, root = txid.
     const h1002 = mine(hdr.hash(&h1001), pay_txid, 1_700_001_800);
@@ -814,15 +814,14 @@ test "settlement: unproven → proven; reorg → unproven (reverted) → re-prov
 
     var w = try lib.wallet.Wallet.load(a, s, p.state, .regtest);
     try std.testing.expectEqual(lib.wallet.Status.unproven, try w.status(p.pay_txid));
-    try std.testing.expect(try w.map("bySettlement").has(&(.{1} ++ p.pay_txid)));
+    try std.testing.expect(try w.map("unproven").has(&p.pay_txid));
     // Mined alone at 1002: proven, and a settlement change for the watchers.
     const h1002 = mine(hdr.hash(&p.h1001), p.pay_txid, 1_700_001_800);
     _ = try w.addHeaders(&.{&h1002});
     try std.testing.expectEqual(lib.wallet.Status.proven, try w.addProof(p.pay_txid, try soloPath(a, 1002, p.pay_txid)));
     try std.testing.expect(hasChange(&w, p.pay_txid, .proven, "mined"));
     const proven_state = try w.save();
-    try std.testing.expect(try w.map("bySettlement").has(&(.{0} ++ p.pay_txid)));
-    try std.testing.expect(try w.map("byStatus").has(&(.{0} ++ p.pay_txid)));
+    try std.testing.expect(!(try w.map("unproven").has(&p.pay_txid))); // proven: it leaves the settlement index
 
     // A heavier branch from 1001 without that block: the proof no longer holds.
     var w2 = try lib.wallet.Wallet.load(a, s, proven_state, .regtest);
@@ -834,7 +833,7 @@ test "settlement: unproven → proven; reorg → unproven (reverted) → re-prov
     try std.testing.expectEqualSlices(u8, &p.pay_txid, &w2.reverted.items[0]);
     try std.testing.expect(hasChange(&w2, p.pay_txid, .unproven, "reorg"));
     _ = try w2.save();
-    try std.testing.expect(try w2.map("bySettlement").has(&(.{1} ++ p.pay_txid)));
+    try std.testing.expect(try w2.map("unproven").has(&p.pay_txid)); // reverted: back in it
     // The old proof is no longer accepted against the new chain; the new block's is.
     try std.testing.expectError(error.RootMismatch, w2.addProof(p.pay_txid, try soloPath(a, 1002, p.pay_txid)));
     const alt3 = mine(hdr.hash(&alt2), p.pay_txid, 1_700_001_803);
@@ -904,8 +903,8 @@ test "settlement: a rejection bubbles through spends and drafts; inputs freed; m
     try std.testing.expectEqualSlices(u8, &p.pay_txid, &def[0].txid);
     try std.testing.expect(def[0].spendable);
     try std.testing.expectEqual(@as(usize, 0), (try w.listOutputs("tokens", true)).len);
-    try std.testing.expect(try w.map("byStatus").has(&(.{2} ++ ca.txid)));
-    try std.testing.expect(try w.map("byStatus").has(&(.{2} ++ cb.txid)));
+    try std.testing.expect(!(try w.map("unproven").has(&ca.txid)) and try w.map("rejected").has(&ca.txid));
+    try std.testing.expect(!(try w.map("unproven").has(&cb.txid)) and try w.map("rejected").has(&cb.txid));
     try std.testing.expectError(error.DraftRejected, w.signAction(d.reference.?, signer.signer()));
     // The payment funds a new spend.
     const again = try w.createAction(.{ .description = "again", .outputs = &.{.{ .satoshis = 300, .locking_script = &payee }} }, signer.signer(), "Yw==", "MQ==", 100);
@@ -1142,6 +1141,106 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     try std.testing.expectEqual(@as(usize, 0), (try ov.inTopic(&w4, "tm_demo", true)).len);
     try std.testing.expectEqual(@as(usize, 0), try w4.map("admitted").count());
     counts.wallet += 1;
+}
+
+// ---------------------------------------------------------------- index cost (#41)
+
+/// A store that counts what is written through it (every put / putblock call).
+const CountingStore = struct {
+    inner: lib.store.Store,
+    puts: usize = 0,
+    fn store(self: *CountingStore) lib.store.Store {
+        return .{ .ptr = self, .getFn = get, .putFn = put, .putBlockFn = putBlock };
+    }
+    fn get(ptr: *anyopaque, arena: std.mem.Allocator, cid: []const u8) anyerror![]const u8 {
+        const self: *CountingStore = @ptrCast(@alignCast(ptr));
+        return self.inner.get(arena, cid);
+    }
+    fn put(ptr: *anyopaque, arena: std.mem.Allocator, bytes: []const u8) anyerror![]const u8 {
+        const self: *CountingStore = @ptrCast(@alignCast(ptr));
+        self.puts += 1;
+        return self.inner.put(arena, bytes);
+    }
+    fn putBlock(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
+        const self: *CountingStore = @ptrCast(@alignCast(ptr));
+        self.puts += 1;
+        return self.inner.putBlock(cid, bytes);
+    }
+};
+
+/// A raw transaction: one input (`prev`), `n` outputs of `script` (unsigned: putTx does not verify).
+fn rawTx(a: std.mem.Allocator, prev: [32]u8, prev_vout: u32, n: u32, script: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
+    try out.appendSlice(a, &prev);
+    try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u32, prev_vout)));
+    try out.appendSlice(a, &.{ 0, 0xff, 0xff, 0xff, 0xff });
+    if (n < 0xfd) try out.append(a, @intCast(n)) else {
+        try out.append(a, 0xfd);
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(n))));
+    }
+    for (0..n) |i| {
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u64, 1000 + i)));
+        try out.append(a, @intCast(script.len));
+        try out.appendSlice(a, script);
+    }
+    try out.appendSlice(a, &.{ 0, 0, 0, 0 });
+    return out.items;
+}
+
+fn insertOutput(a: std.mem.Allocator, w: *lib.wallet.Wallet, txid: [32]u8, tx_cid: []const u8, vout: u32) !void {
+    try w.putOutput(txid, vout, .{ .map = try a.dupe(lib.cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "output" } },
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
+        .{ .key = "vout", .value = .{ .uint = vout } },
+        .{ .key = "tx", .value = .{ .cid = tx_cid } },
+        .{ .key = "basket", .value = .{ .text = "tokens" } },
+        .{ .key = "protocol", .value = .{ .text = "basket insertion" } },
+    }) });
+}
+
+/// Blocks written (put / putblock calls) to add one transaction of ours — the
+/// transaction, its action, one output record, the index nodes and the state
+/// record — to a wallet holding `n` outputs.
+fn costOfOneTx(n: u32) !usize {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const script = lib.brc29.p2pkh(try lib.brc29.identityKey(.{0x33} ** 32));
+    var w = try lib.wallet.Wallet.load(a, ms.store(), null, .regtest);
+    const big = try rawTx(a, .{0x11} ** 32, 0, n, &script);
+    const big_txid = beef.txidOf(big);
+    const big_cid = try w.putTx(big_txid, big);
+    try w.putAction(big_txid, big_cid, "many", &.{}, null);
+    for (0..n) |i| try insertOutput(a, &w, big_txid, big_cid, @intCast(i));
+    const state = try w.save();
+
+    var cs = CountingStore{ .inner = ms.store() };
+    var w2 = try lib.wallet.Wallet.load(a, cs.store(), state, .regtest);
+    const one = try rawTx(a, big_txid, n / 2, 1, &script);
+    const one_txid = beef.txidOf(one);
+    const one_cid = try w2.putTx(one_txid, one);
+    try w2.putAction(one_txid, one_cid, "one", &.{}, null);
+    try insertOutput(a, &w2, one_txid, one_cid, 0);
+    _ = try w2.save();
+    // The spent output moved in byBasket.
+    try std.testing.expectEqual(@as(usize, n), (try w2.listOutputs("tokens", false)).len);
+    return cs.puts;
+}
+
+test "index cost: blocks written per transaction, independent of store size (#41)" {
+    // 10k outputs natively; fewer under wasm32-wasi (building the store there
+    // runs the test runner's allocator out of pages, not the wallet).
+    const n: u32 = if (@import("builtin").cpu.arch == .wasm32) 2_000 else 10_000;
+    const small = try costOfOneTx(100);
+    const large = try costOfOneTx(n);
+    std.debug.print("\nindex cost: one tx writes {d} blocks at 100 outputs, {d} at {d} outputs\n", .{ small, large, n });
+    // Bounded, and independent of the store's size (the MST's depth grows by
+    // one level per ×32 keys: a few nodes at most between the two).
+    try std.testing.expect(large < 40);
+    try std.testing.expect(large <= small + 8);
 }
 
 fn cbor_cid(b: u8) [36]u8 {
