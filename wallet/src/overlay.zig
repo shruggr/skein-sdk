@@ -12,7 +12,10 @@
 //!   admitted       tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, refs}
 //!   applied        tp ‖ txid → applied record {kind: "applied", topic, txid, outputsToAdmit, coinsToRetain, coinsRemoved, at, tx, refs}
 //!   byTopic        tp ‖ 0 (unspent) | 1 (spent) ‖ outpoint → null         derived
-//!   byScript       sha256(script) ‖ tp ‖ 0 | 1 ‖ outpoint → null          derived
+//!
+//! Indexes for answering queries are not here: each lookup service keeps its
+//! own, under its own head, through the hooks the engine calls (#50: `Caller`,
+//! `hookAdmitted`, `hookRejected`; programs/overlay/src/lookup.zig).
 //!
 //! Spent within a topic (#36 notes) is not a table of its own: it is
 //! `admitted` joined to the spends edge — the wallet's `spent[outpoint]`, the
@@ -36,7 +39,7 @@ const bsvz = @import("bsvz");
 const cbor = @import("cbor.zig");
 const hdr = @import("header.zig");
 const beef_mod = @import("beef.zig");
-const spv = @import("spv.zig");
+const merkle = @import("merkle.zig");
 const store_mod = @import("store.zig");
 const wallet_mod = @import("wallet.zig");
 
@@ -64,13 +67,39 @@ pub const Applied = struct {
     records: []const []const u8 = &.{},
 };
 
-/// A submitted transaction, verified: its BEEF, the subject, and which
-/// entries a BUMP proved.
-pub const Submission = struct {
-    beef: beef_mod.Beef,
+/// A transaction being judged: its txid, its CID (bitcoin-tx), and the
+/// transaction as its block decodes.
+pub const Subject = struct {
     txid: [32]u8,
+    cid: []const u8,
     tx: Transaction,
-    proven: []const bool,
+};
+
+/// A transaction a submission carried, as decoded: its txid and block bytes.
+pub const DecodedTx = struct { txid: [32]u8, raw: []const u8 };
+/// A BUMP's block, as the submission's merkle nodes reach it: its height and root.
+pub const Bump = struct { height: u32, root: [32]u8 };
+/// A transaction a BUMP proves (flagged as a txid in it), at that BUMP's height.
+pub const Proven = struct { txid: [32]u8, height: u32 };
+
+/// A submitted BEEF decoded into records (#50): each transaction a
+/// `bitcoin-tx` block, each BUMP the merkle nodes it reveals (64-byte
+/// `bitcoin-tx` blocks, merkle.zig). The blocks are put when decoded — in a
+/// front-door call they land in the call's in-memory overlay, and nothing
+/// persists unless the submission is admitted. What is here besides the
+/// blocks is what the BEEF said about them: the order, the subject, which
+/// BUMP proves which transaction, which entries named a txid only.
+pub const Decoded = struct {
+    subject: [32]u8,
+    /// Every transaction with its bytes, in BEEF order (parents first).
+    txs: []const DecodedTx,
+    /// The merkle nodes the BUMPs reveal, each once.
+    nodes: []const merkle.Node,
+    /// The BUMPs that prove something here (a txid-flagged leaf, or one of ours).
+    bumps: []const Bump,
+    proven: []const Proven,
+    /// Entries that named a txid only (they must be held).
+    txid_only: []const [32]u8,
 };
 
 pub fn topicPrefix(a: std.mem.Allocator, topic: []const u8) ![]u8 {
@@ -82,37 +111,148 @@ fn cat(a: std.mem.Allocator, parts: []const []const u8) ![]u8 {
     return std.mem.concat(a, u8, parts);
 }
 
-fn scriptHash(script: []const u8) [32]u8 {
-    var h: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(script, &h, .{});
-    return h;
-}
-
 // ---------------------------------------------------------------- submit (BRC-22)
 
-/// Parse a submitted BEEF (V1, V2 or Atomic: the subject is the Atomic
-/// BEEF's, else the last transaction) and verify it against our chain as
-/// `internalize` does: every BUMP's root is our header's at its height (an
-/// unknown height is refused), every unproven transaction's inputs come
-/// earlier or are held, with their scripts verified. A subject already
-/// rejected, or spending an output a proven transaction spends, is refused.
-pub fn verify(w: *Wallet, bytes: []const u8) !Submission {
-    const a = w.arena;
+/// Whether the BUMP flags this txid as a transaction (not just a sibling hash).
+fn flagged(p: merkle.MerklePath, txid: [32]u8) bool {
+    if (p.path.len == 0) return false;
+    for (p.path[0]) |leaf| if (leaf.hash) |h| if (std.mem.eql(u8, &h.bytes, &txid)) return leaf.txid orelse false;
+    return false;
+}
+
+/// Decode a submitted BEEF (V1, V2 or Atomic: the subject is the Atomic
+/// BEEF's, else the last transaction) into records, parsing it once (#50):
+/// each transaction put as its `bitcoin-tx` block, each BUMP as the merkle
+/// nodes it reveals (hash-checked by the store). Nothing is kept here: in a
+/// front-door call the blocks live in the call's overlay; the step that
+/// admits the submission holds them (`holdDecoded`). Structure is checked
+/// (parents first, a BUMP that names a transaction holds it, BUMPs that
+/// agree with themselves); the chain and the scripts are `verifyDecoded`'s.
+pub fn decode(a: std.mem.Allocator, s: store_mod.Store, bytes: []const u8) !Decoded {
     const b = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
     const subject = b.subject() orelse return error.InvalidBeef;
     const entry = b.find(subject) orelse return error.InvalidBeef;
-    const tx = entry.tx orelse return error.InvalidBeef; // a txid-only subject
-    var ctx = Wallet.SpvCtx{ .w = w };
-    const checked = try spv.verify(a, b, .{ .ptr = &ctx, .rootAtFn = Wallet.SpvCtx.rootAt, .knownRawFn = Wallet.SpvCtx.knownRaw });
-    if (try w.map("rejected").has(&subject)) return error.TransactionRejected;
-    for (tx.inputs) |in| {
+    if (entry.raw == null) return error.InvalidBeef; // a txid-only subject
+    if (!beef_mod.parentsFirst(b)) return error.NotParentsFirst;
+
+    // The BUMPs that prove something here: their nodes, and the root they reach.
+    var bumps: std.ArrayList(Bump) = .empty;
+    var nodes: std.ArrayList(merkle.Node) = .empty;
+    const bump_of = try a.alloc(?usize, b.bumps.len); // BEEF bump index → `bumps` index
+    for (b.bumps, bump_of) |p, *bi| {
+        bi.* = null;
+        if (p.path.len == 0) return error.RootMismatch;
+        var relevant = false;
+        for (p.path[0]) |leaf| {
+            const h = leaf.hash orelse continue;
+            relevant = relevant or (leaf.txid orelse false) or b.find(h.bytes) != null;
+        }
+        if (!relevant) continue; // a BUMP proving nothing here is harmless
+        const rev = merkle.reveal(a, p) catch return error.RootMismatch;
+        outer: for (rev.nodes) |n| {
+            for (nodes.items) |m| if (std.mem.eql(u8, &m.hash, &n.hash)) continue :outer;
+            try nodes.append(a, n);
+        }
+        bi.* = bumps.items.len;
+        try bumps.append(a, .{ .height = p.block_height, .root = rev.root });
+    }
+    for (nodes.items) |n| try s.putBlock(&merkle.nodeCid(n.hash), &n.bytes);
+
+    var txs: std.ArrayList(DecodedTx) = .empty;
+    var proven: std.ArrayList(Proven) = .empty;
+    var txid_only: std.ArrayList([32]u8) = .empty;
+    for (b.entries) |e| {
+        switch (e.format) {
+            .txid_only => {
+                try txid_only.append(a, e.txid);
+                continue;
+            },
+            .raw_with_bump => {
+                const i = e.bump.?;
+                if (!beef_mod.bumpHas(b.bumps[i], e.txid)) return error.NotInBump;
+                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[bump_of[i].?].height });
+            },
+            .raw => for (b.bumps, bump_of) |p, bi| {
+                const i = bi orelse continue;
+                if (!flagged(p, e.txid)) continue;
+                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[i].height });
+                break;
+            },
+        }
+        const raw = e.raw.?;
+        try s.putBlock(&store_mod.hashCid(.tx, e.txid), raw);
+        try txs.append(a, .{ .txid = e.txid, .raw = raw });
+    }
+    return .{ .subject = subject, .txs = txs.items, .nodes = nodes.items, .bumps = bumps.items, .proven = proven.items, .txid_only = txid_only.items };
+}
+
+/// A transaction's block, read (`get`: in a call, through its overlay) and decoded.
+pub fn subjectOf(w: *Wallet, txid: [32]u8) !Subject {
+    const c = try w.arena.dupe(u8, &store_mod.hashCid(.tx, txid));
+    const raw = w.store.get(w.arena, c) catch return error.MissingInput;
+    return .{ .txid = txid, .cid = c, .tx = Transaction.parse(w.arena, raw) catch return error.InvalidBeef };
+}
+
+fn provenAt(d: Decoded, txid: [32]u8) ?u32 {
+    for (d.proven) |p| if (std.mem.eql(u8, &p.txid, &txid)) return p.height;
+    return null;
+}
+
+fn rootAtHeight(d: Decoded, height: u32) ?[32]u8 {
+    for (d.bumps) |b| if (b.height == height) return b.root;
+    return null;
+}
+
+/// SPV over the decoded records (#50), against our chain, as `internalize`
+/// does over a BEEF: every BUMP's root is our header's at its height (an
+/// unknown height is refused) and each proven transaction is reached from it
+/// through the merkle nodes; every other transaction's inputs come from a
+/// transaction decoded before it or held, read through `get`, with their
+/// scripts verified; a txid-only entry names a transaction we hold. A
+/// subject already rejected, or spending an output a proven transaction
+/// spends, is refused. → the subject.
+pub fn verifyDecoded(w: *Wallet, d: Decoded) !Subject {
+    const a = w.arena;
+    for (d.bumps) |b| {
+        const want = (try w.chain().rootAt(b.height)) orelse return error.UnknownHeader;
+        if (!std.mem.eql(u8, &want, &b.root)) return error.RootMismatch;
+    }
+    for (d.proven) |p| {
+        const root = rootAtHeight(d, p.height) orelse return error.NotInBump;
+        if ((try merkle.pathFor(a, w.store, root, p.height, p.txid)) == null) return error.NotInBump;
+    }
+    for (d.txid_only) |t| if ((try w.txRaw(t)) == null) return error.UnknownTxidOnly;
+    for (d.txs, 0..) |t, i| {
+        if (provenAt(d, t.txid) != null) continue;
+        const sub = try subjectOf(w, t.txid);
+        for (sub.tx.inputs, 0..) |in, k| {
+            const src_txid = in.previous_outpoint.txid.bytes;
+            const earlier = for (d.txs[0..i]) |x| {
+                if (std.mem.eql(u8, &x.txid, &src_txid)) break true;
+            } else false;
+            if (!earlier and (try w.txRaw(src_txid)) == null) return error.MissingInput;
+            const src = try subjectOf(w, src_txid);
+            if (in.previous_outpoint.index >= src.tx.outputs.len) return error.MissingInput;
+            const ok = bsvz.script.interpreter.verifyPrevout(.{
+                .allocator = a,
+                .tx = &sub.tx,
+                .input_index = k,
+                .previous_output = src.tx.outputs[in.previous_outpoint.index],
+                .unlocking_script = in.unlocking_script,
+            }) catch false;
+            if (!ok) return error.ScriptFailed;
+        }
+    }
+    const subject = try subjectOf(w, d.subject);
+    if (try w.map("rejected").has(&d.subject)) return error.TransactionRejected;
+    for (subject.tx.inputs) |in| {
         const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
         for (try w.spendersOf(op)) |other| {
-            if (std.mem.eql(u8, &other, &subject)) continue;
+            if (std.mem.eql(u8, &other, &d.subject)) continue;
             if ((try w.status(other)) == .proven) return error.DoubleSpend;
         }
     }
-    return .{ .beef = b, .txid = subject, .tx = tx, .proven = checked.proven };
+    return subject;
 }
 
 /// Whether the topic judged this transaction already (a dupe: BRC-22 answers it with nothing new).
@@ -170,22 +310,24 @@ pub fn spender(w: *Wallet, topic: []const u8, txid: [32]u8, vout: u32) !?struct 
     return .{ .txid = sp, .retained = retained, .judged = true };
 }
 
-/// Hold the submission's transactions (and the proofs its BUMPs carry) like
-/// any other we hold: blocks (kept: `spends` edges, #42), `txs`. → the
-/// subject's CID.
-pub fn hold(w: *Wallet, sub: Submission) ![]const u8 {
-    var subject_cid: []const u8 = "";
-    for (sub.beef.entries, sub.proven) |e, proven| {
-        const raw = e.raw orelse continue;
-        const c = try w.putTx(e.txid, raw);
-        if (std.mem.eql(u8, &e.txid, &sub.txid)) subject_cid = c;
-        if (!proven or (try w.map("proofs").has(&e.txid))) continue;
-        for (sub.beef.bumps) |p| if (beef_mod.bumpHas(p, e.txid)) {
-            try w.putProof(e.txid, p);
-            break;
-        };
+/// Hold a submission's decoded records (#50), in the step that admits it,
+/// like any other transactions we hold: each transaction's block kept
+/// (`spends` edges, #42) and in `txs`; the merkle nodes kept (`child`
+/// edges); each proven transaction's proof recorded (`proofs`, from the
+/// header its nodes reach). `txs` are block bytes, `nodes` 64-byte merkle
+/// nodes: the records the submit entry carries, not a BEEF.
+pub fn holdDecoded(w: *Wallet, txs: []const []const u8, nodes: []const []const u8, proven: []const Proven) !void {
+    for (txs) |raw| _ = try w.putTx(store_mod.dblSha256(raw), raw);
+    for (nodes) |n| {
+        if (n.len != 64) return error.BadNode;
+        const c = merkle.nodeCid(store_mod.dblSha256(n));
+        try w.store.putBlock(&c, n);
+        try w.store.keep(&c);
     }
-    return subject_cid;
+    for (proven) |p| {
+        if (try w.map("proofs").has(&p.txid)) continue;
+        try w.putProofAt(p.txid, p.height);
+    }
 }
 
 fn contains(xs: []const u32, x: u32) bool {
@@ -221,23 +363,30 @@ pub fn check(tx: Transaction, previous: []const u32, ins: Instructions) !void {
     }
 }
 
-/// Record a topic's judgement of a verified submission (BRC-22 step 4): the
-/// transactions held (when the topic took anything: an output or a previous
-/// coin), each admitted output as an admittance record in `admitted`, the
-/// judgement (which previous coins it retains, which it removes) in
-/// `applied` — both with rel `admits` on the transaction. The previous coins
-/// are spent by the transaction's own `spends` edges (held here). `previous` is
-/// `previousCoins` for this topic, taken before any judgement of this step.
-/// A transaction the topic judged before is a dupe: nothing is written.
-pub fn apply(w: *Wallet, sub: Submission, topic: []const u8, previous: []const u32, ins: Instructions) !Applied {
+/// Whether a topic's instructions take anything: an output admitted, or a
+/// previous coin consumed (retained or removed). One that takes nothing
+/// records nothing.
+pub fn takes(previous: []const u32, ins: Instructions) bool {
+    return ins.outputs_to_admit.len > 0 or previous.len > 0;
+}
+
+/// Record a topic's judgement of a held submission (BRC-22 step 4; the
+/// step holds the decoded records first, `holdDecoded`): each admitted
+/// output as an admittance record in `admitted`, the judgement (which
+/// previous coins it retains, which it removes) in `applied` — both with rel
+/// `admits` on the transaction. The previous coins are spent by the
+/// transaction's own `spends` edges (held). `previous` is `previousCoins`
+/// for this topic, taken before any judgement of this step. A transaction
+/// the topic judged before is a dupe: nothing is written.
+pub fn apply(w: *Wallet, sub: Subject, topic: []const u8, previous: []const u32, ins: Instructions) !Applied {
     const a = w.arena;
     if (try isApplied(w, topic, sub.txid)) return .{ .dupe = true };
     try check(sub.tx, previous, ins);
     var removed: std.ArrayList(u32) = .empty;
     for (previous) |p| if (!contains(ins.coins_to_retain, p)) try removed.append(a, p);
-    if (ins.outputs_to_admit.len == 0 and previous.len == 0) return .{};
+    if (!takes(previous, ins)) return .{};
 
-    const tx_cid = try hold(w, sub);
+    const tx_cid = sub.cid;
     const tp = try topicPrefix(a, topic);
     const txid_hex = try a.dupe(u8, &hdr.toHex(sub.txid));
     var records: std.ArrayList([]const u8) = .empty;
@@ -284,32 +433,27 @@ pub fn apply(w: *Wallet, sub: Submission, topic: []const u8, previous: []const u
 
 // ---------------------------------------------------------------- derived, maintained (#41)
 
-/// An admitted output's `byTopic` / `byScript` keys (key = tp ‖ outpoint),
-/// under whether the outpoint is spent (the wallet's `spent`: a spender we
-/// hold that is not rejected).
+/// An admitted output's `byTopic` key (key = tp ‖ outpoint), under whether
+/// the outpoint is spent (the wallet's `spent`: a spender we hold that is not
+/// rejected).
 pub fn refreshAdmitted(w: *Wallet, key: []const u8) !void {
     const a = w.arena;
-    const rc = (try w.map("admitted").link(key)) orelse return;
+    if (!(try w.map("admitted").has(key))) return;
     const tl = 1 + @as(usize, key[0]);
     if (key.len != tl + 36) return error.BadIndex;
     const state: u8 = if (try w.map("spent").has(key[tl..])) 1 else 0;
-    const sh = scriptHash((try w.record(rc)).getBytes("script") orelse return error.BadRecord);
     _ = try w.map("byTopic").remove(try cat(a, &.{ key[0..tl], &.{1 - state}, key[tl..] }));
     try w.map("byTopic").add(try cat(a, &.{ key[0..tl], &.{state}, key[tl..] }));
-    _ = try w.map("byScript").remove(try cat(a, &.{ &sh, key[0..tl], &.{1 - state}, key[tl..] }));
-    try w.map("byScript").add(try cat(a, &.{ &sh, key[0..tl], &.{state}, key[tl..] }));
 }
 
 /// An admittance vanishes (its transaction was rejected): the record and every derived key of it.
 pub fn unadmit(w: *Wallet, key: []const u8) !void {
     const a = w.arena;
-    const rc = (try w.map("admitted").link(key)) orelse return;
+    if (!(try w.map("admitted").has(key))) return;
     const tl = 1 + @as(usize, key[0]);
     if (key.len != tl + 36) return error.BadIndex;
-    const sh = scriptHash((try w.record(rc)).getBytes("script") orelse return error.BadRecord);
     for ([_]u8{ 0, 1 }) |state| {
         _ = try w.map("byTopic").remove(try cat(a, &.{ key[0..tl], &.{state}, key[tl..] }));
-        _ = try w.map("byScript").remove(try cat(a, &.{ &sh, key[0..tl], &.{state}, key[tl..] }));
     }
     _ = try w.map("admitted").remove(key);
 }
@@ -323,6 +467,126 @@ pub fn spentChanged(w: *Wallet, op: [36]u8) !void {
         const id = kv.key[33..];
         if (id.len < 37 or !std.mem.eql(u8, id[id.len - 36 ..], &op)) continue;
         try refreshAdmitted(w, id);
+    }
+}
+
+// ---------------------------------------------------------------- programs: topics and lookup services (#50)
+
+/// An in-VM call (#40) as the overlay makes it: `program`'s function `func`
+/// on `arg` → its answer. The VM's `call` import in a program; a dispatch
+/// table in the native tests.
+pub const Caller = struct {
+    ctx: *anyopaque,
+    callFn: *const fn (ctx: *anyopaque, a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value,
+
+    pub fn call(self: Caller, a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) !Value {
+        return self.callFn(self.ctx, a, program, func, arg);
+    }
+};
+
+/// A genesis config map (defaults.<key>: a JSON object in a string).
+pub fn configObject(a: std.mem.Allocator, in: Value, key: []const u8) !std.json.ObjectMap {
+    const text = if (in.get("defaults")) |d| d.getText(key) orelse "{}" else "{}";
+    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;
+    if (j != .object) return error.BadConfig;
+    return j.object;
+}
+
+/// A program record by its genesis name (the step's or call's `programs`).
+pub fn programNamed(in: Value, name: []const u8) !?[]const u8 {
+    const progs = in.get("programs") orelse return error.BadConfig;
+    return progs.getCid(name) orelse {
+        std.log.err("config names program {s}, not in the genesis programs", .{name});
+        return error.BadConfig;
+    };
+}
+
+/// A configured name's program: the value is the `bin/` program name, or
+/// (defaults.overlayLookups) an object `{program, topics?}`.
+pub fn configuredProgram(in: Value, map: std.json.ObjectMap, name: []const u8) !?[]const u8 {
+    const v = map.get(name) orelse return null;
+    const prog = switch (v) {
+        .string => |s| s,
+        .object => |o| if (o.get("program")) |p| (if (p == .string) p.string else return error.BadConfig) else return error.BadConfig,
+        else => return error.BadConfig,
+    };
+    return programNamed(in, prog);
+}
+
+/// A lookup service that listens to a topic.
+pub const Listener = struct { service: []const u8, program: []const u8 };
+
+/// The lookup services listening to `topic` (defaults.overlayLookups, #50):
+/// `{"ls_x": {"program": "<bin/ name>", "topics": ["tm_x", …]}}`; the short
+/// form `{"ls_x": "<bin/ name>"}` listens to every topic the instance serves
+/// (defaults.overlayTopics). In the config's order.
+pub fn listeners(a: std.mem.Allocator, in: Value, topic: []const u8) ![]Listener {
+    const lookups = try configObject(a, in, "overlayLookups");
+    const topics = try configObject(a, in, "overlayTopics");
+    var out: std.ArrayList(Listener) = .empty;
+    var it = lookups.iterator();
+    while (it.next()) |e| {
+        const listens = switch (e.value_ptr.*) {
+            .string => topics.contains(topic),
+            .object => |o| blk: {
+                const ts = o.get("topics") orelse break :blk topics.contains(topic);
+                if (ts != .array) return error.BadConfig;
+                for (ts.array.items) |t| {
+                    if (t != .string) return error.BadConfig;
+                    if (std.mem.eql(u8, t.string, topic)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => return error.BadConfig,
+        };
+        if (!listens) continue;
+        try out.append(a, .{ .service = e.key_ptr.*, .program = (try configuredProgram(in, lookups, e.key_ptr.*)).? });
+    }
+    return out.items;
+}
+
+fn hookArg(a: std.mem.Allocator, service: []const u8, topic: []const u8, rest: []const cbor.Entry) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
+        .{ .key = "service", .value = .{ .text = service } },
+        .{ .key = "topic", .value = .{ .text = topic } },
+    });
+    try es.appendSlice(a, rest);
+    return .{ .map = es.items };
+}
+
+/// A topic admitted a transaction (in the step that recorded it): each of
+/// its lookup services' `admitted(topic, tx, outputsToAdmit, coinsRetained)`,
+/// then `spent(topic, outpoint, spendingTx)` for each previous coin it consumed.
+pub fn hookAdmitted(a: std.mem.Allocator, caller: Caller, in: Value, topic: []const u8, sub: Subject, previous: []const u32, applied: Applied) !void {
+    for (try listeners(a, in, topic)) |l| {
+        _ = try caller.call(a, l.program, "admitted", try hookArg(a, l.service, topic, &.{
+            .{ .key = "tx", .value = .{ .cid = sub.cid } },
+            .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
+            .{ .key = "coinsRetained", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
+        }));
+        for (previous) |p| {
+            const in_ = sub.tx.inputs[p];
+            _ = try caller.call(a, l.program, "spent", try hookArg(a, l.service, topic, &.{
+                .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+                    .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &store_mod.hashCid(.tx, in_.previous_outpoint.txid.bytes)) } },
+                    .{ .key = "vout", .value = .{ .uint = in_.previous_outpoint.index } },
+                }) } },
+                .{ .key = "spendingTx", .value = .{ .cid = sub.cid } },
+            }));
+        }
+    }
+}
+
+/// The topics' judgements a rejection removed (Wallet.reject → `unapplied`,
+/// in the walk's order): each topic's lookup services' `rejected(topic, tx)`.
+pub fn hookRejected(a: std.mem.Allocator, caller: Caller, in: Value, gone: []const wallet_mod.Unapplied) !void {
+    for (gone) |g| {
+        const cid = try a.dupe(u8, &store_mod.hashCid(.tx, g.txid));
+        for (try listeners(a, in, g.topic)) |l| {
+            _ = try caller.call(a, l.program, "rejected", try hookArg(a, l.service, g.topic, &.{.{ .key = "tx", .value = .{ .cid = cid } }}));
+        }
     }
 }
 
@@ -353,23 +617,6 @@ pub fn inTopic(w: *Wallet, topic: []const u8, include_spent: bool) ![]Admitted {
     for ([_]u8{ 0, 1 }) |state| {
         if (state == 1 and !include_spent) continue;
         for (try w.map("byTopic").prefixed(try cat(a, &.{ tp, &.{state} }))) |kv| try out.append(a, try admittedAt(w, tp, kv.key[tp.len + 1 ..], state == 1));
-    }
-    return out.items;
-}
-
-/// The admitted outputs whose locking script hashes (sha256) to `hash`, in
-/// one topic or in any: unspent only unless `include_spent`.
-pub fn byScriptHash(w: *Wallet, hash: [32]u8, topic: ?[]const u8, include_spent: bool) ![]Admitted {
-    const a = w.arena;
-    const prefix = if (topic) |t| try cat(a, &.{ &hash, try topicPrefix(a, t) }) else try a.dupe(u8, &hash);
-    var out: std.ArrayList(Admitted) = .empty;
-    for (try w.map("byScript").prefixed(prefix)) |kv| {
-        const rest = kv.key[32..];
-        const tl = 1 + @as(usize, rest[0]);
-        if (rest.len != tl + 1 + 36) return error.BadIndex;
-        const spent = rest[tl] == 1;
-        if (spent and !include_spent) continue;
-        try out.append(a, try admittedAt(w, rest[0..tl], rest[tl + 1 ..], spent));
     }
     return out.items;
 }

@@ -1137,6 +1137,22 @@ fn spend(a: std.mem.Allocator, ins: []const struct { *const bsvz.transaction.Tra
     return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
 }
 
+/// A submission as the overlay takes it (#50): the BEEF decoded into
+/// records, SPV over them, and (`hold`) the records held as the admitting
+/// step holds them.
+fn submitted(a: std.mem.Allocator, w: *lib.wallet.Wallet, bytes: []const u8, hold: bool) !lib.overlay.Subject {
+    const d = try lib.overlay.decode(a, w.store, bytes);
+    const sub = try lib.overlay.verifyDecoded(w, d);
+    if (hold) {
+        const raws = try a.alloc([]const u8, d.txs.len);
+        for (d.txs, raws) |t, *r| r.* = t.raw;
+        const nodes = try a.alloc([]const u8, d.nodes.len);
+        for (d.nodes, nodes) |n, *o| o.* = try a.dupe(u8, &n.bytes);
+        try lib.overlay.holdDecoded(w, raws, nodes, d.proven);
+    }
+    return sub;
+}
+
 /// The maintained `byTopic` is exactly `admitted` joined to the spends edge (`spent`), key for key (#36, #41).
 fn joinHolds(a: std.mem.Allocator, w: *lib.wallet.Wallet) !void {
     var want: std.ArrayList([]const u8) = .empty;
@@ -1153,7 +1169,6 @@ fn joinHolds(a: std.mem.Allocator, w: *lib.wallet.Wallet) !void {
     const have = try w.map("byTopic").prefixed("");
     try std.testing.expectEqual(want.items.len, have.len);
     for (want.items, have) |x, y| try std.testing.expectEqualSlices(u8, x, y.key);
-    try std.testing.expectEqual(have.len, try w.map("byScript").count());
 }
 
 test "overlay: submit and admit, spend with retained coins, lookups with valid BEEF, a rejected spend restores" {
@@ -1197,7 +1212,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
 
     w = try lib.wallet.Wallet.load(a, s, empty, .regtest);
     w.now = 1000;
-    const sub1 = try ov.verify(&w, t1_beef);
+    const sub1 = try submitted(a, &w, t1_beef, true);
     try std.testing.expectEqualSlices(u8, &t1.txid, &sub1.txid);
     try std.testing.expectEqual(@as(usize, 0), (try ov.previousCoins(&w, "tm_demo", sub1.tx)).len);
     // Out-of-range or duplicate instructions are refused.
@@ -1222,16 +1237,11 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     for (try w.dependentsOf(t1.txid)) |d| rel_ok = rel_ok or (d.tag == .admitted and d.rel == .admits);
     try std.testing.expect(rel_ok);
 
-    // Lookups: by topic and by script hash; the answer's BEEF verifies against our chain.
+    // In the topic; the BEEF a lookup answer carries verifies against our chain.
     {
         const live = try ov.inTopic(&w, "tm_demo", false);
         try std.testing.expectEqual(@as(usize, 1), live.len);
         try std.testing.expectEqualSlices(u8, &t1.txid, &live[0].txid);
-        var sh: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(&token, &sh, .{});
-        try std.testing.expectEqual(@as(usize, 1), (try ov.byScriptHash(&w, sh, "tm_demo", false)).len);
-        try std.testing.expectEqual(@as(usize, 1), (try ov.byScriptHash(&w, sh, null, false)).len);
-        try std.testing.expectEqual(@as(usize, 0), (try ov.byScriptHash(&w, sh, "tm_other", false)).len);
         const ans = try beef.parse(a, try ov.beefFor(&w, t1.txid));
         try std.testing.expectEqualSlices(u8, &t1.txid, &ans.atomic.?);
         var fresh = try lib.wallet.Wallet.load(a, s, empty, .regtest); // verified by a node holding only the headers
@@ -1246,7 +1256,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     const t2_beef = try beef.serialize(a, .{ .version = beef.V2, .atomic = t2.txid, .bumps = &.{}, .entries = e2 });
     w = try lib.wallet.Wallet.load(a, s, s1, .regtest);
     w.now = 2000;
-    const sub2 = try ov.verify(&w, t2_beef); // its input's source is held
+    const sub2 = try submitted(a, &w, t2_beef, true); // its input's source is held
     const prev2 = try ov.previousCoins(&w, "tm_demo", sub2.tx);
     try std.testing.expectEqualSlices(u32, &.{0}, prev2);
     const a2 = try ov.apply(&w, sub2, "tm_demo", prev2, .{ .outputs_to_admit = &.{0}, .coins_to_retain = &.{0} });
@@ -1276,6 +1286,10 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     w = try lib.wallet.Wallet.load(a, s, s2, .regtest);
     w.now = 3000;
     try std.testing.expectEqual(lib.wallet.Wallet.Outcome.rejected, try w.applyStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null));
+    // The judgement it removed, for the topic's lookup services (#50: `rejected`).
+    try std.testing.expectEqual(@as(usize, 1), w.unapplied.items.len);
+    try std.testing.expectEqualStrings("tm_demo", w.unapplied.items[0].topic);
+    try std.testing.expectEqualSlices(u8, &t2.txid, &w.unapplied.items[0].txid);
     const s3 = try w.save();
     try joinHolds(a, &w);
     {
@@ -1285,7 +1299,7 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
         try std.testing.expect(!live[0].spent);
         try std.testing.expect(!(try ov.isApplied(&w, "tm_demo", t2.txid)));
         // Resubmitting a rejected transaction is refused.
-        try std.testing.expectError(error.TransactionRejected, ov.verify(&w, t2_beef));
+        try std.testing.expectError(error.TransactionRejected, submitted(a, &w, t2_beef, false));
     }
     // Deterministic: the same rejection from the same state gives the same state record.
     var w3 = try lib.wallet.Wallet.load(a, s, s2, .regtest);
@@ -1297,6 +1311,10 @@ test "overlay: submit and admit, spend with retained coins, lookups with valid B
     var w4 = try lib.wallet.Wallet.load(a, s, s2, .regtest);
     w4.now = 3000;
     try std.testing.expectEqual(@as(usize, 2), (try w4.reject(t1.txid, "REJECTED")).len);
+    // Both judgements removed, in the walk's order.
+    try std.testing.expectEqual(@as(usize, 2), w4.unapplied.items.len);
+    try std.testing.expectEqualSlices(u8, &t1.txid, &w4.unapplied.items[0].txid);
+    try std.testing.expectEqualSlices(u8, &t2.txid, &w4.unapplied.items[1].txid);
     _ = try w4.save();
     try joinHolds(a, &w4);
     try std.testing.expectEqual(@as(usize, 0), (try ov.inTopic(&w4, "tm_demo", true)).len);
