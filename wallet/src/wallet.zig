@@ -357,7 +357,7 @@ pub const Wallet = struct {
         for (kvs, out) |kv, *d| {
             if (kv.key.len < 33) return error.BadIndex;
             d.* = .{
-                .tag = std.meta.intToEnum(Tag, kv.key[32]) catch return error.BadIndex,
+                .tag = std.enums.fromInt(Tag, kv.key[32]) orelse return error.BadIndex,
                 .id = kv.key[33..],
                 .rel = if (kv.value == .string) Rel.parse(kv.value.string) else null,
             };

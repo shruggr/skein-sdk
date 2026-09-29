@@ -124,7 +124,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Beef {
             } else if (has_bump != 0) return error.InvalidBeef;
         } else {
             if (pos >= bytes.len) return error.InvalidBeef;
-            const fmt = std.meta.intToEnum(Format, bytes[pos]) catch return error.InvalidBeef;
+            const fmt = std.enums.fromInt(Format, bytes[pos]) orelse return error.InvalidBeef;
             pos += 1;
             switch (fmt) {
                 .txid_only => {

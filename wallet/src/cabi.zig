@@ -1,6 +1,6 @@
 //! The few C library functions wit-bindgen's C bindings call (malloc, realloc
 //! for cabi_realloc, free, abort, strlen), for the wallet's component build
-//! (issue #34). Not wasi-libc: linking it would switch std.crypto.random to
+//! (issue #34). Not wasi-libc: linking it would switch Zig's random to
 //! libc's arc4random (another generator over the same entropy), and the
 //! component must make the very same draws — and so the very same attested
 //! requests — as the preview1 build. Blocks carry their size in front, over

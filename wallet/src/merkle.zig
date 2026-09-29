@@ -59,14 +59,14 @@ pub fn reveal(a: std.mem.Allocator, p: MerklePath) !Revealed {
         return .{ .root = h.bytes, .nodes = &.{} };
     }
     var nodes: std.ArrayList(Node) = .empty;
-    var cur = std.AutoArrayHashMap(u64, [32]u8).init(a);
+    var cur: std.AutoArrayHashMapUnmanaged(u64, [32]u8) = .empty;
     var dup = std.AutoHashMap(u64, void).init(a);
-    for (p.path[0]) |e| try take(&cur, &dup, e);
+    for (p.path[0]) |e| try take(a, &cur, &dup, e);
     var level: usize = 0;
     while (level < height) : (level += 1) {
-        var next = std.AutoArrayHashMap(u64, [32]u8).init(a);
+        var next: std.AutoArrayHashMapUnmanaged(u64, [32]u8) = .empty;
         var next_dup = std.AutoHashMap(u64, void).init(a);
-        if (level + 1 < height) for (p.path[level + 1]) |e| try take(&next, &next_dup, e);
+        if (level + 1 < height) for (p.path[level + 1]) |e| try take(a, &next, &next_dup, e);
         const offsets = try a.dupe(u64, cur.keys());
         std.mem.sort(u64, offsets, {}, std.sort.asc(u64));
         for (offsets) |o| {
@@ -78,7 +78,7 @@ pub fn reveal(a: std.mem.Allocator, p: MerklePath) !Revealed {
             try nodes.append(a, n);
             if (next.get(e >> 1)) |given| {
                 if (!std.mem.eql(u8, &given, &n.hash)) return error.ConflictingNode;
-            } else try next.put(e >> 1, n.hash);
+            } else try next.put(a, e >> 1, n.hash);
         }
         cur = next;
         dup = next_dup;
@@ -88,7 +88,7 @@ pub fn reveal(a: std.mem.Allocator, p: MerklePath) !Revealed {
     return .{ .root = root, .nodes = nodes.items };
 }
 
-fn take(m: *std.AutoArrayHashMap(u64, [32]u8), dup: *std.AutoHashMap(u64, void), e: PathElement) !void {
+fn take(a: std.mem.Allocator, m: *std.AutoArrayHashMapUnmanaged(u64, [32]u8), dup: *std.AutoHashMap(u64, void), e: PathElement) !void {
     if (e.duplicate orelse false) {
         if (e.offset & 1 == 0) return error.BadProof; // only a right sibling repeats its left
         try dup.put(e.offset, {});
@@ -96,7 +96,7 @@ fn take(m: *std.AutoArrayHashMap(u64, [32]u8), dup: *std.AutoHashMap(u64, void),
     }
     const h = e.hash orelse return error.BadProof;
     if (m.get(e.offset)) |had| if (!std.mem.eql(u8, &had, &h.bytes)) return error.ConflictingNode;
-    try m.put(e.offset, h.bytes);
+    try m.put(a, e.offset, h.bytes);
 }
 
 /// Put the nodes (hash-checked by the store; one already held is the same

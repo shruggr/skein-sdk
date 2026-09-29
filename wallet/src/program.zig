@@ -154,10 +154,24 @@ pub fn main() u8 {
     run(arena_state.allocator()) catch |e| {
         var buf: [1400]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "wallet: {s}{s}{s}\n", .{ @errorName(e), if (last_error_len > 0) ": " else "", last_error[0..last_error_len] }) catch "wallet: error\n";
-        std.fs.File.stderr().writeAll(msg) catch {};
+        std.Io.File.stderr().writeStreamingAll(io(), msg) catch {};
         return 1;
     };
     return 0;
+}
+
+/// The program's Io: one single-threaded WASI process, no concurrency.
+fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// The thread's random: the kernel's random_get, keyed by the entry, so a
+/// replay draws the same. One random_get of exactly `out`, as Zig 0.15's
+/// std.crypto.random made on wasm32-wasi (no CSPRNG in between), so the
+/// change keys the wallet derives, and its entries, are byte-identical
+/// across the move to 0.16.
+fn threadRandom(out: []u8) void {
+    io().randomSecure(out) catch @panic("random_get failed");
 }
 
 fn hexAlloc(arena: std.mem.Allocator, b: []const u8) ![]u8 {
@@ -360,7 +374,7 @@ fn run(a: std.mem.Allocator) !void {
             const opts = body.get("options");
             // The change key: a fresh BRC-29 derivation of our own, drawn from the thread's random (replayable).
             var rnd: [24]u8 = undefined;
-            std.crypto.random.bytes(&rnd);
+            threadRandom(&rnd);
             const enc = std.base64.standard.Encoder;
             const prefix = try a.alloc(u8, enc.calcSize(12));
             const suffix = try a.alloc(u8, enc.calcSize(12));
@@ -462,7 +476,7 @@ fn run(a: std.mem.Allocator) !void {
     if (sk.keep(res_cid.ptr, @intCast(res_cid.len)) < 0) return failed();
     var line = try hexAlloc(a, res_cid);
     line = try std.mem.concat(a, u8, &.{ line, "\n" });
-    try std.fs.File.stdout().writeAll(line);
+    try std.Io.File.stdout().writeStreamingAll(io(), line);
 }
 
 /// Later entries win (a result may name its txid twice).

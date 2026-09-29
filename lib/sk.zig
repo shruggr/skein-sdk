@@ -9,6 +9,11 @@ const cbor = @import("cbor");
 pub const Value = cbor.Value;
 pub const Allocator = std.mem.Allocator;
 
+/// The program's Io: one single-threaded WASI process, no concurrency.
+pub fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const raw = struct {
     pub extern "skein" fn input(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn get(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
@@ -150,7 +155,7 @@ pub fn callValue(a: Allocator, prog: []const u8, func: []const u8, arg: Value) !
 
 /// Write the answer of a call (stdout) as dag-cbor.
 pub fn answer(a: Allocator, v: Value) !void {
-    try std.fs.File.stdout().writeAll(try cbor.encode(a, v));
+    try std.Io.File.stdout().writeStreamingAll(io(), try cbor.encode(a, v));
 }
 
 /// The genesis program named `name` in an input's `programs`.
@@ -189,7 +194,7 @@ pub fn main(comptime name: []const u8, f: fn (Allocator) anyerror!void) u8 {
         var buf: [2400]u8 = undefined;
         const le = lastError();
         const msg = std.fmt.bufPrint(&buf, name ++ ": {s}{s}{s}\n", .{ if (e == error.Reported) "" else @errorName(e), if (le.len > 0 and e != error.Reported) ": " else "", if (e == error.Reported) reported else le }) catch name ++ ": error\n";
-        std.fs.File.stderr().writeAll(msg) catch {};
+        std.Io.File.stderr().writeStreamingAll(io(), msg) catch {};
         return 1;
     };
     return 0;

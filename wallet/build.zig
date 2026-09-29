@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
 
     // The library, for other builds (programs/overlay, #36: `b.dependency("wallet", …).module("wallet")`).
     const lib = libModule(b, target, optimize);
-    b.modules.put("wallet", lib) catch @panic("OOM");
+    b.modules.put(b.graph.arena, "wallet", lib) catch @panic("OOM");
 
     // Native tests.
     const tests = b.addTest(.{ .root_module = testModule(b, target, optimize) });
@@ -46,8 +46,8 @@ pub fn build(b: *std.Build) void {
     // Needs wasm-tools (-Dwasm-tools, default on PATH) and the adapter
     // (-Dwasi-adapter, else $SKEIN_WASI_ADAPTER, else
     // ~/.local/wasi-adapter-v49.0.1/wasi_snapshot_preview1.command.wasm).
-    const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch "/root";
-    const env_adapter = std.process.getEnvVarOwned(b.allocator, "SKEIN_WASI_ADAPTER") catch null;
+    const home = b.graph.environ_map.get("HOME") orelse "/root";
+    const env_adapter = b.graph.environ_map.get("SKEIN_WASI_ADAPTER");
     const adapter = b.option([]const u8, "wasi-adapter", "the preview1 command adapter (wasmtime v49.0.1)") orelse env_adapter orelse
         b.fmt("{s}/.local/wasi-adapter-v49.0.1/wasi_snapshot_preview1.command.wasm", .{home});
     const wasm_tools = b.option([]const u8, "wasm-tools", "wasm-tools (1.259.0)") orelse "wasm-tools";

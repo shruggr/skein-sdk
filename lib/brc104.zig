@@ -118,7 +118,7 @@ pub fn verifySignature(a: Allocator, protocol: []const u8, key_id: []const u8, c
 /// of the 48 bytes.
 pub fn createNonce(a: Allocator) ![]const u8 {
     var first: [16]u8 = undefined;
-    std.posix.getrandom(&first) catch return error.Random;
+    sk.io().randomSecure(&first) catch return error.Random;
     for (&first) |*b| b.* = 33 + b.* % 94;
     const mac = try createHmac(a, NONCE_PROTOCOL, &first, .self, &first);
     var raw: [48]u8 = undefined;
@@ -130,7 +130,7 @@ pub fn createNonce(a: Allocator) ![]const u8 {
 /// A request or response nonce: 32 random bytes, base64 (the SDK's).
 pub fn random64(a: Allocator) ![]const u8 {
     var raw: [32]u8 = undefined;
-    std.posix.getrandom(&raw) catch return error.Random;
+    sk.io().randomSecure(&raw) catch return error.Random;
     return encode64(a, &raw);
 }
 
