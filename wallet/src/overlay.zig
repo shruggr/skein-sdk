@@ -79,8 +79,9 @@ pub const Subject = struct {
 pub const DecodedTx = struct { txid: [32]u8, raw: []const u8 };
 /// A BUMP's block, as the submission's merkle nodes reach it: its height and root.
 pub const Bump = struct { height: u32, root: [32]u8 };
-/// A transaction a BUMP proves (flagged as a txid in it), at that BUMP's height.
-pub const Proven = struct { txid: [32]u8, height: u32 };
+/// A transaction a BUMP proves (flagged as a txid in it), at that BUMP's
+/// height and its position in it (the leaf offset, the BUMP's depth).
+pub const Proven = struct { txid: [32]u8, height: u32, pos: merkle.Position };
 
 /// A submitted BEEF decoded into records (#50): each transaction a
 /// `bitcoin-tx` block, each BUMP the merkle nodes it reveals (64-byte
@@ -170,12 +171,14 @@ pub fn decode(a: std.mem.Allocator, s: store_mod.Store, bytes: []const u8) !Deco
             .raw_with_bump => {
                 const i = e.bump.?;
                 if (!beef_mod.bumpHas(b.bumps[i], e.txid)) return error.NotInBump;
-                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[bump_of[i].?].height });
+                const pos = merkle.positionIn(b.bumps[i], e.txid) orelse return error.NotInBump;
+                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[bump_of[i].?].height, .pos = pos });
             },
             .raw => for (b.bumps, bump_of) |p, bi| {
                 const i = bi orelse continue;
                 if (!flagged(p, e.txid)) continue;
-                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[i].height });
+                const pos = merkle.positionIn(p, e.txid) orelse return error.NotInBump;
+                try proven.append(a, .{ .txid = e.txid, .height = bumps.items[i].height, .pos = pos });
                 break;
             },
         }
@@ -219,7 +222,7 @@ pub fn verifyDecoded(w: *Wallet, d: Decoded) !Subject {
     }
     for (d.proven) |p| {
         const root = rootAtHeight(d, p.height) orelse return error.NotInBump;
-        if ((try merkle.pathFor(a, w.store, root, p.height, p.txid)) == null) return error.NotInBump;
+        if ((try merkle.pathFor(a, w.store, root, p.height, p.txid, p.pos)) == null) return error.NotInBump;
     }
     for (d.txid_only) |t| if ((try w.txRaw(t)) == null) return error.UnknownTxidOnly;
     for (d.txs, 0..) |t, i| {
@@ -326,7 +329,7 @@ pub fn holdDecoded(w: *Wallet, txs: []const []const u8, nodes: []const []const u
     }
     for (proven) |p| {
         if (try w.map("proofs").has(&p.txid)) continue;
-        try w.putProofAt(p.txid, p.height);
+        try w.putProofAt(p.txid, p.height, p.pos);
     }
 }
 
