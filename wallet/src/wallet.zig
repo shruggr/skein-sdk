@@ -1059,7 +1059,9 @@ pub const Wallet = struct {
     /// the record's own. (`applyStatus` re-notes a changed status through
     /// `noteBroadcast`, which drops the field: only "pending" is read, and a
     /// pending submission's status is never applied before it is admitted.)
-    pub fn noteSubmission(self: *Wallet, txid: [32]u8, arc: []const u8, tx_status: []const u8, submission: ?[]const u8) !void {
+    /// `thread`: the thread carrying the submission (#66: a resubmission's
+    /// client waits on it while it is pending); kept from the prior record if null.
+    pub fn noteSubmission(self: *Wallet, txid: [32]u8, arc: []const u8, tx_status: []const u8, submission: ?[]const u8, thread: ?[]const u8) !void {
         const a = self.arena;
         const prior = try self.awaitingRecord(txid);
         const since: u64 = if (prior) |r| r.getUint("since") orelse @intCast(@max(self.now, 0)) else @intCast(@max(self.now, 0));
@@ -1073,6 +1075,7 @@ pub const Wallet = struct {
             .{ .key = "since", .value = .{ .uint = since } },
         });
         if (submission orelse if (prior) |r| r.getText("submission") else null) |s| try fields.append(a, .{ .key = "submission", .value = .{ .text = s } });
+        if (thread orelse if (prior) |r| r.getCid("thread") else null) |t| try fields.append(a, .{ .key = "thread", .value = .{ .cid = t } });
         const cid = try self.store.putValue(a, .{ .map = fields.items });
         try self.map("awaiting").putLink(&txid, cid);
     }
