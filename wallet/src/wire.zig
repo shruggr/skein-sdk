@@ -16,6 +16,13 @@ pub const Counterparty = union(enum) {
     other: [33]u8,
 };
 
+/// getPublicKey for the instance's identity key itself: not privileged, no
+/// permission prompt (BRC-100 getPublicKey with identityKey: true; BRC-103
+/// publishes this key in the auth handshake).
+pub fn identityKeyFrame(arena: std.mem.Allocator) ![]u8 {
+    return arena.dupe(u8, &.{ call_get_public_key, 0, 1, 0, 0xff, 0 });
+}
+
 fn varint(arena: std.mem.Allocator, out: *std.ArrayList(u8), v: u64) !void {
     var b: [9]u8 = undefined;
     const n = try VarInt.encodeInto(&b, v);
