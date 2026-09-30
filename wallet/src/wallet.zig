@@ -1053,6 +1053,30 @@ pub const Wallet = struct {
         try self.map("awaiting").putLink(&txid, cid);
     }
 
+    /// As `noteBroadcast`, for an overlay's submission (#57): the record also
+    /// carries `submission` — "pending" while ARC has not taken the
+    /// transaction (nothing admitted yet), "admitted" once it has; null keeps
+    /// the record's own. (`applyStatus` re-notes a changed status through
+    /// `noteBroadcast`, which drops the field: only "pending" is read, and a
+    /// pending submission's status is never applied before it is admitted.)
+    pub fn noteSubmission(self: *Wallet, txid: [32]u8, arc: []const u8, tx_status: []const u8, submission: ?[]const u8) !void {
+        const a = self.arena;
+        const prior = try self.awaitingRecord(txid);
+        const since: u64 = if (prior) |r| r.getUint("since") orelse @intCast(@max(self.now, 0)) else @intCast(@max(self.now, 0));
+        var fields: std.ArrayList(cbor.Entry) = .empty;
+        try fields.appendSlice(a, &.{
+            .{ .key = "kind", .value = .{ .text = "broadcast" } },
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
+            .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &store_mod.bitcoinCid(.tx, (try self.txRaw(txid)) orelse return error.UnknownTransaction)) } },
+            .{ .key = "arc", .value = .{ .text = arc } },
+            .{ .key = "txStatus", .value = .{ .text = tx_status } },
+            .{ .key = "since", .value = .{ .uint = since } },
+        });
+        if (submission orelse if (prior) |r| r.getText("submission") else null) |s| try fields.append(a, .{ .key = "submission", .value = .{ .text = s } });
+        const cid = try self.store.putValue(a, .{ .map = fields.items });
+        try self.map("awaiting").putLink(&txid, cid);
+    }
+
     pub fn awaitingRecord(self: *Wallet, txid: [32]u8) !?Value {
         const c = (try self.map("awaiting").link(&txid)) orelse return null;
         return try self.record(c);
