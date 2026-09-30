@@ -26,8 +26,12 @@
 //! Recorded calls: the oracle over the `wallet` import (getPublicKey,
 //! createSignature: no key is ever here), and HTTP to ARC (broadcast, status
 //! re-query) — the `http` import in the preview1 build, standard wasi:http in
-//! the component build (#15, wasi_http.zig), the same requests either way. After a broadcast the thread awaits its transaction's CID with
-//! a deadline; a `status`/`proof` entry for it, or the deadline, steps it.
+//! the component build (#15, wasi_http.zig), the same requests either way —
+//! to the host's broadcast route (#58: `defaults.walletArc`, the router's
+//! /arc, which proxies to its Arcade). After a broadcast the thread awaits its transaction's CID with
+//! a deadline; a `status`/`proof` entry for it, or the deadline, steps it. At
+//! the deadline ARC is asked again; a 404 (it never took the transaction)
+//! posts it again.
 //! A transaction never mined within
 //! defaults.walletAbandonMs of its broadcast is abandoned (rejected); a reorg
 //! that turns ours back to unproven broadcasts them again and awaits them.
@@ -353,7 +357,11 @@ fn run(a: std.mem.Allocator) !void {
                 if (try wal.abandonIfDue(t, abandon_ms)) continue;
                 const arc = r.getText("arc") orelse return error.BadRecord;
                 const url = try std.fmt.allocPrint(a, "{s}/v1/tx/{s}", .{ arc, w.header.toHex(t) });
-                const ans = try arcCall(a, "GET", url, null);
+                var ans = try arcCall(a, "GET", url, null);
+                // 404: ARC never took it (the broadcast failed transiently, or it lost its history): post it again.
+                if (ans.http_status == 404) if (try wal.beefOf(t)) |beef| {
+                    ans = try arcCall(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), beef);
+                };
                 _ = try wal.applyStatus(t, ans.tx_status, ans.merkle_path);
                 if (std.mem.eql(u8, &t, &txid)) try out.append(a, .{ .key = "arc", .value = try ans.value(a) });
             }
