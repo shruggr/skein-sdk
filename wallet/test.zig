@@ -557,6 +557,37 @@ test "wire: the anyone counterparty (BRC-100 code 12) encodes byte-identically t
     counts.wire += 4;
 }
 
+// #59: identityKeyFrame, removed by #37's cleanup (c6a923c) along with the
+// sealing frames it was added for, and restored — a program (the front door's
+// BRC-103 handshake, the AMM validator's pool state, its liveness heartbeat)
+// asks the oracle for the instance's identity key with BRC-100's getPublicKey
+// (identityKey: true), byte-identical to the pre-c6a923c encoding and
+// cross-checked against amm-poc-zig016's own copy of the frame
+// (programs/amm-topic/src/frames.zig, identityKeyFrame).
+test "wire: identityKeyFrame (BRC-100 getPublicKey, identityKey: true) encodes byte-identically to the pre-#37 encoding; round-trips through the mock oracle" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // getPublicKey: 08 00 (call, empty originator) 01 (identityKey: true)
+    // 00 (level 0) ff (privilegedReason: none, no protocol/keyID/counterparty)
+    // 00 (seekPermission).
+    const gp = try lib.wire.identityKeyFrame(a);
+    try std.testing.expectEqualStrings("08000100ff00", try hexOf(a, gp));
+
+    // Round-trips through the mock oracle used by the wire tests (VectorOracle,
+    // above): registered by the exact identityKeyFrame bytes, answered with a
+    // real getPublicKey result frame from vectors/wire.json, and parsed back
+    // through wire.zig's own result reader.
+    var vo = VectorOracle{};
+    try vo.frames.put(a, try hexOf(a, gp), "000310c283aac7b35b4ae6fab201d36e8322c3408331149982e16013a5bcb917081c");
+
+    const gp_res = try VectorOracle.call(&vo, a, gp);
+    try std.testing.expectEqualStrings("0310c283aac7b35b4ae6fab201d36e8322c3408331149982e16013a5bcb917081c", &std.fmt.bytesToHex(try lib.wire.publicKeyResult(gp_res), .lower));
+    try std.testing.expectEqual(@as(usize, 1), vo.calls);
+    counts.wire += 2;
+}
+
 // ---------------------------------------------------------------- signing through the oracle
 
 /// The oracle as go-sdk's ProtoWallet answered it: every request frame must be one
