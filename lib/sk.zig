@@ -29,8 +29,7 @@ pub const raw = struct {
     pub extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
     pub extern "skein" fn subscribe(op: [*]const u8, op_len: u32, sender: [*]const u8, sender_len: u32, box: [*]const u8, box_len: u32, handler: [*]const u8, handler_len: u32) i32;
     pub extern "skein" fn wallet(frame: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
-    pub extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
-    pub extern "skein" fn libp2p(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn emit(msg: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn deadline(until_ms: i64) i32;
     pub extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
@@ -147,20 +146,22 @@ pub fn wallet(a: Allocator, frame: []const u8) ![]u8 {
     return result(a, raw.wallet, .{ frame.ptr, n32(frame.len) });
 }
 
-/// One HTTP request {method, url, headers?, body?} → {status, headers, body}.
-pub fn http(a: Allocator, req: Value) !Value {
-    const bytes = try cbor.encode(a, req);
-    return cbor.decode(a, try result(a, raw.http, .{ bytes.ptr, n32(bytes.len) }));
+/// Emit a signed message (#70): `body` (a record) to identity `to` in `box`,
+/// about `subject` if given → the message's CID. `to` must be in the address
+/// book; the message goes out when this step ends without error. Its answer
+/// is an entry: `awaitRecord` the CID and end the step, and the reply steps
+/// the thread (input `reply`), or `undelivered` if a mailbox delivery gave up.
+pub fn emit(a: Allocator, to: []const u8, box: []const u8, body: Value, subject: ?[]const u8) ![]u8 {
+    var m = cbor.MapBuilder.init(a);
+    try m.put("to", .{ .bytes = to });
+    try m.put("box", .{ .string = box });
+    try m.put("body", .{ .bytes = try cbor.encode(a, body) });
+    if (subject) |s| try m.put("subject", cbor.cidv(s));
+    const bytes = try cbor.encode(a, m.value());
+    return result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
 }
 
-/// One libp2p request (#51) {op: "publish" | "dial" | "send" | "receive" | "close", …}
-/// → its result, answered by the router's libp2p host and recorded; a failure
-/// (the host's {error}) is the import's error, `lastError()`.
-pub fn libp2p(a: Allocator, req: Value) !Value {
-    const bytes = try cbor.encode(a, req);
-    return cbor.decode(a, try result(a, raw.libp2p, .{ bytes.ptr, n32(bytes.len) }));
-}
-
+/// Rest until `until_ms` at most (#70: a wake-me to the waker, emitted when the step ends; its answer steps the thread with `woke`).
 pub fn deadline(until_ms: i64) !void {
     if (raw.deadline(until_ms) < 0) return failed();
 }
@@ -304,35 +305,24 @@ pub fn readBody(a: Allocator, message: []const u8, body: []const u8) !Value {
     return cbor.decode(a, b) catch report("body: not dag-cbor");
 }
 
-/// Whether a delivery failed for a reason that may pass (no answer, 5xx,
-/// 408, 425, 429): the messagebox and resolve mark those "transient: …".
+/// Whether a failure may pass (no answer, 5xx, 408, 425, 429): the
+/// messagebox's delivery and resolve mark those "transient: …".
 pub fn transient(msg: []const u8) bool {
     return std.mem.indexOf(u8, msg, "transient: ") != null;
 }
 
-/// Deliver `body` to identity `to` in `box`: the messagebox program's `send`
-/// over http (#40), recorded with this step. The peer's messagebox URL comes
-/// from the address book; `handle`/`domain`, when the handle is given,
-/// resolve it on first contact. Its answer is the message's id — the record
-/// a reply's replyTo names, which the caller may `awaitRecord`.
-pub fn send(a: Allocator, in: Value, to: []const u8, box: []const u8, body: Value, handle: []const u8, domain: []const u8) ![]const u8 {
-    const mb = program(in, "messagebox") orelse return report("send: no messagebox program in the genesis");
-    var arg = cbor.MapBuilder.init(a);
-    try arg.put("to", .{ .bytes = to });
-    try arg.put("box", .{ .string = box });
-    try arg.put("body", .{ .bytes = try cbor.encode(a, body) });
-    if (handle.len > 0) {
-        try arg.put("handle", .{ .string = handle });
-        try arg.put("domain", .{ .string = domain });
-    }
-    const out = try call(a, mb, "send", try cbor.encode(a, arg.value()));
-    const r = cbor.decode(a, out) catch return report("send: the answer is not dag-cbor");
-    return Value.cidOf(r.get("id")) orelse report("send: the answer names no id");
+/// Send `body` to identity `to` in `box` (#70): an `emit` — the message goes
+/// out by `to`'s transport when this step ends (a mailbox recipient's
+/// through the messagebox program's delivery thread, over this instance's own
+/// BRC-103/104 session). Its CID is the message's id, what a reply's
+/// `replyTo` names: `awaitRecord` it to rest on the reply.
+pub fn send(a: Allocator, to: []const u8, box: []const u8, body: Value) ![]const u8 {
+    return emit(a, to, box, body, null);
 }
 
-/// The address book (#40, the head `peers`, written by the resolve program):
-/// its peer records {kind: "peer", key, url, handle?, domain?, since,
-/// source}, this step's own writes included.
+/// The address book (#70, the head `peers`): its peer records {kind: "peer",
+/// key, transport, address, role?, handle?, domain?, since, source}, this
+/// step's own writes included.
 pub fn peers(a: Allocator) ![]const Value {
     const root = (try head(a, "peers")) orelse return &.{};
     const t = try get(a, root);
@@ -345,21 +335,74 @@ pub fn peers(a: Allocator) ![]const Value {
     return out;
 }
 
-/// Resolve a BRC-169 handle to its identity key: the address book's record
-/// for it, else the resolve program's lookup (an in-VM call whose http calls
-/// are recorded with this step, and which writes the peer record).
-pub fn resolve(a: Allocator, in: Value, handle: []const u8, domain: []const u8) ![]const u8 {
+/// The key the address book names for a BRC-169 handle, or null (resolve it:
+/// `launchResolve`).
+pub fn peerByHandle(a: Allocator, handle: []const u8, domain: []const u8) !?[]const u8 {
     for (try peers(a)) |p| {
         if (std.mem.eql(u8, Value.str(p.get("handle")) orelse "", handle) and std.mem.eql(u8, Value.str(p.get("domain")) orelse "", domain)) {
             if (try keyOf(a, p.get("key"))) |k| return k;
         }
     }
+    return null;
+}
+
+/// The address book's entry for `key`, or null.
+pub fn peerOf(a: Allocator, key: []const u8) !?Value {
+    for (try peers(a)) |p| if (std.mem.eql(u8, Value.bytesOf(p.get("key")) orelse "", key)) return p;
+    return null;
+}
+
+/// The key of the provider playing `role` for this instance (#70: `fetch`,
+/// `libp2p`, `waker`, `broadcast`): the address book entry with that role.
+pub fn provider(a: Allocator, role: []const u8) ![]const u8 {
+    for (try peers(a)) |p| if (std.mem.eql(u8, Value.str(p.get("role")) orelse "", role)) {
+        if (Value.bytesOf(p.get("key"))) |k| return k;
+    };
+    return report(try std.fmt.allocPrint(a, "no {s} provider in the address book (an entry with role \"{s}\")", .{ role, role }));
+}
+
+/// Resolve a BRC-169 handle (#70: external communication is a thread): launch
+/// the resolve program on {handle, domain, key?}; this step then waits on it,
+/// and when it finishes the address book names the handle (its result is the
+/// peer record) — or it errored (`resolved[i].error`). Its origin CID.
+pub fn launchResolve(a: Allocator, in: Value, handle: []const u8, domain: []const u8, key: ?[]const u8) ![]const u8 {
     const rp = program(in, "resolve") orelse return report(try std.fmt.allocPrint(a, "resolve @{s}@{s}: no resolve program in the genesis", .{ handle, domain }));
     var q = cbor.MapBuilder.init(a);
     try q.put("handle", .{ .string = handle });
     try q.put("domain", .{ .string = domain });
-    const p = try callValue(a, rp, "resolve", q.value());
-    return (try keyOf(a, p.get("key"))) orelse report("resolve: the peer record names no key");
+    if (key) |k| try q.put("key", .{ .bytes = k });
+    return launch(a, rp, try put(a, q.value()));
+}
+
+/// One HTTP request through the `fetch` provider (#70): {method, url,
+/// headers?, body?, timeoutMs?} emitted to it (box "fetch") → the message's
+/// CID; awaited here. Its answer, the reply's body, is {replyTo, status,
+/// headers, body} or {replyTo, error} (no answer at all).
+pub fn fetch(a: Allocator, method: []const u8, url: []const u8, headers: ?Value, body: ?[]const u8) ![]const u8 {
+    var q = cbor.MapBuilder.init(a);
+    try q.put("method", .{ .string = method });
+    try q.put("url", .{ .string = url });
+    if (headers) |h| try q.put("headers", h);
+    if (body) |b| try q.put("body", .{ .bytes = b });
+    const id = try emit(a, try provider(a, "fetch"), "fetch", q.value(), null);
+    try awaitRecord(id);
+    return id;
+}
+
+/// A reply that woke this step (input `reply`): the message, its body record, and what it answers.
+pub const Reply = struct { message: []const u8, body: Value, box: []const u8, sender: []const u8, reply_to: []const u8 };
+
+pub fn replyOf(a: Allocator, in: Value) !?Reply {
+    const r = in.get("reply") orelse return null;
+    if (r != .map) return null;
+    const message = Value.cidOf(r.get("message")) orelse return null;
+    return .{
+        .message = message,
+        .body = try get(a, Value.cidOf(r.get("body")) orelse return report("reply: no body")),
+        .box = Value.str(r.get("box")) orelse "",
+        .sender = Value.bytesOf(r.get("sender")) orelse "",
+        .reply_to = Value.cidOf(r.get("replyTo")) orelse "",
+    };
 }
 
 // ---------------------------------------------------------------- trees
