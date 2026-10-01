@@ -69,8 +69,10 @@ const exe = b.addExecutable(.{
 ```
 
 `shruggr/skein-static` and `shruggr/skein-workbench` are built this way.
-A program built in a checkout of skein uses the same package through a path
-dependency (`.path = "../../sdk"`, skein's `sdk/` submodule).
+A program built in a checkout of skein depends on the same package the same
+way (#75: `skein_sdk` by URL+hash, not a submodule). skein's
+`scripts/sdk-local.sh` overrides the dependency with a sibling `../skein-sdk`
+checkout for developing both at once, with no edit to committed files.
 
 ### bsvz
 
@@ -102,7 +104,7 @@ resolves: `node sdk/wallet/vectors/gen-ts/run.mjs`).
 
 `build.zig.zon` carries the version (0.1.0). A change to a module's API or
 to the ABI the `sk`/`skein_wit` calls describe is a new minor version until
-1.0; skein's kernel and the SDK move together (skein pins the SDK commit as
-its `sdk/` submodule).
+1.0; skein's kernel and the SDK move together (skein pins a tagged release
+by URL+hash, #75).
 
 MIT, as skein.
