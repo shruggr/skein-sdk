@@ -125,6 +125,15 @@ pub fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: 
     return hold(r, out, cap);
 }
 
+/// The one outbound primitive (#70): a dag-cbor {to, box, body, subject?} → the message's CID.
+pub fn emit(p: [*]const u8, n: u32, out: [*]u8, cap: u32) i32 {
+    var d = list(p, n);
+    var r: c.skein_kernel_skein_cid_t = undefined;
+    var e: c.program_string_t = undefined;
+    if (!c.skein_kernel_skein_emit(&d, &r, &e)) return fail(&e);
+    return holdCid(r, out, cap);
+}
+
 pub fn deadline(until: i64) i32 {
     var e: c.program_string_t = undefined;
     if (!c.skein_kernel_skein_deadline(until, &e)) return fail(&e);

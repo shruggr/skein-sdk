@@ -24,14 +24,16 @@
 //! subject, txid, path}, {kind: "status", subject, txid, txStatus, merklePath?}.
 //!
 //! Recorded calls: the oracle over the `wallet` import (getPublicKey,
-//! createSignature: no key is ever here), and HTTP to ARC (broadcast, status
-//! re-query) — the `http` import in the preview1 build, standard wasi:http in
-//! the component build (#15, wasi_http.zig), the same requests either way —
-//! to the host's broadcast route (#58: `defaults.walletArc`, the router's
-//! /arc, which proxies to its Arcade). After a broadcast the thread awaits its transaction's CID with
-//! a deadline; a `status`/`proof` entry for it, or the deadline, steps it. At
-//! the deadline ARC is asked again; a 404 (it never took the transaction)
-//! posts it again.
+//! createSignature: no key is ever here). Broadcasting is a message (#70,
+//! #67: external communication is a thread): the wallet emits the Atomic BEEF
+//! to the address book's `broadcast` provider (box "broadcast", {tx}, about
+//! the transaction: `subject` its CID) and ends its step awaiting the answer —
+//! the provider's signed message {replyTo, status, body}, Arcade's own answer
+//! (the host's broadcaster, #58) — and the transaction's CID, for a
+//! `status`/`proof` entry, with a deadline. The answer, an entry, or the
+//! deadline steps it. At the deadline the broadcaster is asked again (box
+//! "status", {txid}); a 404 (Arcade never took the transaction) posts it
+//! again. No `broadcast` provider in the address book: nothing is broadcast.
 //! A transaction never mined within
 //! defaults.walletAbandonMs of its broadcast is abandoned (rejected); a reorg
 //! that turns ours back to unproven broadcasts them again and awaits them.
@@ -51,8 +53,6 @@ const Value = cbor.Value;
 /// The skein calls: the preview1 `skein` imports, or (the component build, issue
 /// #34) the same calls over the WIT interface skein:kernel/skein (skein_wit.zig).
 const component = @import("build_options").component;
-/// Outgoing HTTP in the component build (#15): standard wasi:http.
-const wasi_http = if (component) @import("wasi_http.zig") else struct {};
 const sk = if (component) @import("skein_wit.zig") else struct {
     extern "skein" fn input(out: [*]u8, cap: u32) i32;
     extern "skein" fn get(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
@@ -62,7 +62,7 @@ const sk = if (component) @import("skein_wit.zig") else struct {
     extern "skein" fn head(name: [*]const u8, name_len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
     extern "skein" fn wallet(frame: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
-    extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    extern "skein" fn emit(msg: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     extern "skein" fn deadline(until: i64) i32;
     extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
     extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
@@ -210,9 +210,11 @@ fn run(a: std.mem.Allocator) !void {
     // owner's message, or a plain entry.
     const callback = step.get("event");
     const woke = step.getBool("woke") orelse false;
+    // The broadcaster's answer to what this thread asked it (#70: a reply to our message).
+    const reply: ?Value = if (step.get("reply")) |r| (if (r == .map) r else null) else null;
     var body: Value = .null;
     var op: []const u8 = undefined;
-    if (callback != null or woke) {
+    if (callback != null or woke or reply != null) {
         op = "callback";
         if (callback) |c| body = try s.getValue(a, c.getCid("event") orelse return error.BadInput);
     } else if (args.getCid("body")) |bc| {
@@ -226,7 +228,8 @@ fn run(a: std.mem.Allocator) !void {
         op = "event";
     } else return error.BadInput;
     const defaults = step.get("defaults");
-    const arc_url: ?[]const u8 = if (defaults) |d| d.getText("walletArc") else null;
+    // The broadcaster (#70): the address book's `broadcast` provider, if there is one.
+    var bc = Broadcaster{ .key = try broadcasterKey(a, s) };
     const recheck_ms: i64 = if (defaults) |d| std.fmt.parseInt(i64, d.getText("walletRecheckMs") orelse "600000", 10) catch return error.BadConfig else 600000;
     const abandon_ms: i64 = if (defaults) |d| std.fmt.parseInt(i64, d.getText("walletAbandonMs") orelse "86400000", 10) catch return error.BadConfig else 86400000;
     const now: i64 = @intCast(step.getUint("at") orelse return error.BadInput);
@@ -259,7 +262,7 @@ fn run(a: std.mem.Allocator) !void {
         const raws = try a.alloc([]const u8, list.array.len);
         for (list.array, raws) |x, *r| r.* = if (x == .bytes) x.bytes else return error.BadBody;
         const res = try wal.addHeaders(raws);
-        try rebroadcast(a, &wal, arc_url, &await_txs, &out);
+        try rebroadcast(a, &wal, &bc, &await_txs, &out);
         try out.appendSlice(a, &.{
             .{ .key = "added", .value = .{ .uint = res.added } },
             .{ .key = "known", .value = .{ .uint = res.known } },
@@ -321,7 +324,7 @@ fn run(a: std.mem.Allocator) !void {
         try out.append(a, .{ .key = "event", .value = .{ .text = kind } });
         if (std.mem.eql(u8, kind, "header")) {
             const res = try wal.addHeaders(&.{body.getBytes("raw") orelse return error.BadEvent});
-            try rebroadcast(a, &wal, arc_url, &await_txs, &out);
+            try rebroadcast(a, &wal, &bc, &await_txs, &out);
             try out.appendSlice(a, &.{
                 .{ .key = "added", .value = .{ .uint = res.added } },
                 .{ .key = "known", .value = .{ .uint = res.known } },
@@ -341,6 +344,8 @@ fn run(a: std.mem.Allocator) !void {
         // Transactions we broadcast: a status entry for one of them, or the
         // deadline (each still awaited is abandoned if due, else ARC is asked again).
         var awaited = try awaitedFromTip(a, s, step);
+        // The questions to the broadcaster still unanswered (#70): awaited again, but for the one answered now.
+        try bc.carry(a, s, step, if (reply) |r| r.getCid("replyTo") else null);
         var txid: [32]u8 = undefined;
         var outcome: w.wallet.Wallet.Outcome = .pending;
         if (callback != null) {
@@ -349,21 +354,29 @@ fn run(a: std.mem.Allocator) !void {
             outcome = try applyEvent(&wal, txid, kind, body);
             try out.append(a, .{ .key = "event", .value = .{ .text = kind } });
             if (!contains(awaited.items, txid)) try awaited.insert(a, 0, txid);
+        } else if (reply) |r| {
+            // The broadcaster's answer: Arcade's, to a broadcast or to the question at a deadline.
+            const asked = try s.getValue(a, r.getCid("message") orelse return error.BadInput);
+            txid = w.store.bitcoinHash(asked.getCid("subject") orelse return error.BadInput) orelse return error.BadInput;
+            const ans_body = try s.getValue(a, r.getCid("body") orelse return error.BadInput);
+            if (ans_body.getText("error")) |e| std.log.err("the broadcaster: {s}", .{e});
+            var ans = try arcAnswer(a, ans_body);
+            // 404 to the question: Arcade never took it (the broadcast failed transiently, or it lost its history): post it again.
+            if (std.mem.eql(u8, r.getText("box") orelse "", "status") and ans.http_status == 404) if (try wal.beefOf(txid)) |beef| {
+                try bc.broadcast(a, txid, beef);
+                ans.tx_status = "";
+            };
+            outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
+            try out.append(a, .{ .key = "arc", .value = try ans.value(a) });
+            if (!contains(awaited.items, txid)) try awaited.insert(a, 0, txid);
         } else {
             if (awaited.items.len == 0) return error.BadInput;
             txid = awaited.items[0];
             for (awaited.items) |t| {
-                const r = (try wal.awaitingRecord(t)) orelse continue;
+                if ((try wal.awaitingRecord(t)) == null) continue;
                 if (try wal.abandonIfDue(t, abandon_ms)) continue;
-                const arc = r.getText("arc") orelse return error.BadRecord;
-                const url = try std.fmt.allocPrint(a, "{s}/v1/tx/{s}", .{ arc, w.header.toHex(t) });
-                var ans = try arcCall(a, "GET", url, null);
-                // 404: ARC never took it (the broadcast failed transiently, or it lost its history): post it again.
-                if (ans.http_status == 404) if (try wal.beefOf(t)) |beef| {
-                    ans = try arcCall(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), beef);
-                };
-                _ = try wal.applyStatus(t, ans.tx_status, ans.merkle_path);
-                if (std.mem.eql(u8, &t, &txid)) try out.append(a, .{ .key = "arc", .value = try ans.value(a) });
+                // Ask the broadcaster again; its answer is the next step's.
+                try bc.ask(a, t);
             }
             outcome = switch (try wal.status(txid)) {
                 .proven => .proven,
@@ -401,17 +414,13 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "tx", .value = .{ .bytes = created.beef } },
         });
         if (created.reference) |r| try out.append(a, .{ .key = "reference", .value = .{ .cid = r } });
-        // Broadcast: the Atomic BEEF to ARC over http, then await the status.
-        if (created.reference == null and !created.no_send) if (arc_url) |arc| {
-            try wal.noteBroadcast(created.txid, arc, "");
-            const ans = try arcCall(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), created.beef);
-            const outcome = try wal.applyStatus(created.txid, ans.tx_status, ans.merkle_path);
-            try out.appendSlice(a, &.{
-                .{ .key = "arc", .value = try ans.value(a) },
-                .{ .key = "outcome", .value = .{ .text = @tagName(outcome) } },
-            });
-            if (outcome == .pending) try await_txs.append(a, created.txid);
-        };
+        // Broadcast: the Atomic BEEF to the broadcaster (#70: a message), then await its answer and the status.
+        if (created.reference == null and !created.no_send and bc.key != null) {
+            try wal.noteBroadcast(created.txid, "broadcast", "");
+            try bc.broadcast(a, created.txid, created.beef);
+            try out.append(a, .{ .key = "outcome", .value = .{ .text = "pending" } });
+            try await_txs.append(a, created.txid);
+        }
     } else if (std.mem.eql(u8, op, "list")) {
         mutates = false;
         const basket = body.getText("basket") orelse "default";
@@ -463,6 +472,15 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "awaited", .value = .{ .array = hexes } },
             .{ .key = "awaiting", .value = .{ .boolean = true } },
         });
+    }
+    // What this thread asked the broadcaster and has no answer to yet: awaited (the answer steps it), and kept on the result.
+    if (bc.asked.items.len > 0) {
+        const ids = try a.alloc(Value, bc.asked.items.len);
+        for (bc.asked.items, ids) |id, *v| {
+            if (sk.@"await"(id.ptr, @intCast(id.len)) < 0) return failed();
+            v.* = .{ .cid = id };
+        }
+        try out.append(a, .{ .key = "asked", .value = .{ .array = ids } });
     }
     // The transactions this result is about, as `mentions` (kernel edges from the thread).
     {
@@ -535,19 +553,77 @@ fn txCid(txid: [32]u8) [37]u8 {
 
 /// After a reorg: our transactions turned back to unproven are broadcast
 /// again (as after createAction) and awaited.
-fn rebroadcast(a: std.mem.Allocator, wal: *w.wallet.Wallet, arc_url: ?[]const u8, await_txs: *std.ArrayList([32]u8), out: *std.ArrayList(cbor.Entry)) !void {
+fn rebroadcast(a: std.mem.Allocator, wal: *w.wallet.Wallet, bc: *Broadcaster, await_txs: *std.ArrayList([32]u8), out: *std.ArrayList(cbor.Entry)) !void {
     if (wal.reverted.items.len == 0) return;
     const hexes = try a.alloc(Value, wal.reverted.items.len);
     for (wal.reverted.items, hexes) |t, *h| h.* = .{ .text = try a.dupe(u8, &w.header.toHex(t)) };
     try out.append(a, .{ .key = "reverted", .value = .{ .array = hexes } });
-    const arc = arc_url orelse return;
+    if (bc.key == null) return;
     for (wal.reverted.items) |t| {
         const beef = (try wal.beefOf(t)) orelse continue;
-        try wal.noteBroadcast(t, arc, "");
-        const ans = try arcCall(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), beef);
-        if ((try wal.applyStatus(t, ans.tx_status, ans.merkle_path)) == .pending and !contains(await_txs.items, t)) try await_txs.append(a, t);
+        try wal.noteBroadcast(t, "broadcast", "");
+        try bc.broadcast(a, t, beef);
+        if (!contains(await_txs.items, t)) try await_txs.append(a, t);
     }
 }
+
+/// The address book's `broadcast` provider's key (#70: the entry with role
+/// "broadcast" under the head `peers`), or null.
+fn broadcasterKey(a: std.mem.Allocator, s: w.store.Store) !?[]const u8 {
+    const name = "peers";
+    const root = try result(a, sk.head, .{ name.ptr, @as(u32, name.len) });
+    if (root.len == 0) return null;
+    const book = try s.getValue(a, root);
+    for (book.getArray("peers") orelse return null) |e| {
+        const p = try s.getValue(a, e.getCid("peer") orelse continue);
+        if (std.mem.eql(u8, p.getText("role") orelse "", "broadcast")) return p.getBytes("key");
+    }
+    return null;
+}
+
+/// The broadcaster as this step talks to it (#70): what it is asked — a
+/// message each, emitted, about the transaction (`subject` its CID) — and
+/// what the thread still awaits an answer to.
+const Broadcaster = struct {
+    key: ?[]const u8,
+    asked: std.ArrayList([]const u8) = .empty,
+
+    /// The thread's questions still unanswered (the last result's `asked`), but for `answered`.
+    fn carry(self: *Broadcaster, a: std.mem.Allocator, s: w.store.Store, step: Value, answered: ?[]const u8) !void {
+        const tip = try s.getValue(a, step.getCid("tip") orelse return);
+        const kept = tip.getArray("kept") orelse return;
+        if (kept.len == 0 or kept[kept.len - 1] != .cid) return;
+        const res = try s.getValue(a, kept[kept.len - 1].cid);
+        for (res.getArray("asked") orelse return) |x| {
+            if (x != .cid) continue;
+            if (answered) |c| if (std.mem.eql(u8, c, x.cid)) continue;
+            try self.asked.append(a, x.cid);
+        }
+    }
+
+    /// A message to the broadcaster in `box` about `txid`.
+    fn emit(self: *Broadcaster, a: std.mem.Allocator, box: []const u8, txid: [32]u8, body: Value) !void {
+        const to = self.key orelse return;
+        const subject = txCid(txid);
+        const msg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "to", .value = .{ .bytes = to } },
+            .{ .key = "box", .value = .{ .text = box } },
+            .{ .key = "body", .value = .{ .bytes = try cbor.encode(a, body) } },
+            .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &subject) } },
+        }) });
+        try self.asked.append(a, try result(a, sk.emit, .{ msg.ptr, @as(u32, @intCast(msg.len)) }));
+    }
+
+    /// Broadcast a transaction: its Atomic BEEF (box "broadcast", {tx}).
+    fn broadcast(self: *Broadcaster, a: std.mem.Allocator, txid: [32]u8, beef: []const u8) !void {
+        try self.emit(a, "broadcast", txid, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "tx", .value = .{ .bytes = beef } }}) });
+    }
+
+    /// Ask after a transaction (box "status", {txid}).
+    fn ask(self: *Broadcaster, a: std.mem.Allocator, txid: [32]u8) !void {
+        try self.emit(a, "status", txid, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(txid)) } }}) });
+    }
+};
 
 const ArcAnswer = struct {
     http_status: u64,
@@ -567,83 +643,29 @@ const ArcAnswer = struct {
     }
 };
 
-/// One call to ARC's API: over the `http` import in the preview1 build (this
-/// function as it was before #15, so the pinned module is unchanged), over
-/// standard wasi:http in the component build (wasiArcCall, #15), which the
-/// kernel serializes into the very same recorded request.
-const arcCall = if (component) wasiArcCall else p1ArcCall;
-
-/// One call to ARC's API over the `http` import (attested: request and
-/// response are recorded, so replay never touches the network). A 4xx is a
-/// rejection unless ARC names a status; anything else unanswered stays pending.
-fn p1ArcCall(a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8) !ArcAnswer {
-    var req: std.ArrayList(cbor.Entry) = .empty;
-    try req.appendSlice(a, &.{
-        .{ .key = "method", .value = .{ .text = method } },
-        .{ .key = "url", .value = .{ .text = url } },
-        .{ .key = "headers", .value = .{ .map = if (body != null) &.{
-            .{ .key = "Content-Type", .value = .{ .text = "application/octet-stream" } },
-            .{ .key = "Accept", .value = .{ .text = "application/json" } },
-        } else &.{.{ .key = "Accept", .value = .{ .text = "application/json" } }} } },
-    });
-    if (body) |b| try req.append(a, .{ .key = "body", .value = .{ .bytes = b } });
-    const req_bytes = try cbor.encode(a, .{ .map = req.items });
-    const res_bytes = try result(a, sk.http, .{ req_bytes.ptr, @as(u32, @intCast(req_bytes.len)) });
-    const res = try cbor.decode(a, res_bytes);
-    const status = res.getUint("status") orelse return error.BadHttpResponse;
-    const text = res.getBytes("body") orelse "";
-    var ans = ArcAnswer{ .http_status = status, .tx_status = "", .merkle_path = null, .extra = "" };
+/// The broadcaster's answer {status, body} (Arcade's HTTP status and JSON):
+/// a 4xx is a rejection unless Arcade names a status; anything else
+/// unanswered (no answer at all: {error}) stays pending.
+fn arcAnswer(a: std.mem.Allocator, ans: Value) !ArcAnswer {
+    const status = ans.getUint("status") orelse 0;
+    const text = ans.getBytes("body") orelse "";
+    var out = ArcAnswer{ .http_status = status, .tx_status = "", .merkle_path = null, .extra = ans.getText("error") orelse "" };
     if (std.json.parseFromSliceLeaky(std.json.Value, a, text, .{})) |j| {
         if (j == .object) {
             if (j.object.get("txStatus")) |t| if (t == .string) {
-                ans.tx_status = t.string;
+                out.tx_status = t.string;
             };
             if (j.object.get("extraInfo")) |t| if (t == .string) {
-                ans.extra = t.string;
+                out.extra = t.string;
             };
             if (j.object.get("merklePath")) |t| if (t == .string and t.string.len > 0) {
                 const p = try a.alloc(u8, t.string.len / 2);
                 _ = std.fmt.hexToBytes(p, t.string) catch return error.BadHttpResponse;
-                ans.merkle_path = p;
+                out.merkle_path = p;
             };
         }
     } else |_| {}
-    if (ans.tx_status.len == 0 and status >= 400 and status < 500) ans.tx_status = "REJECTED";
-    return ans;
+    if (out.tx_status.len == 0 and status >= 400 and status < 500) out.tx_status = "REJECTED";
+    return out;
 }
 
-/// The same call over wasi:http (the component build): the same method, URL,
-/// headers and body, so the kernel records the same request; the same reading
-/// of the answer as p1ArcCall's.
-fn wasiArcCall(a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8) !ArcAnswer {
-    const headers: []const wasi_http.Header = if (body != null) &.{
-        .{ .name = "Content-Type", .value = "application/octet-stream" },
-        .{ .name = "Accept", .value = "application/json" },
-    } else &.{.{ .name = "Accept", .value = "application/json" }};
-    const r = wasi_http.request(a, method, url, headers, body) catch |e| {
-        const n = @min(wasi_http.last_error.len, last_error.len);
-        @memcpy(last_error[0..n], wasi_http.last_error[0..n]);
-        last_error_len = n;
-        return e;
-    };
-    const status: u64 = r.status;
-    const text = r.body;
-    var ans = ArcAnswer{ .http_status = status, .tx_status = "", .merkle_path = null, .extra = "" };
-    if (std.json.parseFromSliceLeaky(std.json.Value, a, text, .{})) |j| {
-        if (j == .object) {
-            if (j.object.get("txStatus")) |t| if (t == .string) {
-                ans.tx_status = t.string;
-            };
-            if (j.object.get("extraInfo")) |t| if (t == .string) {
-                ans.extra = t.string;
-            };
-            if (j.object.get("merklePath")) |t| if (t == .string and t.string.len > 0) {
-                const p = try a.alloc(u8, t.string.len / 2);
-                _ = std.fmt.hexToBytes(p, t.string) catch return error.BadHttpResponse;
-                ans.merkle_path = p;
-            };
-        }
-    } else |_| {}
-    if (ans.tx_status.len == 0 and status >= 400 and status < 500) ans.tx_status = "REJECTED";
-    return ans;
-}
