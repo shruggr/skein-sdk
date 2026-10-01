@@ -44,10 +44,9 @@ interface skein {
   launch: func(program: cid, args: cid) -> result<cid, string>;
 
   /// Rest on a record in the store (the step ends `waiting` with `awaits`):
-  /// a message this step sent (#40: the record the messagebox's `send` put —
-  /// an admitted message whose body's `replyTo` names it, from the identity it
-  /// was sent to, is the thread's next input), or the subject of a plain entry
-  /// to come (#29).
+  /// a message this step emitted (#70: an admitted message whose body's
+  /// `replyTo` names it, from the identity it was sent to, is the thread's
+  /// next input), a thread (#66), or the subject of a plain entry to come (#29).
   await: func(cid: cid) -> result<_, string>;
 
   /// The tree CID a named head points at; none if it has none (preview1:
@@ -62,19 +61,23 @@ interface skein {
   /// store; no sender: any sender), when the step ends without error.
   subscribe: func(op: string, sender: option<string>, box: string, handler: cid) -> result<_, string>;
 
-  /// A BRC-100 wallet wire request frame → its result frame. Attested.
+  /// A BRC-100 wallet wire request frame → its result frame: the oracle,
+  /// answered synchronously and recorded (an `oracle` record on the update).
   wallet: func(frame: list<u8>) -> result<list<u8>, string>;
 
-  /// One HTTP request, dag-cbor {method, url, headers?, body?} → the response
-  /// {status, headers, body}, answered by the host and recorded (op "http").
-  /// The pre-#15 shape, kept for preview1 programs (their `skein.http`
-  /// import); a component uses standard `wasi:http/outgoing-handler` (#15),
-  /// which the kernel turns into this very request, answered and recorded by
-  /// the same path.
-  http: func(request: list<u8>) -> result<list<u8>, string>;
+  /// The one outbound primitive (#70): emit a signed message. `message` is
+  /// dag-cbor {to: bytes(33), box, body: <dag-cbor bytes>, subject?: <cid>};
+  /// the result is the message's CID. `to` must be in the address book (the
+  /// head `peers`); the kernel signs the message through the oracle, lists
+  /// it on the step's update (`emitted`) and sends it by the recipient's
+  /// transport when the step ends without error. The answer is an entry:
+  /// `await` the CID and end the step. docs/VM.md, "emit".
+  emit: func(message: list<u8>) -> result<cid, string>;
 
   /// If this step ends waiting, rest no later than `until-ms` (ms since the
-  /// epoch, after the step's time): a wake entry then steps the thread (#29).
+  /// epoch, after the step's time): sugar for a wake-me message to the
+  /// address book's waker (#70), emitted and awaited when the step ends; its
+  /// answer steps the thread with `woke`.
   deadline: func(until-ms: s64) -> result<_, string>;
 
   /// An in-VM call (#40): run `program` (a program record) as a function —
@@ -93,57 +96,15 @@ interface skein {
   edges: func(to: cid, rel: option<string>) -> result<list<u8>, string>;
 }
 
-/// libp2p from a step (#51): answered by the router's libp2p host (the runtime
-/// has no network), each call **recorded on the update like `http`** — request
-/// and result, as the dag-cbor request preview1's `skein.libp2p` import takes
-/// (`{op: "publish" | "dial" | "send" | "receive" | "close", …}`), so replay
-/// serves the recorded result and never touches the network, and a differing
-/// request on replay is a divergence. A host failure (a dial that fails, a
-/// stream that is gone) is recorded too, and is the call's error. Published
-/// messages are signed by GossipSub with the instance's peer key (a child of
-/// the host's master secret, key ID `libp2p:<handle>`), never a wallet key.
-/// Refused in a kernel call (only a step sends) and in the browser build.
-interface libp2p {
-  /// What `receive` found on the stream.
-  variant received {
-    /// The next length-prefixed frame.
-    frame(list<u8>),
-    /// Nothing yet: set a `deadline` and end the step; the thread rests, and
-    /// the router wakes it (a wake entry, before the deadline) when a frame
-    /// arrives, so its next step's `receive` has it.
-    pending,
-    /// The remote closed the stream; nothing more will come.
-    closed,
-  }
-
-  /// Publish `body` on a GossipSub topic (signed with the instance's peer
-  /// key) → the message's seqno.
-  publish: func(topic: string, body: list<u8>) -> result<u64, string>;
-
-  /// Open a stream to a peer (a peer ID, or a multiaddr with /p2p/<id>) on
-  /// `protocol` → its id (the router's, unique across its restarts).
-  dial: func(peer: string, protocol: string) -> result<u64, string>;
-
-  /// Write one length-prefixed frame (unsigned varint length).
-  send: func(stream-id: u64, body: list<u8>) -> result<_, string>;
-
-  /// The next frame, or `pending` (rest; woken when it comes), or `closed`.
-  receive: func(stream-id: u64) -> result<received, string>;
-
-  /// Close the stream (our side), and forget it.
-  close: func(stream-id: u64) -> result<_, string>;
-}
-
-/// What a handler program imports beyond WASI's command world: skein's calls
-/// and outgoing HTTP (`wasi:http`, #15). A program built for
-/// preview1 WASI (Zig, C, Rust `wasm32-wasip1`) embeds this world with
-/// wit-bindgen and becomes a component through the preview1 command adapter
-/// (`wasm-tools component new --adapt`), which brings the WASI imports and
-/// the `wasi:cli/run` export: the result targets `handler`.
+/// What a handler program imports beyond WASI's command world: skein's
+/// calls. A program built for preview1 WASI (Zig, C, Rust `wasm32-wasip1`)
+/// embeds this world with wit-bindgen and becomes a component through the
+/// preview1 command adapter (`wasm-tools component new --adapt`), which
+/// brings the WASI imports and the `wasi:cli/run` export: the result targets
+/// `handler`. There is no network import (#67): a program reaches the world
+/// by `emit`ting to a provider (the HTTP proxy, the libp2p node).
 world program {
   import skein;
-  import libp2p;
-  import wasi:http/outgoing-handler@0.2.12;
 }
 
 /// A handler program as a component: a WASI 0.2 command (`wasi:cli/run`) with
@@ -157,13 +118,6 @@ world program {
 /// - `wasi:random`: the entry-derived stream (insecure too);
 /// - `wasi:cli`: args (argv[0] = the program's name), no environment,
 ///   stdin empty, stdout/stderr captured; no terminal.
-/// - `wasi:http/outgoing-handler` (#15): each request is serialized into the
-///   recorded-call shape of `skein.http` and answered by the host; request and
-///   response are recorded on the step's update, so replay reads the answer
-///   and never touches the network. Bodies are buffered; no trailers.
-/// - `skein:kernel/libp2p` (#51): each call serialized into the recorded
-///   request of preview1's `skein.libp2p` and answered by the router's libp2p
-///   host; recorded on the update, so replay never touches the network.
 /// No sockets, no incoming handler.
 world handler {
   import wasi:cli/environment@0.2.12;
@@ -186,10 +140,7 @@ world handler {
   import wasi:random/random@0.2.12;
   import wasi:random/insecure@0.2.12;
   import wasi:random/insecure-seed@0.2.12;
-  import wasi:http/types@0.2.12;
-  import wasi:http/outgoing-handler@0.2.12;
   import skein;
-  import libp2p;
 
   export wasi:cli/run@0.2.12;
 }
