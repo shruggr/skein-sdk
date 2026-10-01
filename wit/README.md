@@ -12,7 +12,7 @@ and the WASI 0.2 packages it depends on.
 ## The interface `skein:kernel/skein`
 
 The interface has the same calls, with the same behaviour, as the preview1
-`skein` import namespace (`kernel-zig/src/program.zig`). Only the ABI differs:
+`skein` import namespace (skein's `kernel-zig/src/program.zig`). Only the ABI differs:
 
 | preview1 | WIT |
 |---|---|
@@ -83,6 +83,6 @@ wit-bindgen c wit --world program --out-dir wit/bindings/c
 ```
 
 `program.c` calls `malloc`, `realloc`, `free`, `abort` and `strlen`. The
-wallet provides them itself (`wallet-zig/src/cabi.zig`, with headers in
-`wallet-zig/src/c`) rather than linking wasi-libc:
-`kernel-zig/README.md`, "Building a component handler", says why.
+component provides them itself (`wit/zig/cabi.zig`, the SDK module `cabi`, with headers in
+`wit/zig/c`) rather than linking wasi-libc:
+skein's `kernel-zig/README.md`, "Building a component handler", says why.

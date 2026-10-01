@@ -8,7 +8,7 @@
 //! signed BRC-169's way (§7.2/§7.3): ECDSA (DER) by the sender's BRC-42 child
 //! for [2, "metanet handles envelope"], key ID "send", counterparty anyone,
 //! over sha256 of the dag-cbor of the record without `signature`. Anyone
-//! checks it with the sender's key alone (kernel-zig/src/secp.zig, pure Zig).
+//! checks it with the sender's key alone (src/secp.zig, pure Zig).
 const std = @import("std");
 const cbor = @import("cbor");
 const secp = @import("secp");

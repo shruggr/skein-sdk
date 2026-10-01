@@ -1,6 +1,6 @@
 // Bundle check.ts (it imports the TS wallet-toolbox's sources, which have no
 // node_modules of their own: @bsv/sdk resolves from skein's) and run it over
-// the vectors directory. From the skein root: node wallet-zig/vectors/gen-ts/run.mjs
+// the vectors directory. From a skein checkout: node sdk/wallet/vectors/gen-ts/run.mjs
 import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";

@@ -3,7 +3,7 @@
 // and @bsv/sdk (BEEF, merkle paths, transactions, BRC-42/29 key derivation).
 // A vector passes only if both reference stacks agree with it.
 //
-//   node wallet-zig/vectors/gen-ts/run.mjs      (bundles this file with esbuild, then runs it)
+//   node sdk/wallet/vectors/gen-ts/run.mjs      (bundles this file with esbuild, then runs it)
 
 import { readFileSync } from "node:fs";
 import { Beef, KeyDeriver, MerklePath, PrivateKey, PublicKey, Transaction, Utils } from "@bsv/sdk";

@@ -18,14 +18,14 @@
 //
 // Nothing here knows SQLite or the kernel: nodes are read through `Blocks`
 // (get by CID) and new ones collect in `pending` until the owner flushes the
-// ones a root reaches; it needs only cbor.zig and cid.zig. wallet-zig (#29)
-// builds this file as a module of its own (wallet-zig/build.zig) for the
+// ones a root reaches; it needs only cbor.zig and cid.zig. The wallet (#29)
+// uses this file as the SDK module `mst` (build.zig) for the
 // wallet's index maps: inside the VM its Blocks are the `skein` get import
 // and a flush is one `putblock` per pending node.
 const std = @import("std");
-const cbor = @import("cbor.zig");
-const cidm = @import("cid.zig");
-/// Exported for users of this file as a library module (wallet-zig, #29).
+const cbor = @import("cbor");
+const cidm = @import("cid");
+/// Exported for users of this file as a library module (the wallet, #29; skein's kernel).
 pub const Value = cbor.Value;
 pub const codec = cbor;
 

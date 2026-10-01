@@ -8,7 +8,7 @@
 //! servers too.
 const std = @import("std");
 const cbor = @import("cbor");
-const sk = @import("sk.zig");
+const sk = @import("sk");
 
 const Allocator = std.mem.Allocator;
 

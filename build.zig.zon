@@ -1,0 +1,25 @@
+.{
+    .name = .skein_sdk,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x6cf97c210405ba62,
+    .dependencies = .{
+        // shruggr/bsvz branch skein-sdk: the Chronicle pin (8e1c956, opldotdev/bsvz#2)
+        // plus wallet/patches/bsvz.patch, the one hunk wasm32 needs. Lazy: only the
+        // wallet module fetches it.
+        .bsvz = .{
+            .url = "git+https://github.com/shruggr/bsvz#309085f02700760637e5257415125f15f61947a7",
+            .hash = "bsvz-0.1.0-wvsL-e5NGAAriF1IwX2HlSIv8JEW7SvxsjVvNPJKzPlp",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "src",
+        "lib",
+        "wallet",
+        "wit",
+    },
+}

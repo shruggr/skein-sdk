@@ -1,6 +1,6 @@
 //! The skein calls for the component build of the wallet (issue #34): the
-//! WIT interface skein:kernel/skein (../../wit/skein.wit) through the C
-//! bindings wit-bindgen emits (../../wit/bindings/c/program.h, compiled in
+//! WIT interface skein:kernel/skein (wit/skein.wit) through the C
+//! bindings wit-bindgen emits (wit/bindings/c/program.h, compiled in
 //! with program.c), presented with the same signatures as the preview1
 //! `skein` imports program.zig declares — so program.zig is one source for
 //! both builds and nothing above this file knows which ABI it runs on.
@@ -12,7 +12,7 @@ const std = @import("std");
 const c = @cImport(@cInclude("program.h"));
 
 comptime {
-    _ = @import("cabi.zig");
+    _ = @import("cabi");
 }
 
 var held: c.program_list_u8_t = .{ .ptr = null, .len = 0 };
