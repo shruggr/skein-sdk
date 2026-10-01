@@ -34,9 +34,9 @@
 //!                                 {fn, args} (JSON, or dag-cbor as application/cbor); the answer,
 //!                                 on the connection: 200 {fn, result} | an error status {fn, error}.
 //!                                 The caller must be admitted to the app's box as a message
-//!                                 would be (a dispatch row for (caller, <app>) or (anyone,
-//!                                 <app>)); an open route (sender "*") has no caller, so only
-//!                                 a box open to anyone admits it.
+//!                                 would be (a mailbox row for (caller, <app>) or (anyone,
+//!                                 <app>) in the call's `dispatch`); an open route (sender "*")
+//!                                 has no caller, so only a box open to anyone admits it.
 //!   an in-VM call                 call(<handler program>, "<interface>.<function>", args) → result
 //!                                 (dag-cbor), or the call's error.
 //!
@@ -326,13 +326,23 @@ fn onCall(a: Allocator, in: Value, app: []const u8, fns: []const Function, name:
     };
 }
 
-/// Whether the input's subscriptions admit `caller` (null: anyone) to `box`.
+/// Whether the input's dispatch rows (#77: the kernel's table, handed to a
+/// call as `dispatch`) admit `caller` (null: anyone) to `box`: a `mailbox`
+/// row for the box (or any box, "*") whose sender is "*" admits anyone, one
+/// whose sender is a key admits that identity.
 pub fn admitted(in: Value, caller: ?[]const u8, box: []const u8) bool {
-    const rules = in.get("subscriptions") orelse return false;
-    if (rules != .array) return false;
-    for (rules.array) |r| {
-        if (Value.str(r.get("box"))) |b| if (!eql(u8, b, box)) continue;
-        const s = Value.bytesOf(r.get("sender")) orelse return true;
+    const rows = in.get("dispatch") orelse return false;
+    if (rows != .array) return false;
+    for (rows.array) |r| {
+        if (!eql(u8, Value.str(r.get("transport")) orelse "", "mailbox")) continue;
+        const addr = Value.str(r.get("address")) orelse continue;
+        if (!eql(u8, addr, "*") and !eql(u8, addr, box)) continue;
+        const sender = r.get("sender") orelse continue;
+        if (Value.str(sender)) |t| {
+            if (eql(u8, t, "*")) return true;
+            continue;
+        }
+        const s = Value.bytesOf(sender) orelse continue;
         if (caller) |c| if (eql(u8, s, c)) return true;
     }
     return false;
@@ -470,19 +480,26 @@ test "a function's declaration by its full name" {
     try std.testing.expect((try declOf(a, m, "amm.pool")) == null);
 }
 
-test "admission by the subscriptions" {
+test "admission by the dispatch rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const k1 = [_]u8{2} ++ [_]u8{1} ** 32;
     const k2 = [_]u8{3} ++ [_]u8{2} ** 32;
     var r1 = cbor.MapBuilder.init(a);
+    try r1.put("transport", cbor.string("mailbox"));
     try r1.put("sender", .{ .bytes = &k1 });
-    try r1.put("box", cbor.string("demo"));
+    try r1.put("address", cbor.string("demo"));
     var r2 = cbor.MapBuilder.init(a);
-    try r2.put("box", cbor.string("open"));
+    try r2.put("transport", cbor.string("mailbox"));
+    try r2.put("sender", cbor.string("*"));
+    try r2.put("address", cbor.string("open"));
+    var r3 = cbor.MapBuilder.init(a);
+    try r3.put("transport", cbor.string("http"));
+    try r3.put("sender", cbor.string("*"));
+    try r3.put("address", cbor.string("other"));
     var in = cbor.MapBuilder.init(a);
-    try in.put("subscriptions", .{ .array = &.{ r1.value(), r2.value() } });
+    try in.put("dispatch", .{ .array = &.{ r1.value(), r2.value(), r3.value() } });
     const v = in.value();
     try std.testing.expect(admitted(v, &k1, "demo"));
     try std.testing.expect(!admitted(v, &k2, "demo"));
