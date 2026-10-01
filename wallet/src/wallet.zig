@@ -1037,16 +1037,16 @@ pub const Wallet = struct {
     }
 
     /// A transaction of ours now awaits its status: the `awaiting` map names
-    /// the broadcast record (the ARC it went to, the last status heard, and
-    /// `since`: when it was first broadcast, the abandonment clock).
-    pub fn noteBroadcast(self: *Wallet, txid: [32]u8, arc: []const u8, tx_status: []const u8) !void {
+    /// the broadcast record (the last status heard, and `since`: when it was
+    /// first broadcast, the abandonment clock). Where it went is not the
+    /// wallet's to know (#65: a broadcast is an event the host carries).
+    pub fn noteBroadcast(self: *Wallet, txid: [32]u8, tx_status: []const u8) !void {
         const a = self.arena;
         const since: u64 = if (try self.awaitingRecord(txid)) |r| r.getUint("since") orelse @intCast(@max(self.now, 0)) else @intCast(@max(self.now, 0));
         const cid = try self.store.putValue(a, .{ .map = &.{
             .{ .key = "kind", .value = .{ .text = "broadcast" } },
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
             .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &store_mod.bitcoinCid(.tx, (try self.txRaw(txid)) orelse return error.UnknownTransaction)) } },
-            .{ .key = "arc", .value = .{ .text = arc } },
             .{ .key = "txStatus", .value = .{ .text = tx_status } },
             .{ .key = "since", .value = .{ .uint = since } },
         } });
@@ -1061,7 +1061,7 @@ pub const Wallet = struct {
     /// pending submission's status is never applied before it is admitted.)
     /// `thread`: the thread carrying the submission (#66: a resubmission's
     /// client waits on it while it is pending); kept from the prior record if null.
-    pub fn noteSubmission(self: *Wallet, txid: [32]u8, arc: []const u8, tx_status: []const u8, submission: ?[]const u8, thread: ?[]const u8) !void {
+    pub fn noteSubmission(self: *Wallet, txid: [32]u8, tx_status: []const u8, submission: ?[]const u8, thread: ?[]const u8) !void {
         const a = self.arena;
         const prior = try self.awaitingRecord(txid);
         const since: u64 = if (prior) |r| r.getUint("since") orelse @intCast(@max(self.now, 0)) else @intCast(@max(self.now, 0));
@@ -1070,7 +1070,6 @@ pub const Wallet = struct {
             .{ .key = "kind", .value = .{ .text = "broadcast" } },
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
             .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &store_mod.bitcoinCid(.tx, (try self.txRaw(txid)) orelse return error.UnknownTransaction)) } },
-            .{ .key = "arc", .value = .{ .text = arc } },
             .{ .key = "txStatus", .value = .{ .text = tx_status } },
             .{ .key = "since", .value = .{ .uint = since } },
         });
@@ -1132,7 +1131,7 @@ pub const Wallet = struct {
         if (outcome != .pending) {
             _ = try self.map("awaiting").remove(&txid);
         } else if (try self.awaitingRecord(txid)) |r| {
-            if (!std.mem.eql(u8, r.getText("txStatus") orelse "", tx_status) and tx_status.len > 0) try self.noteBroadcast(txid, r.getText("arc") orelse "", tx_status);
+            if (!std.mem.eql(u8, r.getText("txStatus") orelse "", tx_status) and tx_status.len > 0) try self.noteBroadcast(txid, tx_status);
         }
         return outcome;
     }

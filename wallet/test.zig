@@ -1209,10 +1209,10 @@ test "settlement: a competing spend proven rejects ours; never mined in time is 
     // Never mined: B broadcast at 1000, still unproven at the deadline, is abandoned (A stands).
     var wa = try lib.wallet.Wallet.load(a, s, base, .regtest);
     wa.now = 1000;
-    try wa.noteBroadcast(cb.txid, "https://arc.test", "SEEN_ON_NETWORK");
+    try wa.noteBroadcast(cb.txid, "SEEN_ON_NETWORK");
     wa.now = 1000 + 3_600_000 - 1;
     try std.testing.expect(!(try wa.abandonIfDue(cb.txid, 3_600_000)));
-    try wa.noteBroadcast(cb.txid, "https://arc.test", "SEEN_IN_ORPHAN_MEMPOOL"); // keeps its `since`
+    try wa.noteBroadcast(cb.txid, "SEEN_IN_ORPHAN_MEMPOOL"); // keeps its `since`
     wa.now = 1000 + 3_600_000;
     try std.testing.expect(try wa.abandonIfDue(cb.txid, 3_600_000));
     try std.testing.expectEqual(lib.wallet.Status.rejected, try wa.status(cb.txid));

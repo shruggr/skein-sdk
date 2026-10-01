@@ -161,6 +161,20 @@ pub fn emit(a: Allocator, to: []const u8, box: []const u8, body: Value, subject:
     return result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
 }
 
+/// Broadcast a transaction (#65): the event {event: "broadcast", tx: <its
+/// CID, held>, beef?: <its Atomic BEEF>}, unauthenticated and addressed to no
+/// one — the host's wiring carries it to the network. → the event record's
+/// CID. Await the transaction's CID to rest on its proof (an event) or a
+/// status provider's message about it.
+pub fn broadcast(a: Allocator, tx: []const u8, beef: ?[]const u8) ![]u8 {
+    var m = cbor.MapBuilder.init(a);
+    try m.put("event", .{ .string = "broadcast" });
+    try m.put("tx", cbor.cidv(tx));
+    if (beef) |b| try m.put("beef", .{ .bytes = b });
+    const bytes = try cbor.encode(a, m.value());
+    return result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
+}
+
 /// Rest until `until_ms` at most (#70: a wake-me to the waker, emitted when the step ends; its answer steps the thread with `woke`).
 pub fn deadline(until_ms: i64) !void {
     if (raw.deadline(until_ms) < 0) return failed();
@@ -353,7 +367,8 @@ pub fn peerOf(a: Allocator, key: []const u8) !?Value {
 }
 
 /// The key of the provider playing `role` for this instance (#70: `fetch`,
-/// `libp2p`, `waker`, `broadcast`): the address book entry with that role.
+/// `libp2p`, `waker`; #69: `cron`; #65: `status`): the address book entry
+/// with that role — on this host (`local`) or a remote one (`mailbox`).
 pub fn provider(a: Allocator, role: []const u8) ![]const u8 {
     for (try peers(a)) |p| if (std.mem.eql(u8, Value.str(p.get("role")) orelse "", role)) {
         if (Value.bytesOf(p.get("key"))) |k| return k;

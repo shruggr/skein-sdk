@@ -2,9 +2,11 @@
 //! wasm32-wasi command stepped with the `skein` imports (kernel-zig
 //! program.zig). One run is one step over one input: an owner's message
 //! (args.body), a plain entry routed by subscription (args.event: a
-//! `header`, `proof` or `status` record), or — for a thread resting after a
-//! broadcast — the entry for its transaction (input.event) or its deadline
-//! (input.woke).
+//! `header` or `proof` record), a status provider's message routed by
+//! subscription (args.box "status": a `status` body), or — for a thread
+//! resting after a broadcast — an event about its transaction (input.event:
+//! a proof), a status provider's message about it (input.message), or its
+//! deadline (input.woke).
 //!
 //! The wallet's state is the record the head `wallet` names (a
 //! `wallet-state`: its index maps by name); each step loads it, applies the
@@ -21,22 +23,20 @@
 //!   {op: "list", basket?, includeSpent?}        our outputs in a basket (default "default")
 //!
 //! Plain entries (docs/WALLET.md): {kind: "header", raw}, {kind: "proof",
-//! subject, txid, path}, {kind: "status", subject, txid, txStatus, merklePath?}.
+//! subject, txid, path}. Status messages (#65, from a status provider the
+//! instance subscribes to, box "status"): {kind: "status", txid, txStatus, …}.
 //!
 //! Recorded calls: the oracle over the `wallet` import (getPublicKey,
-//! createSignature: no key is ever here). Broadcasting is a message (#70,
-//! #67: external communication is a thread): the wallet emits the Atomic BEEF
-//! to the address book's `broadcast` provider (box "broadcast", {tx}, about
-//! the transaction: `subject` its CID) and ends its step awaiting the answer —
-//! the provider's signed message {replyTo, status, body}, Arcade's own answer
-//! (the host's broadcaster, #58) — and the transaction's CID, for a
-//! `status`/`proof` entry, with a deadline. The answer, an entry, or the
-//! deadline steps it. At the deadline the broadcaster is asked again (box
-//! "status", {txid}); a 404 (Arcade never took the transaction) posts it
-//! again. No `broadcast` provider in the address book: nothing is broadcast.
-//! A transaction never mined within
-//! defaults.walletAbandonMs of its broadcast is abandoned (rejected); a reorg
-//! that turns ours back to unproven broadcasts them again and awaits them.
+//! createSignature: no key is ever here). Broadcasting is an event (#65): the
+//! wallet emits {event: "broadcast", tx: <its CID>, beef: <the Atomic BEEF>},
+//! addressed to no one — the host carries it (a durable queue, retries, its
+//! Arcade) — and ends its step awaiting the transaction's CID, with a
+//! deadline at its abandonment (defaults.walletAbandonMs after its first
+//! broadcast; 0: none). Its proof (an event in box `chain`) proves it; a
+//! status message, when the instance subscribes to a status provider,
+//! rejects it (REJECTED, DOUBLE_SPEND_ATTEMPTED, …) or notes how it stands;
+//! the deadline abandons it (rejected) if it is still unproven. A reorg that
+//! turns ours back to unproven broadcasts them again and awaits them.
 //!
 //! Settlement (#37) is state to read, not an event to deliver: a `status`
 //! entry that rejects a transaction writes its settlement record and walks
@@ -210,13 +210,18 @@ fn run(a: std.mem.Allocator) !void {
     // owner's message, or a plain entry.
     const callback = step.get("event");
     const woke = step.getBool("woke") orelse false;
-    // The broadcaster's answer to what this thread asked it (#70: a reply to our message).
-    const reply: ?Value = if (step.get("reply")) |r| (if (r == .map) r else null) else null;
+    // A status provider's message about the transaction this thread awaits (#65: routed by its subject).
+    const status_msg: ?Value = if (step.get("message")) |m| (if (m == .map) m else null) else null;
     var body: Value = .null;
     var op: []const u8 = undefined;
-    if (callback != null or woke or reply != null) {
+    if (callback != null or woke or status_msg != null) {
         op = "callback";
         if (callback) |c| body = try s.getValue(a, c.getCid("event") orelse return error.BadInput);
+        if (status_msg) |m| body = try s.getValue(a, m.getCid("body") orelse return error.BadInput);
+    } else if (std.mem.eql(u8, args.getText("box") orelse "", "status") and args.getCid("body") != null) {
+        // A status provider's message by subscription (#65: nothing awaits its transaction here).
+        body = try s.getValue(a, args.getCid("body").?);
+        op = "event";
     } else if (args.getCid("body")) |bc| {
         body = s.getValue(a, bc) catch |e| {
             std.log.err("body record: {s}", .{@errorName(e)});
@@ -228,9 +233,6 @@ fn run(a: std.mem.Allocator) !void {
         op = "event";
     } else return error.BadInput;
     const defaults = step.get("defaults");
-    // The broadcaster (#70): the address book's `broadcast` provider, if there is one.
-    var bc = Broadcaster{ .key = try broadcasterKey(a, s) };
-    const recheck_ms: i64 = if (defaults) |d| std.fmt.parseInt(i64, d.getText("walletRecheckMs") orelse "600000", 10) catch return error.BadConfig else 600000;
     const abandon_ms: i64 = if (defaults) |d| std.fmt.parseInt(i64, d.getText("walletAbandonMs") orelse "86400000", 10) catch return error.BadConfig else 86400000;
     const now: i64 = @intCast(step.getUint("at") orelse return error.BadInput);
     // After the step: await these transactions (their CIDs) until the deadline.
@@ -262,7 +264,7 @@ fn run(a: std.mem.Allocator) !void {
         const raws = try a.alloc([]const u8, list.array.len);
         for (list.array, raws) |x, *r| r.* = if (x == .bytes) x.bytes else return error.BadBody;
         const res = try wal.addHeaders(raws);
-        try rebroadcast(a, &wal, &bc, &await_txs, &out);
+        try rebroadcast(a, &wal, &await_txs, &out);
         try out.appendSlice(a, &.{
             .{ .key = "added", .value = .{ .uint = res.added } },
             .{ .key = "known", .value = .{ .uint = res.known } },
@@ -319,12 +321,13 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "status", .value = .{ .text = @tagName(st) } },
         });
     } else if (std.mem.eql(u8, op, "event")) {
-        // A plain entry, by subscription: the feed's header, proof or status.
+        // A plain entry by subscription (the feed's header, a proof), or a status provider's message.
         const kind = body.getText("kind") orelse return error.BadEvent;
         try out.append(a, .{ .key = "event", .value = .{ .text = kind } });
+        if (body.getText("txStatus")) |ts| try out.append(a, .{ .key = "txStatus", .value = .{ .text = ts } });
         if (std.mem.eql(u8, kind, "header")) {
             const res = try wal.addHeaders(&.{body.getBytes("raw") orelse return error.BadEvent});
-            try rebroadcast(a, &wal, &bc, &await_txs, &out);
+            try rebroadcast(a, &wal, &await_txs, &out);
             try out.appendSlice(a, &.{
                 .{ .key = "added", .value = .{ .uint = res.added } },
                 .{ .key = "known", .value = .{ .uint = res.known } },
@@ -341,42 +344,25 @@ fn run(a: std.mem.Allocator) !void {
             });
         } else return error.BadEvent;
     } else if (std.mem.eql(u8, op, "callback")) {
-        // Transactions we broadcast: a status entry for one of them, or the
-        // deadline (each still awaited is abandoned if due, else ARC is asked again).
+        // Transactions we broadcast: a proof or a status for one of them, or
+        // the deadline (each still awaited is abandoned if due).
         var awaited = try awaitedFromTip(a, s, step);
-        // The questions to the broadcaster still unanswered (#70): awaited again, but for the one answered now.
-        try bc.carry(a, s, step, if (reply) |r| r.getCid("replyTo") else null);
         var txid: [32]u8 = undefined;
         var outcome: w.wallet.Wallet.Outcome = .pending;
-        if (callback != null) {
-            txid = try eventTxid(body);
+        if (callback != null or status_msg != null) {
+            // A proof event, or a status provider's message (its subject is the transaction).
+            txid = if (status_msg) |m| w.store.bitcoinHash(m.getCid("subject") orelse return error.BadInput) orelse return error.BadInput else try eventTxid(body);
             const kind = body.getText("kind") orelse return error.BadEvent;
             outcome = try applyEvent(&wal, txid, kind, body);
             try out.append(a, .{ .key = "event", .value = .{ .text = kind } });
-            if (!contains(awaited.items, txid)) try awaited.insert(a, 0, txid);
-        } else if (reply) |r| {
-            // The broadcaster's answer: Arcade's, to a broadcast or to the question at a deadline.
-            const asked = try s.getValue(a, r.getCid("message") orelse return error.BadInput);
-            txid = w.store.bitcoinHash(asked.getCid("subject") orelse return error.BadInput) orelse return error.BadInput;
-            const ans_body = try s.getValue(a, r.getCid("body") orelse return error.BadInput);
-            if (ans_body.getText("error")) |e| std.log.err("the broadcaster: {s}", .{e});
-            var ans = try arcAnswer(a, ans_body);
-            // 404 to the question: Arcade never took it (the broadcast failed transiently, or it lost its history): post it again.
-            if (std.mem.eql(u8, r.getText("box") orelse "", "status") and ans.http_status == 404) if (try wal.beefOf(txid)) |beef| {
-                try bc.broadcast(a, txid, beef);
-                ans.tx_status = "";
-            };
-            outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
-            try out.append(a, .{ .key = "arc", .value = try ans.value(a) });
+            if (body.getText("txStatus")) |ts| try out.append(a, .{ .key = "txStatus", .value = .{ .text = ts } });
             if (!contains(awaited.items, txid)) try awaited.insert(a, 0, txid);
         } else {
             if (awaited.items.len == 0) return error.BadInput;
             txid = awaited.items[0];
             for (awaited.items) |t| {
                 if ((try wal.awaitingRecord(t)) == null) continue;
-                if (try wal.abandonIfDue(t, abandon_ms)) continue;
-                // Ask the broadcaster again; its answer is the next step's.
-                try bc.ask(a, t);
+                _ = try wal.abandonIfDue(t, abandon_ms);
             }
             outcome = switch (try wal.status(txid)) {
                 .proven => .proven,
@@ -414,10 +400,10 @@ fn run(a: std.mem.Allocator) !void {
             .{ .key = "tx", .value = .{ .bytes = created.beef } },
         });
         if (created.reference) |r| try out.append(a, .{ .key = "reference", .value = .{ .cid = r } });
-        // Broadcast: the Atomic BEEF to the broadcaster (#70: a message), then await its answer and the status.
-        if (created.reference == null and !created.no_send and bc.key != null) {
-            try wal.noteBroadcast(created.txid, "broadcast", "");
-            try bc.broadcast(a, created.txid, created.beef);
+        // Broadcast (#65: an event the host carries), then await the transaction: its proof, a status, or abandonment.
+        if (created.reference == null and !created.no_send) {
+            try wal.noteBroadcast(created.txid, "");
+            try broadcast(a, created.txid, created.beef);
             try out.append(a, .{ .key = "outcome", .value = .{ .text = "pending" } });
             try await_txs.append(a, created.txid);
         }
@@ -459,28 +445,25 @@ fn run(a: std.mem.Allocator) !void {
     // overlay): each topic's lookup services are told, in this step (#50).
     if (wal.unapplied.items.len > 0) try w.overlay.hookRejected(a, VmCaller.caller(), step, wal.unapplied.items);
     if (await_txs.items.len > 0) {
-        // Rest until a `status` / `proof` entry for one of these transactions (a CID is its txid), or the deadline.
+        // Rest until a proof or a status for one of these transactions (a CID is its txid), or the
+        // earliest abandonment among them (its first broadcast + walletAbandonMs; 0: none).
         const hexes = try a.alloc(Value, await_txs.items.len);
+        var until: ?i64 = null;
         for (await_txs.items, hexes) |t, *h| {
             const subject = txCid(t);
             if (sk.@"await"(&subject, subject.len) < 0) return failed();
             h.* = .{ .text = try a.dupe(u8, &w.header.toHex(t)) };
+            if (abandon_ms > 0) if (try wal.awaitingRecord(t)) |r| {
+                const at = @max(@as(i64, @intCast(r.getUint("since") orelse @as(u64, @intCast(@max(now, 0))))) + abandon_ms, now + 1);
+                until = if (until) |u| @min(u, at) else at;
+            };
         }
-        if (sk.deadline(now + recheck_ms) < 0) return failed();
+        if (until) |u| if (sk.deadline(u) < 0) return failed();
         try out.appendSlice(a, &.{
             .{ .key = "txid", .value = hexes[0] },
             .{ .key = "awaited", .value = .{ .array = hexes } },
             .{ .key = "awaiting", .value = .{ .boolean = true } },
         });
-    }
-    // What this thread asked the broadcaster and has no answer to yet: awaited (the answer steps it), and kept on the result.
-    if (bc.asked.items.len > 0) {
-        const ids = try a.alloc(Value, bc.asked.items.len);
-        for (bc.asked.items, ids) |id, *v| {
-            if (sk.@"await"(id.ptr, @intCast(id.len)) < 0) return failed();
-            v.* = .{ .cid = id };
-        }
-        try out.append(a, .{ .key = "asked", .value = .{ .array = ids } });
     }
     // The transactions this result is about, as `mentions` (kernel edges from the thread).
     {
@@ -516,7 +499,7 @@ fn dedupe(a: std.mem.Allocator, es: []const cbor.Entry) ![]const cbor.Entry {
     return out.items;
 }
 
-/// The txid a `proof` / `status` record is about: its subject (a bitcoin-tx CID), else its txid (hex).
+/// The txid a `proof` event or a `status` body is about: its subject (a bitcoin-tx CID), else its txid (hex).
 fn eventTxid(ev: Value) ![32]u8 {
     if (ev.getCid("subject")) |c| return w.store.bitcoinHash(c) orelse error.BadEvent;
     return w.header.fromHex(ev.getText("txid") orelse return error.BadEvent);
@@ -553,119 +536,28 @@ fn txCid(txid: [32]u8) [37]u8 {
 
 /// After a reorg: our transactions turned back to unproven are broadcast
 /// again (as after createAction) and awaited.
-fn rebroadcast(a: std.mem.Allocator, wal: *w.wallet.Wallet, bc: *Broadcaster, await_txs: *std.ArrayList([32]u8), out: *std.ArrayList(cbor.Entry)) !void {
+fn rebroadcast(a: std.mem.Allocator, wal: *w.wallet.Wallet, await_txs: *std.ArrayList([32]u8), out: *std.ArrayList(cbor.Entry)) !void {
     if (wal.reverted.items.len == 0) return;
     const hexes = try a.alloc(Value, wal.reverted.items.len);
     for (wal.reverted.items, hexes) |t, *h| h.* = .{ .text = try a.dupe(u8, &w.header.toHex(t)) };
     try out.append(a, .{ .key = "reverted", .value = .{ .array = hexes } });
-    if (bc.key == null) return;
     for (wal.reverted.items) |t| {
         const beef = (try wal.beefOf(t)) orelse continue;
-        try wal.noteBroadcast(t, "broadcast", "");
-        try bc.broadcast(a, t, beef);
+        try wal.noteBroadcast(t, "");
+        try broadcast(a, t, beef);
         if (!contains(await_txs.items, t)) try await_txs.append(a, t);
     }
 }
 
-/// The address book's `broadcast` provider's key (#70: the entry with role
-/// "broadcast" under the head `peers`), or null.
-fn broadcasterKey(a: std.mem.Allocator, s: w.store.Store) !?[]const u8 {
-    const name = "peers";
-    const root = try result(a, sk.head, .{ name.ptr, @as(u32, name.len) });
-    if (root.len == 0) return null;
-    const book = try s.getValue(a, root);
-    for (book.getArray("peers") orelse return null) |e| {
-        const p = try s.getValue(a, e.getCid("peer") orelse continue);
-        if (std.mem.eql(u8, p.getText("role") orelse "", "broadcast")) return p.getBytes("key");
-    }
-    return null;
+/// Broadcast a transaction (#65): the event {event: "broadcast", tx: <its CID>,
+/// beef: <its Atomic BEEF>}, unauthenticated and addressed to no one — the
+/// host carries it to the network. The step then awaits the transaction.
+fn broadcast(a: std.mem.Allocator, txid: [32]u8, beef: []const u8) !void {
+    const tx = txCid(txid);
+    const ev = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "broadcast" } },
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &tx) } },
+        .{ .key = "beef", .value = .{ .bytes = beef } },
+    }) });
+    _ = try result(a, sk.emit, .{ ev.ptr, @as(u32, @intCast(ev.len)) });
 }
-
-/// The broadcaster as this step talks to it (#70): what it is asked — a
-/// message each, emitted, about the transaction (`subject` its CID) — and
-/// what the thread still awaits an answer to.
-const Broadcaster = struct {
-    key: ?[]const u8,
-    asked: std.ArrayList([]const u8) = .empty,
-
-    /// The thread's questions still unanswered (the last result's `asked`), but for `answered`.
-    fn carry(self: *Broadcaster, a: std.mem.Allocator, s: w.store.Store, step: Value, answered: ?[]const u8) !void {
-        const tip = try s.getValue(a, step.getCid("tip") orelse return);
-        const kept = tip.getArray("kept") orelse return;
-        if (kept.len == 0 or kept[kept.len - 1] != .cid) return;
-        const res = try s.getValue(a, kept[kept.len - 1].cid);
-        for (res.getArray("asked") orelse return) |x| {
-            if (x != .cid) continue;
-            if (answered) |c| if (std.mem.eql(u8, c, x.cid)) continue;
-            try self.asked.append(a, x.cid);
-        }
-    }
-
-    /// A message to the broadcaster in `box` about `txid`.
-    fn emit(self: *Broadcaster, a: std.mem.Allocator, box: []const u8, txid: [32]u8, body: Value) !void {
-        const to = self.key orelse return;
-        const subject = txCid(txid);
-        const msg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "to", .value = .{ .bytes = to } },
-            .{ .key = "box", .value = .{ .text = box } },
-            .{ .key = "body", .value = .{ .bytes = try cbor.encode(a, body) } },
-            .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &subject) } },
-        }) });
-        try self.asked.append(a, try result(a, sk.emit, .{ msg.ptr, @as(u32, @intCast(msg.len)) }));
-    }
-
-    /// Broadcast a transaction: its Atomic BEEF (box "broadcast", {tx}).
-    fn broadcast(self: *Broadcaster, a: std.mem.Allocator, txid: [32]u8, beef: []const u8) !void {
-        try self.emit(a, "broadcast", txid, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "tx", .value = .{ .bytes = beef } }}) });
-    }
-
-    /// Ask after a transaction (box "status", {txid}).
-    fn ask(self: *Broadcaster, a: std.mem.Allocator, txid: [32]u8) !void {
-        try self.emit(a, "status", txid, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(txid)) } }}) });
-    }
-};
-
-const ArcAnswer = struct {
-    http_status: u64,
-    tx_status: []const u8,
-    merkle_path: ?[]const u8,
-    extra: []const u8,
-
-    fn value(self: ArcAnswer, a: std.mem.Allocator) !Value {
-        var es: std.ArrayList(cbor.Entry) = .empty;
-        try es.appendSlice(a, &.{
-            .{ .key = "status", .value = .{ .uint = self.http_status } },
-            .{ .key = "txStatus", .value = .{ .text = self.tx_status } },
-            .{ .key = "extraInfo", .value = .{ .text = self.extra } },
-        });
-        if (self.merkle_path) |p| try es.append(a, .{ .key = "merklePath", .value = .{ .bytes = p } });
-        return .{ .map = es.items };
-    }
-};
-
-/// The broadcaster's answer {status, body} (Arcade's HTTP status and JSON):
-/// a 4xx is a rejection unless Arcade names a status; anything else
-/// unanswered (no answer at all: {error}) stays pending.
-fn arcAnswer(a: std.mem.Allocator, ans: Value) !ArcAnswer {
-    const status = ans.getUint("status") orelse 0;
-    const text = ans.getBytes("body") orelse "";
-    var out = ArcAnswer{ .http_status = status, .tx_status = "", .merkle_path = null, .extra = ans.getText("error") orelse "" };
-    if (std.json.parseFromSliceLeaky(std.json.Value, a, text, .{})) |j| {
-        if (j == .object) {
-            if (j.object.get("txStatus")) |t| if (t == .string) {
-                out.tx_status = t.string;
-            };
-            if (j.object.get("extraInfo")) |t| if (t == .string) {
-                out.extra = t.string;
-            };
-            if (j.object.get("merklePath")) |t| if (t == .string and t.string.len > 0) {
-                const p = try a.alloc(u8, t.string.len / 2);
-                _ = std.fmt.hexToBytes(p, t.string) catch return error.BadHttpResponse;
-                out.merkle_path = p;
-            };
-        }
-    } else |_| {}
-    if (out.tx_status.len == 0 and status >= 400 and status < 500) out.tx_status = "REJECTED";
-    return out;
-}
-
