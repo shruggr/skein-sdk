@@ -6,7 +6,7 @@ and the WASI 0.2 packages it depends on.
 | path | what |
 |---|---|
 | `skein.wit` | The interface `skein` and the worlds `program` and `handler`. |
-| `deps/*.wit` | WASI 0.2.12: `cli`, `clocks`, `filesystem`, `io`, `random` and `sockets`, vendored unchanged from wasmtime v49.0.1's `crates/wasi/src/p2/wit/deps`; `http` (#15) from its `crates/wasi-http/wit/deps` (whose `cli`/`io` copies are the same files). That is the version wasmtime v49 implements and its preview1 adapter imports. |
+| `deps/*.wit` | WASI 0.2.12: `cli`, `clocks`, `filesystem`, `io`, `random` and `sockets`, vendored unchanged from wasmtime v49.0.1's `crates/wasi/src/p2/wit/deps` (`http` went with #70: no world imports it). That is the version wasmtime v49 implements and its preview1 adapter imports. |
 | `bindings/c/` | The guest's C bindings for world `program`, from `wit-bindgen c` 0.62.0. They are committed so that builds need no wit-bindgen. |
 
 ## The interface `skein:kernel/skein`
@@ -35,11 +35,10 @@ the adapter and the canonical-ABI glue are instructions too. Every other
 field of an update is the same.
 
 The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `await`,
-`head`, `advance`, `subscribe`, `wallet`, `http`, `deadline`, `call` and
+`head`, `advance`, `subscribe`, `wallet`, `emit`, `deadline`, `call` and
 `edges` (#42: the edges into a record, from the kernel's index; docs/VM.md "Edges").
-`emit` and `resolve` are gone (#40): an instance delivers a message itself,
-its messagebox program's `send` over `http`, and looks a handle up with its
-`resolve` program; both are reached through `call`.
+There is no `http` and no `libp2p` (#70, #67: format 6 removed them); a
+handle is looked up by launching the `resolve` program.
 
 - **`call`** (#40) runs a program record as a function: its entry, with
   `input()` = `{kind: "call", fn, arg, …}`, and returns what it wrote to
@@ -48,24 +47,21 @@ its messagebox program's `send` over `http`, and looks a handle up with its
   are the step's. From the kernel's own `call` (a request to the front door,
   a read), it only reads. Calls nest to depth 8.
 
-- **`http`** is the preview1 shape: a dag-cbor request in, a dag-cbor
-  response out. It stays for preview1 programs (and in the interface, which
-  mirrors them). A component uses standard `wasi:http/outgoing-handler`
-  (#15), which the kernel serializes into this same request and answers by
-  the same path: request and response recorded on the update, replay never
-  touching the network (`docs/VM.md`, "Outgoing HTTP").
+- **`emit`** (#70, #67) is the one way out: `emit(message: list<u8>) ->
+  result<cid, string>`, `message` the dag-cbor `{to: bytes(33), box, body:
+  bytes, subject?: cid}`; the kernel signs the message record through the
+  oracle and returns its CID, and the message goes out when the step ends
+  without error. A program reaches HTTP and libp2p by emitting to the
+  address book's providers (`fetch`, `libp2p`), and awaits the answer, which
+  steps it again (`docs/VM.md`, "emit"; `docs/MESSAGES.md`, "Outbound").
+  `programs/fetch` and `programs/p2p-component` are components that do.
+- **`deadline`** is sugar over `emit`: a wake-me to the address book's
+  waker, awaited when the step ends.
 - **`wallet`** takes BRC-100 wire frames as bytes, for now.
-- **`skein:kernel/libp2p`** (#51), a second interface: `publish`, `dial`,
-  `send`, `receive` (a `received` variant: `frame`, `pending`, `closed`),
-  `close`. Each typed call becomes the dag-cbor request of preview1's
-  `skein.libp2p` import (`{op, …}`), answered by the router's libp2p host and
-  recorded on the update like `http` (`docs/VM.md`, "libp2p"). Both worlds
-  import it; `programs/p2p-component` is a component that calls it.
 
 ## The worlds
 
-- **`program`**: imports `skein` and `wasi:http/outgoing-handler` (the
-  latter brings `wasi:http/types` and the `wasi:io` it uses). A preview1 program (Zig, C, Rust
+- **`program`**: imports `skein` only. A preview1 program (Zig, C, Rust
   `wasm32-wasip1`) embeds this world with wit-bindgen. The preview1 command
   adapter (`wasm-tools component new --adapt`) then adds the WASI imports
   and the `wasi:cli/run` export. The result satisfies `handler`.
@@ -73,10 +69,9 @@ its messagebox program's `send` over `http`, and looks a handle up with its
   - WASI 0.2.12's `cli` (environment, exit, stdio, terminal), `clocks`
     (monotonic, wall), `filesystem` (types, preopens), `io` (error, poll,
     streams) and `random` (random, insecure, insecure-seed);
-  - `wasi:http/types` and `wasi:http/outgoing-handler` (#15);
   - `skein`.
 
-  It exports `wasi:cli/run`. There are no sockets and no incoming handler.
+  It exports `wasi:cli/run`. There are no sockets and no `wasi:http`.
   The kernel answers every import over the graph (`kernel-zig/README.md`,
   "Components"). A component built against an older 0.2.x WASI links by
   semver: wasi-sdk 34's `wasm32-wasip2` output runs unchanged.
