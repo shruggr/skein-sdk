@@ -11,6 +11,9 @@
 //   brc104     BRC-103/104 framing for programs (imports cbor, sk)             lib/brc104.zig
 //   dagjson    dag-json (imports cbor)                                         lib/dagjson.zig
 //   message    BRC-169 messages: build, sign through the oracle, verify        lib/message.zig
+//   app        calling an app (skein docs/APPS.md §4): {fn, args} dispatch     lib/app.zig
+//              by the manifest's `provides`, args checked, `writes` enforced,
+//              the answer message; the `/call` route (imports cbor, sk, dagjson)
 //   cabi       malloc/realloc/free/abort/strlen for wit-bindgen's C bindings   wit/zig/cabi.zig
 //   skein_wit  the `skein` calls over the WIT interface, for a component       wit/zig/skein_wit.zig
 //              build (the C bindings compiled in: wit/bindings/c)
@@ -41,6 +44,7 @@ pub fn build(b: *std.Build) void {
     _ = b.addModule("brc104", .{ .root_source_file = b.path("lib/brc104.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
     const dagjson = b.addModule("dagjson", .{ .root_source_file = b.path("lib/dagjson.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "cbor", .module = c.cbor }} });
     _ = b.addModule("message", .{ .root_source_file = b.path("lib/message.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "secp", .module = secp } } });
+    const app = b.addModule("app", .{ .root_source_file = b.path("lib/app.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk }, .{ .name = "dagjson", .module = dagjson } } });
 
     // The component glue: no wasi-libc (wit/README.md says why).
     const cabi = b.addModule("cabi", .{ .root_source_file = b.path("wit/zig/cabi.zig"), .target = target, .optimize = optimize });
@@ -51,7 +55,7 @@ pub fn build(b: *std.Build) void {
     wit.addObjectFile(b.path("wit/bindings/c/program_component_type.o"));
 
     const test_step = b.step("test", "every module's tests and the wallet's vector corpus, natively");
-    for ([_]*std.Build.Module{ c.cid, c.cbor, c.mst, secp, dagjson }) |m| {
+    for ([_]*std.Build.Module{ c.cid, c.cbor, c.mst, secp, dagjson, app }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 

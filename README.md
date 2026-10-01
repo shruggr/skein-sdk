@@ -20,6 +20,7 @@ is one copy of each file, here.
 | `brc104` | `lib/brc104.zig` | BRC-103/104 framing for programs |
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
 | `message` | `lib/message.zig` | BRC-169 messages: build, sign through the oracle, verify with the sender's key alone |
+| `app` | `lib/app.zig` | calling an app (skein `docs/APPS.md` §4): `{fn, args}` dispatched by the manifest's `provides` (read from the app's head), `args` checked against the declared shapes, `writes: false` enforced, the answer message to the sender; the `/call` route; the app's state under its head (since 0.2.0) |
 | `cabi` | `wit/zig/cabi.zig` | `malloc`/`realloc`/`free`/`abort`/`strlen` for wit-bindgen's C bindings, without wasi-libc |
 | `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk`'s preview1 imports over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build (the C bindings in `wit/bindings/c` are compiled in) |
 | `wallet` | `wallet/src/lib.zig` | the wallet library: headers and our chain tracker, SPV, BEEF, BRC-29, the transaction builder, the wallet's records and index maps, the overlay's state (over bsvz) |
@@ -88,10 +89,40 @@ upstream with that fix, the dependency moves to the merged commit.
 `-Dwallet=false` leaves the wallet module (and bsvz) out entirely; skein's
 kernel builds that way.
 
+## Calling an app (`app`, 0.2.0)
+
+An app's handler lists the functions it implements and hands every input
+to `app.serve`; the manifest's `provides` (the root record of the app's
+head, written by skein's install) says which exist, their argument shapes
+and whether they write:
+
+```zig
+const app = @import("app");
+const fns = [_]app.Function{
+    .{ .name = "demo.counter.get", .run = get },   // demo.counter/1's `get`
+    .{ .name = "demo.counter.add", .run = add },
+};
+fn add(c: *app.Call) !Value {
+    const by = Value.intOf(c.args.get("by")).?;      // checked against {by: "int"} already
+    _ = try c.setState(newState);                    // refused if the manifest says writes: false
+    return result;
+}
+pub fn main() u8 { return sk.main("demo", run); }
+fn run(a: Allocator) !void { return app.serve(a, try sk.input(a), "demo", &fns, other); }
+```
+
+The three callers (a message `{fn, args}` in the app's box, answered to the
+sender `{fn, request, replyTo, result | error: {code, message}}`; the route
+`{path: "/call", fn: "call"}`, answered on the connection; an in-VM `call`)
+and the error codes are documented at the top of `lib/app.zig`. A
+function's writes go through its `Call` (`put`, `keep`, `advance`,
+`setState`, `emit`, `launch`, `subscribe`, `deadline`, `awaitRecord`); for a
+`writes: false` function each is refused with `read-only`.
+
 ## Tests
 
 ```
-zig build test         # cid, cbor, mst, secp, dagjson; the wallet's library tests and vector corpus (26)
+zig build test         # cid, cbor, mst, secp, dagjson, app; the wallet's library tests and vector corpus (26)
 zig build test-wasm    # the wallet's tests built for wasm32-wasi, under Node's WASI (needs node)
 ```
 
@@ -102,7 +133,7 @@ resolves: `node sdk/wallet/vectors/gen-ts/run.mjs`).
 
 ## Versions
 
-`build.zig.zon` carries the version (0.1.0). A change to a module's API or
+`build.zig.zon` carries the version (0.2.0: the `app` module). A change to a module's API or
 to the ABI the `sk`/`skein_wit` calls describe is a new minor version until
 1.0; skein's kernel and the SDK move together (skein pins a tagged release
 by URL+hash, #75).
