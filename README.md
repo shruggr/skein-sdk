@@ -16,11 +16,11 @@ is one copy of each file, here.
 | `cbor` | `src/cbor.zig` | dag-cbor values, canonical encode/decode, the CID of a value (`cbor.cidm` is `cid`) |
 | `mst` | `src/mst.zig` | Merkle search trees over dag-cbor blocks: the ordered maps of the kernel's index and the wallet's |
 | `secp` | `src/secp.zig` | BRC-42 "anyone" child keys and ECDSA verification, pure Zig |
-| `sk` | `lib/sk.zig` | the preview1 `skein` imports (`get`, `put`, `emit`, `head`, `advance`, `call`, …) and the helpers over them: kept records, messages, the address book, trees |
+| `sk` | `lib/sk.zig` | the preview1 `skein` imports (`get`, `put`, `emit`, `head`, `advance`, `call`, …; no `subscribe` since 0.3.0) and the helpers over them: kept records, messages, the address book, trees |
 | `brc104` | `lib/brc104.zig` | BRC-103/104 framing for programs |
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
 | `message` | `lib/message.zig` | BRC-169 messages: build, sign through the oracle, verify with the sender's key alone |
-| `app` | `lib/app.zig` | calling an app (skein `docs/APPS.md` §4): `{fn, args}` dispatched by the manifest's `provides` (read from the app's head), `args` checked against the declared shapes, `writes: false` enforced, the answer message to the sender; the `/call` route; the app's state under its head (since 0.2.0) |
+| `app` | `lib/app.zig` | calling an app (skein `docs/APPS.md` §4): `{fn, args}` dispatched by the manifest's `provides` (read from the app's head), `args` checked against the declared shapes, `writes: false` enforced, the answer message to the sender; the `/call` route; the app's state under its head `<app>/app` (since 0.2.0; the head name since 0.3.0) |
 | `cabi` | `wit/zig/cabi.zig` | `malloc`/`realloc`/`free`/`abort`/`strlen` for wit-bindgen's C bindings, without wasi-libc |
 | `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk`'s preview1 imports over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build (the C bindings in `wit/bindings/c` are compiled in) |
 | `wallet` | `wallet/src/lib.zig` | the wallet library: headers and our chain tracker, SPV, BEEF, BRC-29, the transaction builder, the wallet's records and index maps, the overlay's state (over bsvz) |
@@ -89,7 +89,7 @@ upstream with that fix, the dependency moves to the merged commit.
 `-Dwallet=false` leaves the wallet module (and bsvz) out entirely; skein's
 kernel builds that way.
 
-## Calling an app (`app`, 0.2.0)
+## Calling an app (`app`, 0.2.0; the head `<app>/app` since 0.3.0)
 
 An app's handler lists the functions it implements and hands every input
 to `app.serve`; the manifest's `provides` (the root record of the app's
@@ -116,7 +116,7 @@ sender `{fn, request, replyTo, result | error: {code, message}}`; the route
 `{path: "/call", fn: "call"}`, answered on the connection; an in-VM `call`)
 and the error codes are documented at the top of `lib/app.zig`. A
 function's writes go through its `Call` (`put`, `keep`, `advance`,
-`setState`, `emit`, `launch`, `subscribe`, `deadline`, `awaitRecord`); for a
+`setState`, `emit`, `launch`, `deadline`, `awaitRecord`); for a
 `writes: false` function each is refused with `read-only`.
 
 ## Tests
@@ -133,7 +133,10 @@ resolves: `node sdk/wallet/vectors/gen-ts/run.mjs`).
 
 ## Versions
 
-`build.zig.zon` carries the version (0.2.0: the `app` module). A change to a module's API or
+`build.zig.zon` carries the version (0.2.0: the `app` module; 0.3.0: no
+`subscribe` import — the dispatch table is the kernel's, shruggr/skein#77 —
+and an app's root head is `<app>/app`, under its own name, as every head an
+app writes is). A change to a module's API or
 to the ABI the `sk`/`skein_wit` calls describe is a new minor version until
 1.0; skein's kernel and the SDK move together (skein pins a tagged release
 by URL+hash, #75).

@@ -1,6 +1,6 @@
 //! The `skein` import namespace for the Zig programs (the front door, the
-//! messagebox, resolve, and the handlers: run, objects, head, subscribe, the
-//! loop): preview1 imports with f(…, out, cap) → n and `take` for a result
+//! messagebox, resolve, the workbench's run and loop, and every app's
+//! handler): preview1 imports with f(…, out, cap) → n and `take` for a result
 //! that did not fit (kernel-zig/src/program.zig), wrapped so a program says
 //! `sk.get(a, cid)` and gets the bytes or an error whose message
 //! `lastError()` holds. Below the imports, what a handler builds on them:
@@ -27,7 +27,6 @@ pub const raw = struct {
     pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
     pub extern "skein" fn head(name: [*]const u8, name_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
-    pub extern "skein" fn subscribe(op: [*]const u8, op_len: u32, sender: [*]const u8, sender_len: u32, box: [*]const u8, box_len: u32, handler: [*]const u8, handler_len: u32) i32;
     pub extern "skein" fn wallet(frame: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn emit(msg: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn deadline(until_ms: i64) i32;
@@ -132,14 +131,9 @@ pub fn launch(a: Allocator, prog: []const u8, args: []const u8) ![]u8 {
     return result(a, raw.launch, .{ prog.ptr, n32(prog.len), args.ptr, n32(args.len) });
 }
 
-/// Change the instance's subscriptions when this step ends without error
-/// (docs/VM.md, "Subscriptions"): op "add" appends the rule (sender, box) →
-/// handler, "remove" deletes it. No sender is any sender (else the identity
-/// key's 33 bytes); the handler is a program record in the store.
-pub fn subscribe(op: []const u8, sender: ?[]const u8, box: []const u8, handler: []const u8) !void {
-    const s = sender orelse "";
-    if (raw.subscribe(op.ptr, n32(op.len), s.ptr, n32(s.len), box.ptr, n32(box.len), handler.ptr, n32(handler.len)) < 0) return failed();
-}
+// There is no `subscribe` (skein-sdk 0.3.0, shruggr/skein#77): the dispatch
+// table is the kernel's, changed by admin messages (box `dispatch`) from the
+// owner or a delegate, never by a program import.
 
 /// A BRC-100 wire frame to the oracle → its result frame.
 pub fn wallet(a: Allocator, frame: []const u8) ![]u8 {

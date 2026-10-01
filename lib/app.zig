@@ -8,8 +8,9 @@
 //!               functions: {add: {writes: true, args: {by: "int", "note?": "string"}, answer: {count: "int"}}, …}}]
 //!
 //! At install the manifest becomes the root record of the app's head
-//! (`{kind: "app", name, …, provides, …, tree, state?}`); `serve` reads it
-//! from there. A function's full name is `<interface name>.<function>`, the
+//! `<app>/app` (`{kind: "app", name, …, provides, …, tree, state?}`;
+//! skein-sdk 0.3.0, shruggr/skein#77: an app writes only heads under its
+//! own name, `<app>/…`); `serve` reads it from there (`headOf`). A function's full name is `<interface name>.<function>`, the
 //! interface's `/<major>` dropped: `demo.counter.add`. The program lists
 //! what it implements:
 //!
@@ -33,8 +34,8 @@
 //!                                 {fn, args} (JSON, or dag-cbor as application/cbor); the answer,
 //!                                 on the connection: 200 {fn, result} | an error status {fn, error}.
 //!                                 The caller must be admitted to the app's box as a message
-//!                                 would be (a subscription on (caller, <app>) or on (anyone,
-//!                                 <app>)); an open route (auth "none") has no caller, so only
+//!                                 would be (a dispatch row for (caller, <app>) or (anyone,
+//!                                 <app>)); an open route (sender "*") has no caller, so only
 //!                                 a box open to anyone admits it.
 //!   an in-VM call                 call(<handler program>, "<interface>.<function>", args) → result
 //!                                 (dag-cbor), or the call's error.
@@ -49,7 +50,7 @@
 //!
 //! **`writes`.** A function's writes go through its `Call`: `put`,
 //! `putBlock`, `keep`, `advance`, `setState`, `emit`/`send`, `launch`,
-//! `subscribe`, `deadline`, `awaitRecord`. For a function the manifest marks
+//! `deadline`, `awaitRecord`. For a function the manifest marks
 //! `writes: false` each of them is refused (error code `read-only`): it
 //! answers from the app's head as it stands. (A function that calls the raw
 //! `sk` imports itself goes around this; the log shows what it did.) A
@@ -61,7 +62,7 @@
 //! caller), `read-only`, `failed` (the function's own error). Over HTTP:
 //! 400, 404, 400, 403, 409, 500.
 //!
-//! **State.** The app's head is its handler's (§1): the root record is the
+//! **State.** The app's head `<app>/app` is its handler's (§1): the root record is the
 //! manifest the owner installed, and the app keeps its own state as the
 //! root's `state` link — `Call.state()` reads it, `Call.setState(v)` puts
 //! `v` and advances the head to the root with `state` replaced. An install
@@ -111,7 +112,7 @@ pub const Call = struct {
     a: Allocator,
     /// The program's input (a step's, or a call's).
     in: Value,
-    /// The app's name: its head and its box.
+    /// The app's name: its box, and the prefix of its heads (`<app>/app` the root).
     app: []const u8,
     /// The head's root record: the installed manifest.
     manifest: Value,
@@ -182,10 +183,6 @@ pub const Call = struct {
         try c.guard("launch");
         return sk.launch(c.a, prog, args);
     }
-    pub fn subscribe(c: *Call, op: []const u8, sender: ?[]const u8, box: []const u8, handler: []const u8) !void {
-        try c.guard("subscribe");
-        return sk.subscribe(op, sender, box, handler);
-    }
     pub fn deadline(c: *Call, until_ms: i64) !void {
         try c.guard("deadline");
         return sk.deadline(until_ms);
@@ -217,11 +214,17 @@ pub fn serve(a: Allocator, in: Value, app: []const u8, fns: []const Function, ot
     try onMessage(a, in, app, fns, body);
 }
 
-/// The installed manifest: the app's head's root record.
+/// The app's root head, `<app>/app` (shruggr/skein#77: an app's heads are `<app>/…`).
+pub fn headOf(a: Allocator, app: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}/app", .{app});
+}
+
+/// The installed manifest: the root record of the head `<app>/app`.
 pub fn manifestOf(a: Allocator, app: []const u8) !Value {
-    const root = (try sk.head(a, app)) orelse return sk.report(try std.fmt.allocPrint(a, "no head {s}: the app is not installed (its manifest is the head's root record)", .{app}));
+    const name = try headOf(a, app);
+    const root = (try sk.head(a, name)) orelse return sk.report(try std.fmt.allocPrint(a, "no head {s}: the app is not installed (its manifest is the head's root record)", .{name}));
     const m = try sk.get(a, root);
-    if (!eql(u8, Value.str(m.get("kind")) orelse "", "app")) return sk.report(try std.fmt.allocPrint(a, "head {s}: its root is not an app record", .{app}));
+    if (!eql(u8, Value.str(m.get("kind")) orelse "", "app")) return sk.report(try std.fmt.allocPrint(a, "head {s}: its root is not an app record", .{name}));
     return m;
 }
 
@@ -236,7 +239,7 @@ pub fn stateOf(a: Allocator, manifest: Value) !?Value {
 pub fn putState(a: Allocator, app: []const u8, manifest: Value, v: Value) !struct { state: []u8, root: Value } {
     const s = try sk.put(a, v);
     const root = try withField(a, manifest, "state", cbor.cidv(s));
-    try sk.advance(app, try sk.put(a, root));
+    try sk.advance(try headOf(a, app), try sk.put(a, root));
     return .{ .state = s, .root = root };
 }
 

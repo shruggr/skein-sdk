@@ -32,9 +32,6 @@ extern void __wasm_import_skein_kernel_skein_head(uint8_t *, size_t, uint8_t *);
 __attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("advance")))
 extern void __wasm_import_skein_kernel_skein_advance(uint8_t *, size_t, uint8_t *, size_t, uint8_t *);
 
-__attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("subscribe")))
-extern void __wasm_import_skein_kernel_skein_subscribe(uint8_t *, size_t, int32_t, uint8_t *, size_t, uint8_t *, size_t, uint8_t *, size_t, uint8_t *);
-
 __attribute__((__import_module__("skein:kernel/skein@0.1.0"), __import_name__("wallet")))
 extern void __wasm_import_skein_kernel_skein_wallet(uint8_t *, size_t, uint8_t *);
 
@@ -362,48 +359,6 @@ bool skein_kernel_skein_advance(program_string_t *name, skein_kernel_skein_cid_t
   uint8_t ret_area[(3*sizeof(void*))];
   uint8_t *ptr = (uint8_t *) &ret_area;
   __wasm_import_skein_kernel_skein_advance((uint8_t *) (*name).ptr, (*name).len, (uint8_t *) (*tree).ptr, (*tree).len, ptr);
-  skein_kernel_skein_result_void_string_t result;
-  switch ((int32_t) *((uint8_t*) (ptr + 0))) {
-    case 0: {
-      result.is_err = false;
-      break;
-    }
-    case 1: {
-      result.is_err = true;
-      result.val.err = (program_string_t) { (uint8_t*)(*((uint8_t **) (ptr + sizeof(void*)))), (*((size_t*) (ptr + (2*sizeof(void*))))) };
-      break;
-    }
-  }
-  if (!result.is_err) {
-    return 1;
-  } else {
-    *err = result.val.err;
-    return 0;
-  }
-}
-
-bool skein_kernel_skein_subscribe(program_string_t *op, program_string_t *maybe_sender, program_string_t *box, skein_kernel_skein_cid_t *handler, program_string_t *err) {
-  __attribute__((__aligned__(sizeof(void*))))
-  uint8_t ret_area[(3*sizeof(void*))];
-  program_option_string_t sender;
-  sender.is_some = maybe_sender != NULL;if (maybe_sender) {
-    sender.val = *maybe_sender;
-  }
-  int32_t option;
-  uint8_t * option1;
-  size_t option2;
-  if ((sender).is_some) {
-    const program_string_t *payload0 = &(sender).val;
-    option = 1;
-    option1 = (uint8_t *) (*payload0).ptr;
-    option2 = (*payload0).len;
-  } else {
-    option = 0;
-    option1 = 0;
-    option2 = 0;
-  }
-  uint8_t *ptr = (uint8_t *) &ret_area;
-  __wasm_import_skein_kernel_skein_subscribe((uint8_t *) (*op).ptr, (*op).len, option, option1, option2, (uint8_t *) (*box).ptr, (*box).len, (uint8_t *) (*handler).ptr, (*handler).len, ptr);
   skein_kernel_skein_result_void_string_t result;
   switch ((int32_t) *((uint8_t*) (ptr + 0))) {
     case 0: {

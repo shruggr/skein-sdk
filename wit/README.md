@@ -22,7 +22,6 @@ The interface has the same calls, with the same behaviour, as the preview1
 | a CID as pointer and length | `cid` (`list<u8>`, binary) |
 | a name as pointer and length (decoded as UTF-8 with replacement) | `string` (the canonical ABI requires valid UTF-8) |
 | `head` → n = 0 when there is no head | `result<option<cid>, string>` |
-| `subscribe(…, sender, sender_len = 0, …)` for any sender | `sender: option<string>` |
 
 Two differences from preview1 were accepted on #34 (David, 2026-09-28):
 
@@ -35,7 +34,7 @@ the adapter and the canonical-ABI glue are instructions too. Every other
 field of an update is the same.
 
 The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `await`,
-`head`, `advance`, `subscribe`, `wallet`, `emit`, `deadline`, `call` and
+`head`, `advance`, `wallet`, `emit`, `deadline`, `call` and
 `edges` (#42: the edges into a record, from the kernel's index; docs/VM.md "Edges").
 There is no `http` and no `libp2p` (#70, #67: format 6 removed them); a
 handle is looked up by launching the `resolve` program.

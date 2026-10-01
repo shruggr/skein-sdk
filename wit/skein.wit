@@ -53,13 +53,12 @@ interface skein {
   /// n = 0). docs/VM.md "Heads".
   head: func(name: string) -> result<option<cid>, string>;
 
-  /// Move a named head to a tree in the store, when the step ends without error.
+  /// Move a named head to a tree in the store, when the step ends without
+  /// error. The name must be in the program's write scope (shruggr/skein#77:
+  /// an app's heads are `<app>/…`; a genesis-wired program's are what its
+  /// genesis `scopes` name). There is no `subscribe`: the dispatch table is
+  /// the kernel's (docs/MESSAGES.md).
   advance: func(name: string, tree: cid) -> result<_, string>;
-
-  /// Change the subscriptions (docs/VM.md "Subscriptions"): `op` "add" or
-  /// "remove" the rule (sender, box) → handler (a program record in the
-  /// store; no sender: any sender), when the step ends without error.
-  subscribe: func(op: string, sender: option<string>, box: string, handler: cid) -> result<_, string>;
 
   /// A BRC-100 wallet wire request frame → its result frame: the oracle,
   /// answered synchronously and recorded (an `oracle` record on the update).

@@ -91,12 +91,12 @@ extern bool skein_kernel_skein_await(skein_kernel_skein_cid_t *cid, program_stri
 // The tree CID a named head points at; none if it has none (preview1:
 // n = 0). docs/VM.md "Heads".
 extern bool skein_kernel_skein_head(program_string_t *name, skein_kernel_skein_option_cid_t *ret, program_string_t *err);
-// Move a named head to a tree in the store, when the step ends without error.
+// Move a named head to a tree in the store, when the step ends without
+// error. The name must be in the program's write scope (shruggr/skein#77:
+// an app's heads are `<app>/…`; a genesis-wired program's are what its
+// genesis `scopes` name). There is no `subscribe`: the dispatch table is
+// the kernel's (docs/MESSAGES.md).
 extern bool skein_kernel_skein_advance(program_string_t *name, skein_kernel_skein_cid_t *tree, program_string_t *err);
-// Change the subscriptions (docs/VM.md "Subscriptions"): `op` "add" or
-// "remove" the rule (sender, box) → handler (a program record in the
-// store; no sender: any sender), when the step ends without error.
-extern bool skein_kernel_skein_subscribe(program_string_t *op, program_string_t *maybe_sender, program_string_t *box, skein_kernel_skein_cid_t *handler, program_string_t *err);
 // A BRC-100 wallet wire request frame → its result frame: the oracle,
 // answered synchronously and recorded (an `oracle` record on the update).
 extern bool skein_kernel_skein_wallet(program_list_u8_t *frame, program_list_u8_t *ret, program_string_t *err);
