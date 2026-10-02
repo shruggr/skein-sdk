@@ -1,62 +1,64 @@
 # skein-sdk
 
-What a program for a [skein](https://github.com/shruggr/skein) VM is written
-against, as a Zig package (Zig 0.16.0). Split out of skein by
-shruggr/skein#71, with the history of the moved paths: skein's
-`programs/lib` (→ `lib/`), `wallet-zig` (→ `wallet/`), `wit` (→ `wit/`) and
-the kernel's codecs `kernel-zig/src/{cid,cbor,mst,secp}.zig` (→ `src/`).
-skein's kernel and its own programs build against this package too: there
-is one copy of each file, here.
+The Zig package a program for a [skein](https://github.com/shruggr/skein)
+is written against: the `skein` imports, the codecs, the app-calling helper,
+the chain library and the wallet library. skein's kernel and its own
+programs build against it too, so each file has one copy, here. Version
+**0.4.0**, Zig 0.16.0.
 
-## Modules
+## What it is
 
 | module | file | what |
 |---|---|---|
-| `cid` | `src/cid.zig` | CIDs: parse, format; the codecs skein uses (raw, dag-cbor, git-raw, the bitcoin codecs) |
-| `cbor` | `src/cbor.zig` | dag-cbor values, canonical encode/decode, the CID of a value (`cbor.cidm` is `cid`) |
-| `mst` | `src/mst.zig` | Merkle search trees over dag-cbor blocks: the ordered maps of the kernel's index and the wallet's |
+| `sk` | `lib/sk.zig` | the preview1 `skein` imports (`input`, `get`, `put`, `putblock`, `keep`, `head`, `advance`, `edges`, `launch`, `await`, `deadline`, `call`, `emit`, `wallet`) and helpers over them: kept records, messages, the address book, trees |
+| `app` | `lib/app.zig` | calling an app: `{fn, args}` dispatched by the manifest's `provides` (read from `<app>/app`), args checked against the declared shapes, `writes: false` enforced, the answer message to the sender, the `/call` route, the app's state |
+| `cbor` | `src/cbor.zig` | dag-cbor values, canonical encode/decode, the CID of a value |
+| `cid` | `src/cid.zig` | CIDs: parse, format; the codecs skein uses (raw, dag-cbor, git-raw, bitcoin-block, bitcoin-tx) |
+| `mst` | `src/mst.zig` | Merkle search trees over dag-cbor blocks: the kernel's index maps and every app's maps |
 | `secp` | `src/secp.zig` | BRC-42 "anyone" child keys and ECDSA verification, pure Zig |
-| `sk` | `lib/sk.zig` | the preview1 `skein` imports (`get`, `put`, `emit`, `head`, `advance`, `call`, …; no `subscribe` since 0.3.0) and the helpers over them: kept records, messages, the address book, trees |
-| `brc104` | `lib/brc104.zig` | BRC-103/104 framing for programs |
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
-| `message` | `lib/message.zig` | BRC-169 messages: build, sign through the oracle, verify with the sender's key alone |
-| `app` | `lib/app.zig` | calling an app (skein `docs/APPS.md` §4): `{fn, args}` dispatched by the manifest's `provides` (read from the app's head), `args` checked against the declared shapes, `writes: false` enforced, the answer message to the sender; the `/call` route; the app's state under its head `<app>/app` (since 0.2.0; the head name since 0.3.0) |
+| `message` | `lib/message.zig` | BRC-169 messages: build, sign through the signer, verify with the sender's key alone |
+| `brc104` | `lib/brc104.zig` | BRC-103/104 framing for programs |
+| `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF, SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads |
+| `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (re-exported under the same names): BRC-29, the transaction builder, the BRC-100 wire frames |
+| `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk` over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build |
 | `cabi` | `wit/zig/cabi.zig` | `malloc`/`realloc`/`free`/`abort`/`strlen` for wit-bindgen's C bindings, without wasi-libc |
-| `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk`'s preview1 imports over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build (the C bindings in `wit/bindings/c` are compiled in) |
-| `chain` | `chain/src/lib.zig` | the chain library (0.4.0, shruggr/skein#78): headers and our chain tracker, merkle paths as IPLD nodes, BEEF, SPV, the record store and its index maps, and `state` — the chain app's records (`chain-state`: transactions, proofs, spends, settlement, registered broadcasts), what shruggr/skein-chain writes and every reader of the chain head reads (over bsvz) |
-| `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (its modules re-exported under the same names, `chainstate` the chain state): BRC-29, the transaction builder, the wallet's records and index maps, the overlay's state (over bsvz) |
 
 `wit/` is the WIT package `skein:kernel@0.1.0` and the WASI 0.2.12 packages
-it depends on (`wit/README.md`). The program ABI itself (what the kernel
-answers) is specified in skein's `docs/VM.md`.
+it depends on (`wit/README.md`). The ABI itself (what the kernel answers) is
+specified in skein's `docs/VM.md`.
 
-## Depending on it
+**The wallet module's combined `Wallet` record and `wallet/src/overlay.zig`**
+(chain, wallet and overlay maps in one state record) are not used by skein's
+programs since shruggr/skein#79: the chain state is the chain app's, the
+wallet's records are `programs/wallet`'s in skein, and an overlay's are
+shruggr/skein-overlay's. skein's wallet program still uses this module's
+builder, BRC-29 and wire code.
 
-An app (docs/APPS.md in skein: a tree with `bin/`, `etc/app.json`, …)
-names the SDK in its `build.zig.zon`:
+## Use it
+
+Depend on it by tag:
 
 ```
-zig fetch --save=skein_sdk "git+https://github.com/shruggr/skein-sdk#<commit>"
+zig fetch --save=skein_sdk https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.4.0.tar.gz
 ```
 
-which writes
+which writes into `build.zig.zon`:
 
 ```zig
-.dependencies = .{
-    .skein_sdk = .{
-        .url = "git+https://github.com/shruggr/skein-sdk#<commit>",
-        .hash = "skein_sdk-0.1.0-…",
-    },
+.skein_sdk = .{
+    .url = "https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.4.0.tar.gz",
+    .hash = "skein_sdk-0.4.0-YroFBDfGGADreMJWF41zqUyuS71zsF4uG8GNoPswWhek",
 },
 ```
 
-and takes the modules it needs in `build.zig`:
+Take the modules you need in `build.zig`:
 
 ```zig
 const wasi = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
-const sdk = b.dependency("skein_sdk", .{ .target = wasi, .optimize = .ReleaseSafe });
+const sdk = b.dependency("skein_sdk", .{ .target = wasi, .optimize = .ReleaseSafe, .wallet = false });
 const exe = b.addExecutable(.{
-    .name = "my-handler",
+    .name = "counter",
     .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = wasi,
@@ -65,82 +67,151 @@ const exe = b.addExecutable(.{
         .imports = &.{
             .{ .name = "cbor", .module = sdk.module("cbor") },
             .{ .name = "sk", .module = sdk.module("sk") },
+            .{ .name = "app", .module = sdk.module("app") },
         },
     }),
 });
+b.installArtifact(exe);
 ```
 
-`shruggr/skein-static` and `shruggr/skein-workbench` are built this way.
-A program built in a checkout of skein depends on the same package the same
-way (#75: `skein_sdk` by URL+hash, not a submodule). skein's
-`scripts/sdk-local.sh` overrides the dependency with a sibling `../skein-sdk`
-checkout for developing both at once, with no edit to committed files.
+`.wallet = false` leaves out `chain` and `wallet` and never fetches bsvz;
+drop it to use them.
+
+A minimal app handler, named `counter`, providing `demo.counter/1` with
+`get` and `add` (its manifest declares the interface; skein's
+`docs/APPS.md` §2 has the manifest, and skein's `programs/test/app-demo` is a
+complete app with a tick and a route):
+
+```zig
+const std = @import("std");
+const cbor = @import("cbor");
+const sk = @import("sk");
+const app = @import("app");
+const Value = cbor.Value;
+
+const fns = [_]app.Function{
+    .{ .name = "demo.counter.get", .run = get },
+    .{ .name = "demo.counter.add", .run = add },
+};
+
+pub fn main() u8 {
+    return sk.main("counter", run);
+}
+
+fn run(a: std.mem.Allocator) !void {
+    return app.serve(a, try sk.input(a), "counter", &fns, null);
+}
+
+fn count(c: *app.Call) !i128 {
+    const s = (try c.state()) orelse return 0;
+    return Value.intOf(s.get("count")) orelse 0;
+}
+
+fn answer(a: std.mem.Allocator, n: i128) !Value {
+    var m = cbor.MapBuilder.init(a);
+    try m.put("count", cbor.int(n));
+    return m.value();
+}
+
+fn get(c: *app.Call) !Value {
+    return answer(c.a, try count(c));
+}
+
+fn add(c: *app.Call) !Value {
+    const n = try count(c) + Value.intOf(c.args.get("by")).?; // args already checked against {by: "int"}
+    _ = try c.setState(try answer(c.a, n)); // refused if the manifest says writes: false
+    return answer(c.a, n);
+}
+```
+
+Its tree is `bin/counter.wasm` (the built module) and `etc/app.json`:
+
+```json
+{
+  "kind": "app",
+  "name": "counter",
+  "version": "0.1.0",
+  "programs": { "counter": "bin/counter.wasm" },
+  "provides": [{ "interface": "demo.counter/1", "functions": {
+    "get": { "writes": false, "args": {}, "answer": { "count": "int" } },
+    "add": { "writes": true, "args": { "by": "int" }, "answer": { "count": "int" } } } }],
+  "requires": [],
+  "dispatch": [{ "address": "counter", "sender": "$owner", "program": "counter" }]
+}
+```
+
+`skein-host install <dir> --instance <handle>` installs it; the owner then
+sends `{fn: "demo.counter.add", args: {by: 2}}` to box `counter`.
+
+Three callers reach a function with one definition: a message `{fn, args}`
+in the app's box (answered to the sender `{fn, request, replyTo, result |
+error: {code, message}}`), the route `{transport: "http", address: "/call",
+fn: "call"}` (answered on the connection), and an in-VM `call`. The error
+codes and the HTTP statuses are at the top of `lib/app.zig`. The app's state
+is the `state` link of its app record, the root of `<app>/app`: an app writes
+only heads under its own name.
 
 ### bsvz
 
-The wallet module is over [bsvz](https://github.com/opldotdev/bsvz) (the BSV
-primitives). It is a **lazy** URL dependency: `zig build` fetches it the
-first time something asks for the `wallet` module, and never otherwise. The
-pin is branch `skein-sdk` of `shruggr/bsvz` (commit `309085f`): the Chronicle
-branch skein was pinned at (`8e1c956`, open as opldotdev/bsvz#2) plus the one
-hunk wasm32 needs (`wallet/patches/bsvz.patch`: `Preimage.parse` casts the
-script length to `usize` before slicing). When the Chronicle PR is merged
-upstream with that fix, the dependency moves to the merged commit.
+`chain` and `wallet` are over [bsvz](https://github.com/opldotdev/bsvz) (the
+BSV primitives), a **lazy** URL dependency fetched only when one of them is
+asked for:
 
-`-Dwallet=false` leaves the chain and wallet modules (and bsvz) out entirely; skein's
-kernel builds that way.
+| pin | commit | why |
+|---|---|---|
+| `shruggr/bsvz` branch `skein-sdk` | `309085f` | the Chronicle branch (`8e1c956`, open as opldotdev/bsvz#2) plus the one hunk wasm32 needs (`wallet/patches/bsvz.patch`) |
 
-## Calling an app (`app`, 0.2.0; the head `<app>/app` since 0.3.0)
+When the Chronicle PR is merged upstream with that fix, the pin moves to the
+merged commit.
 
-An app's handler lists the functions it implements and hands every input
-to `app.serve`; the manifest's `provides` (the root record of the app's
-head, written by skein's install) says which exist, their argument shapes
-and whether they write:
-
-```zig
-const app = @import("app");
-const fns = [_]app.Function{
-    .{ .name = "demo.counter.get", .run = get },   // demo.counter/1's `get`
-    .{ .name = "demo.counter.add", .run = add },
-};
-fn add(c: *app.Call) !Value {
-    const by = Value.intOf(c.args.get("by")).?;      // checked against {by: "int"} already
-    _ = try c.setState(newState);                    // refused if the manifest says writes: false
-    return result;
-}
-pub fn main() u8 { return sk.main("demo", run); }
-fn run(a: Allocator) !void { return app.serve(a, try sk.input(a), "demo", &fns, other); }
-```
-
-The three callers (a message `{fn, args}` in the app's box, answered to the
-sender `{fn, request, replyTo, result | error: {code, message}}`; the route
-`{path: "/call", fn: "call"}`, answered on the connection; an in-VM `call`)
-and the error codes are documented at the top of `lib/app.zig`. A
-function's writes go through its `Call` (`put`, `keep`, `advance`,
-`setState`, `emit`, `launch`, `deadline`, `awaitRecord`); for a
-`writes: false` function each is refused with `read-only`.
-
-## Tests
+## Build and test
 
 ```
-zig build test         # cid, cbor, mst, secp, dagjson, app; the chain state (chain/test.zig); the wallet's library tests and vector corpus
+zig build test         # cid, cbor, mst, secp, dagjson, app; chain/test.zig; the wallet's tests and vector corpus (44 tests)
 zig build test-wasm    # the wallet's tests built for wasm32-wasi, under Node's WASI (needs node)
 ```
 
-The wallet's vectors (`wallet/vectors/*.json`) are made by go-sdk
+The vector corpus (`wallet/vectors/*.json`) is made by go-sdk
 (`wallet/vectors/gen-go`) and cross-checked against the TS wallet-toolbox
-(`wallet/vectors/gen-ts`, run from a skein checkout, where `@bsv/sdk`
-resolves: `node sdk/wallet/vectors/gen-ts/run.mjs`).
+(`wallet/vectors/gen-ts`). A run prints its counts; at 0.4.0: tx 39 (fees
+429), beef 27, merkle 43, headers 46, brc29 24, wire 13, signing 10,
+chronicle 3, wallet scenarios 6. The TS cross-check runs from a skein
+checkout beside this one, where `@bsv/sdk` resolves:
+`node ../skein-sdk/wallet/vectors/gen-ts/run.mjs`.
+
+Developing skein and the SDK together: clone this repo next to skein and
+prefix a skein build with its `scripts/sdk-local.sh`, which overrides the
+fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
+`build.zig.zon`. Any other dependent can do the same with
+`zig build --fork=<this checkout>`.
+
+## Docs
+
+| what | where |
+|---|---|
+| the ABI (imports, records, threads, emit) | skein `docs/VM.md` |
+| apps: tree, manifest, install, calling | skein `docs/APPS.md` |
+| the wire, the dispatch table, providers | skein `docs/MESSAGES.md` |
+| the wallet and SPV | skein `docs/WALLET.md` |
+| the chain app's contract | shruggr/skein-chain `docs/CHAIN.md` |
+| the WIT package | `wit/README.md` |
 
 ## Versions
 
-`build.zig.zon` carries the version (0.2.0: the `app` module; 0.3.0: no
-`subscribe` import — the dispatch table is the kernel's, shruggr/skein#77 —
-and an app's root head is `<app>/app`, under its own name, as every head an
-app writes is; 0.4.0: the `chain` module split out of `wallet`, with the chain
-app's state, shruggr/skein#78). A change to a module's API or
-to the ABI the `sk`/`skein_wit` calls describe is a new minor version until
-1.0; skein's kernel and the SDK move together (skein pins a tagged release
-by URL+hash, #75).
+| version | change |
+|---|---|
+| 0.4.0 | the `chain` module split out of `wallet`, with the chain app's state (shruggr/skein#78) |
+| 0.3.0 | no `subscribe` import (the dispatch table is the kernel's); an app's record is `<app>/app` (shruggr/skein#77) |
+| 0.2.0 | the `app` module |
 
-MIT, as skein.
+skein's kernel and every program in skein pin the SDK by tag (URL and hash
+in each `build.zig.zon`). The kernel takes its codecs (`cid`, `cbor`, `mst`,
+`secp`) from here, so a codec change is a log format change for skein: a new
+tag, a new pin, and new stores. A dependency pinned by hash is a fixed
+program: a changed codec is a different program. A change to a module's API
+or to the ABI is a new minor version until 1.0.
+
+## Contributing
+
+Work is tracked in shruggr/skein; start at issue
+[#31](https://github.com/shruggr/skein/issues/31). MIT, as skein.
