@@ -36,11 +36,11 @@
 //! step that keeps them gives the kernel the same edges (docs/VM.md "Edges").
 const std = @import("std");
 const bsvz = @import("bsvz");
-const cbor = @import("cbor.zig");
-const hdr = @import("header.zig");
-const beef_mod = @import("beef.zig");
-const merkle = @import("merkle.zig");
-const store_mod = @import("store.zig");
+const cbor = @import("chain").cbor;
+const hdr = @import("chain").header;
+const beef_mod = @import("chain").beef;
+const merkle = @import("chain").merkle;
+const store_mod = @import("chain").store;
 const wallet_mod = @import("wallet.zig");
 
 const Wallet = wallet_mod.Wallet;

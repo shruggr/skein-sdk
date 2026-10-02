@@ -1,6 +1,6 @@
 .{
     .name = .skein_sdk,
-    .version = "0.3.0",
+    .version = "0.4.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x6cf97c210405ba62,
     .dependencies = .{
@@ -19,6 +19,7 @@
         "README.md",
         "src",
         "lib",
+        "chain",
         "wallet",
         "wit",
     },

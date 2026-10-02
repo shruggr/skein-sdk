@@ -28,16 +28,16 @@
 //! are rejected in turn, the inputs they consumed are spendable again).
 const std = @import("std");
 const bsvz = @import("bsvz");
-const cbor = @import("cbor.zig");
-const hdr = @import("header.zig");
-const beef_mod = @import("beef.zig");
-const spv = @import("spv.zig");
+const cbor = @import("chain").cbor;
+const hdr = @import("chain").header;
+const beef_mod = @import("chain").beef;
+const spv = @import("chain").spv;
 const brc29 = @import("brc29.zig");
-const chain_mod = @import("chain.zig");
-const store_mod = @import("store.zig");
+const chain_mod = @import("chain").chain;
+const store_mod = @import("chain").store;
 const builder = @import("builder.zig");
 const overlay = @import("overlay.zig");
-const merkle = @import("merkle.zig");
+const merkle = @import("chain").merkle;
 
 const Store = store_mod.Store;
 const Map = store_mod.Map;

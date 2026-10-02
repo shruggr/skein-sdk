@@ -23,7 +23,8 @@ is one copy of each file, here.
 | `app` | `lib/app.zig` | calling an app (skein `docs/APPS.md` §4): `{fn, args}` dispatched by the manifest's `provides` (read from the app's head), `args` checked against the declared shapes, `writes: false` enforced, the answer message to the sender; the `/call` route; the app's state under its head `<app>/app` (since 0.2.0; the head name since 0.3.0) |
 | `cabi` | `wit/zig/cabi.zig` | `malloc`/`realloc`/`free`/`abort`/`strlen` for wit-bindgen's C bindings, without wasi-libc |
 | `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk`'s preview1 imports over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build (the C bindings in `wit/bindings/c` are compiled in) |
-| `wallet` | `wallet/src/lib.zig` | the wallet library: headers and our chain tracker, SPV, BEEF, BRC-29, the transaction builder, the wallet's records and index maps, the overlay's state (over bsvz) |
+| `chain` | `chain/src/lib.zig` | the chain library (0.4.0, shruggr/skein#78): headers and our chain tracker, merkle paths as IPLD nodes, BEEF, SPV, the record store and its index maps, and `state` — the chain app's records (`chain-state`: transactions, proofs, spends, settlement, registered broadcasts), what shruggr/skein-chain writes and every reader of the chain head reads (over bsvz) |
+| `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (its modules re-exported under the same names, `chainstate` the chain state): BRC-29, the transaction builder, the wallet's records and index maps, the overlay's state (over bsvz) |
 
 `wit/` is the WIT package `skein:kernel@0.1.0` and the WASI 0.2.12 packages
 it depends on (`wit/README.md`). The program ABI itself (what the kernel
@@ -86,7 +87,7 @@ hunk wasm32 needs (`wallet/patches/bsvz.patch`: `Preimage.parse` casts the
 script length to `usize` before slicing). When the Chronicle PR is merged
 upstream with that fix, the dependency moves to the merged commit.
 
-`-Dwallet=false` leaves the wallet module (and bsvz) out entirely; skein's
+`-Dwallet=false` leaves the chain and wallet modules (and bsvz) out entirely; skein's
 kernel builds that way.
 
 ## Calling an app (`app`, 0.2.0; the head `<app>/app` since 0.3.0)
@@ -122,7 +123,7 @@ function's writes go through its `Call` (`put`, `keep`, `advance`,
 ## Tests
 
 ```
-zig build test         # cid, cbor, mst, secp, dagjson, app; the wallet's library tests and vector corpus (26)
+zig build test         # cid, cbor, mst, secp, dagjson, app; the chain state (chain/test.zig); the wallet's library tests and vector corpus
 zig build test-wasm    # the wallet's tests built for wasm32-wasi, under Node's WASI (needs node)
 ```
 
@@ -136,7 +137,8 @@ resolves: `node sdk/wallet/vectors/gen-ts/run.mjs`).
 `build.zig.zon` carries the version (0.2.0: the `app` module; 0.3.0: no
 `subscribe` import — the dispatch table is the kernel's, shruggr/skein#77 —
 and an app's root head is `<app>/app`, under its own name, as every head an
-app writes is). A change to a module's API or
+app writes is; 0.4.0: the `chain` module split out of `wallet`, with the chain
+app's state, shruggr/skein#78). A change to a module's API or
 to the ABI the `sk`/`skein_wit` calls describe is a new minor version until
 1.0; skein's kernel and the SDK move together (skein pins a tagged release
 by URL+hash, #75).

@@ -17,8 +17,15 @@
 //   cabi       malloc/realloc/free/abort/strlen for wit-bindgen's C bindings   wit/zig/cabi.zig
 //   skein_wit  the `skein` calls over the WIT interface, for a component       wit/zig/skein_wit.zig
 //              build (the C bindings compiled in: wit/bindings/c)
-//   wallet     the wallet library: chain, SPV, BEEF, BRC-29, the wallet's      wallet/src/lib.zig
-//              records and index maps, the overlay's state (over bsvz)
+//   chain      the chain library: headers and the chain tracker, merkle       chain/src/lib.zig
+//              paths, BEEF, SPV, the record store and its index maps, and
+//              `state`, the chain app's records (shruggr/skein#78; over bsvz)
+//   wallet     the wallet library over `chain` (re-exported under the same    wallet/src/lib.zig
+//              names): BRC-29, the builder, the wallet's records and index
+//              maps, the overlay's state (over bsvz)
+//
+// `wallet` imports the same `chain` module this package exports, so a
+// program may import either or both.
 //
 // The WIT package itself is wit/ (`dep.path("wit/…")` for a component build).
 //
@@ -60,15 +67,20 @@ pub fn build(b: *std.Build) void {
     }
 
     if (!with_wallet) return;
-    const wallet = walletModule(b, "wallet/src/lib.zig", target, optimize, c.mst) orelse return;
+    const chain = chainModule(b, "chain/src/lib.zig", target, optimize, c.mst) orelse return;
+    b.modules.put(b.graph.arena, "chain", chain) catch @panic("OOM");
+    const wallet = walletModule(b, "wallet/src/lib.zig", target, optimize, c.mst, chain) orelse return;
     b.modules.put(b.graph.arena, "wallet", wallet) catch @panic("OOM");
 
-    const wtests = b.addTest(.{ .root_module = walletModule(b, "wallet/test.zig", target, optimize, c.mst).? });
+    const ctests = b.addTest(.{ .root_module = chainModule(b, "chain/test.zig", target, optimize, c.mst).? });
+    test_step.dependOn(&b.addRunArtifact(ctests).step);
+    const wtests = b.addTest(.{ .root_module = walletModule(b, "wallet/test.zig", target, optimize, c.mst, chain).? });
     test_step.dependOn(&b.addRunArtifact(wtests).step);
 
     // The same tests for wasm32-wasi, run with Node's WASI (wallet/scripts/run-wasi.mjs).
     const wasi = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
-    const wasm_tests = b.addTest(.{ .root_module = walletModule(b, "wallet/test.zig", wasi, optimize, codecs(b, wasi, optimize).mst).? });
+    const wmst = codecs(b, wasi, optimize).mst;
+    const wasm_tests = b.addTest(.{ .root_module = walletModule(b, "wallet/test.zig", wasi, optimize, wmst, chainModule(b, "chain/src/lib.zig", wasi, optimize, wmst).?).? });
     const run_wasm = b.addSystemCommand(&.{ "node", "--no-warnings" });
     run_wasm.addFileArg(b.path("wallet/scripts/run-wasi.mjs"));
     run_wasm.addArtifactArg(wasm_tests);
@@ -85,13 +97,24 @@ fn codecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     return .{ .cid = cid, .cbor = cbor, .mst = mst };
 }
 
-/// The wallet library (or its test root) over bsvz and the SDK's mst.
-fn walletModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, mst: *std.Build.Module) ?*std.Build.Module {
+/// The chain library (or its test root) over bsvz and the SDK's mst.
+fn chainModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, mst: *std.Build.Module) ?*std.Build.Module {
     const bsvz = b.lazyDependency("bsvz", .{ .target = target, .optimize = optimize }) orelse return null;
     return b.createModule(.{
         .root_source_file = b.path(root),
         .target = target,
         .optimize = optimize,
         .imports = &.{ .{ .name = "bsvz", .module = bsvz.module("bsvz") }, .{ .name = "mst", .module = mst } },
+    });
+}
+
+/// The wallet library (or its test root) over bsvz, the SDK's mst and the chain library.
+fn walletModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, mst: *std.Build.Module, chain: *std.Build.Module) ?*std.Build.Module {
+    const bsvz = b.lazyDependency("bsvz", .{ .target = target, .optimize = optimize }) orelse return null;
+    return b.createModule(.{
+        .root_source_file = b.path(root),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "bsvz", .module = bsvz.module("bsvz") }, .{ .name = "mst", .module = mst }, .{ .name = "chain", .module = chain } },
     });
 }
