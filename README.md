@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.7.0**, Zig 0.16.0.
+**0.7.1**, Zig 0.16.0.
 
 ## What it is
 
@@ -174,7 +174,7 @@ zig build test-wasm    # the wallet's tests built for wasm32-wasi, under Node's 
 
 The vector corpus (`wallet/vectors/*.json`) is made by go-sdk
 (`wallet/vectors/gen-go`) and cross-checked against the TS wallet-toolbox
-(`wallet/vectors/gen-ts`). A run prints its counts; at 0.6.0: tx 39 (fees
+(`wallet/vectors/gen-ts`). A run prints its counts; at 0.7.1: tx 39 (fees
 429), beef 27, merkle 43, headers 46, brc29 24, wire 13, signing 10,
 chronicle 3, wallet scenarios 6. The TS cross-check runs from a skein
 checkout beside this one, where `@bsv/sdk` resolves:
@@ -201,6 +201,8 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.7.1 | chain: a proven transaction's broadcast watchers survive a reorg; the proof in the new block tells them again (shruggr/skein-chain#2) |
+| 0.7.0 | intentions, `authfetch` (the kernel's BRC-104 client), no `provider(role)` (shruggr/skein#126) |
 | 0.6.1 | `message`: a claim (box `claim`) may name no recipient — signed before the instance it claims exists, forwarded into it by the host; the same signing (shruggr/skein#127) |
 | 0.6.0 | `files`: the file server for any http handler, moved out of shruggr/skein-static with its tests (shruggr/skein#125) |
 | 0.5.1 | `State.beefOf` serves a proven subject with its own BUMP and nothing above it |
