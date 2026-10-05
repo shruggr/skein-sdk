@@ -278,7 +278,7 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     try std.testing.expectEqual(lib.state.Status.unproven, try st3.status(ta.txid));
 }
 
-test "a reorg turns a proven transaction back to unproven: its broadcast registered again" {
+test "a reorg turns a proven transaction back to unproven, its broadcast registered again; proven in another block, the same watchers told" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -287,18 +287,46 @@ test "a reorg turns a proven transaction back to unproven: its broadcast registe
     var w = try world(a, ms.store(), 1);
     const child = try spend(a, &w.fund.tx, 0, 9_000);
     _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{child}));
+    try w.st.watch(child.txid, &caller, "chain", &request);
     _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), child.txid, 1_700_001_200)});
     try std.testing.expectEqual(State.Outcome.proven, try w.st.applyStatus(child.txid, "MINED", try soloPath(a, 2, child.txid)));
+    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items.len);
+    const first = w.st.changes.items[0];
+    try std.testing.expectEqual(.proven, first.state);
+    try std.testing.expectEqual(@as(usize, 1), first.watchers.len);
+    try std.testing.expectEqualSlices(u8, &caller, first.watchers[0].getBytes("to").?);
+    try std.testing.expect((try w.st.broadcastRecord(child.txid)) == null);
     const proven = try w.st.save();
+
+    // A heavier branch without it: unproven again, its broadcast registered again with the watcher.
     var st2 = try State.load(a, ms.store(), proven, .regtest);
     const alt1 = mine(hdr.hash(&w.h1), .{3} ** 32, 1_700_001_201);
     const alt2 = mine(hdr.hash(&alt1), .{4} ** 32, 1_700_001_202);
     try std.testing.expectEqual(@as(u32, 1), (try st2.addHeaders(&.{ &alt1, &alt2 })).replaced);
     try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(child.txid));
     try std.testing.expectEqual(@as(usize, 1), st2.reverted.items.len);
-    try std.testing.expect((try st2.broadcastRecord(child.txid)) != null);
+    const again = (try st2.broadcastRecord(child.txid)).?;
+    try std.testing.expectEqual(@as(usize, 1), again.getArray("watchers").?.len);
     try std.testing.expect(try st2.map("unproven").has(&child.txid));
-    _ = try st2.save();
+    const reverted = try st2.save();
+
+    // Mined again at 4, in another block: proven, the same watcher told of the new proof.
+    var st3 = try State.load(a, ms.store(), reverted, .regtest);
+    const alt3 = mine(hdr.hash(&alt2), child.txid, 1_700_001_203);
+    _ = try st3.addHeaders(&.{&alt3});
+    try std.testing.expectEqual(State.Outcome.proven, try st3.applyStatus(child.txid, "MINED", try soloPath(a, 4, child.txid)));
+    try std.testing.expectEqual(lib.state.Status.proven, try st3.status(child.txid));
+    try std.testing.expectEqual(@as(usize, 1), st3.changes.items.len);
+    const second = st3.changes.items[0];
+    try std.testing.expectEqual(.proven, second.state);
+    try std.testing.expectEqual(@as(usize, 1), second.watchers.len);
+    try std.testing.expectEqualSlices(u8, first.watchers[0].getBytes("to").?, second.watchers[0].getBytes("to").?);
+    try std.testing.expectEqualStrings(first.watchers[0].getText("box").?, second.watchers[0].getText("box").?);
+    try std.testing.expectEqualSlices(u8, first.watchers[0].getCid("request").?, second.watchers[0].getCid("request").?);
+    try std.testing.expectEqual(@as(u32, 4), (try st3.proofFor(child.txid)).?.block_height);
+    try std.testing.expect((try st3.broadcastRecord(child.txid)) == null);
+    try std.testing.expect(!(try st3.map("unproven").has(&child.txid)));
+    _ = try st3.save();
 }
 
 /// The pointer record the door would write for `bytes` (skein kernel-zig/src/beef.zig `record`),
