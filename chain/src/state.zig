@@ -513,18 +513,6 @@ pub const State = struct {
         return .accepted;
     }
 
-    /// Never mined in time: a registered broadcast at least `abandon_ms` old, still unproven, is
-    /// rejected ("abandoned"). → whether it was.
-    pub fn abandonIfDue(self: *State, txid: [32]u8, abandon_ms: i64) !bool {
-        if (abandon_ms <= 0) return false;
-        const r = (try self.broadcastRecord(txid)) orelse return false;
-        const since: i64 = @intCast(r.getUint("since") orelse return false);
-        if (self.now - since < abandon_ms) return false;
-        if ((try self.status(txid)) != .unproven) return false;
-        _ = try self.reject(txid, "abandoned");
-        return true;
-    }
-
     // ------------------------------------------------------------ ingest
 
     pub const SpvCtx = struct {

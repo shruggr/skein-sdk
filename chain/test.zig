@@ -172,7 +172,7 @@ test "ingest: unproven in is registered; accepted by the first status, proven by
     _ = try w.st.save();
 }
 
-test "a rejection walks the spends; a proven competing spend is a double spend; abandonment" {
+test "a rejection walks the spends; a proven competing spend is a double spend; never mined stays unproven" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -210,13 +210,10 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     const g3 = try st2.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ta}));
     try std.testing.expectEqual(lib.state.Status.rejected, g3.status);
 
-    // Never mined in time: abandoned.
+    // Never mined: no clock here, it stays unproven however long it waits.
     var st3 = try State.load(a, ms.store(), base, .regtest);
-    st3.now = 3_600_000 - 1;
-    try std.testing.expect(!(try st3.abandonIfDue(ta.txid, 3_600_000)));
-    st3.now = 3_600_000;
-    try std.testing.expect(try st3.abandonIfDue(ta.txid, 3_600_000));
-    try std.testing.expectEqualStrings("abandoned", (try st3.record((try st3.settlementCid(ta.txid)).?)).getText("reason").?);
+    st3.now = 365 * 24 * 3_600_000;
+    try std.testing.expectEqual(lib.state.Status.unproven, try st3.status(ta.txid));
 }
 
 test "a reorg turns a proven transaction back to unproven: its broadcast registered again" {
