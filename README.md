@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.5.1**, Zig 0.16.0.
+**0.6.0**, Zig 0.16.0.
 
 ## What it is
 
@@ -12,6 +12,7 @@ programs build against it too, so each file has one copy, here. Version
 |---|---|---|
 | `sk` | `lib/sk.zig` | the preview1 `skein` imports (`input`, `get`, `put`, `putblock`, `keep`, `head`, `advance`, `edges`, `launch`, `await`, `deadline`, `call`, `emit`, `wallet`) and helpers over them: kept records, messages, the address book, trees |
 | `app` | `lib/app.zig` | calling an app: `{fn, args}` dispatched by the manifest's `provides` (read from `<app>/app`), args checked against the declared shapes, `writes: false` enforced, the answer message to the sender, the `/call` route, the app's state |
+| `files` | `lib/files.zig` | files from a git tree for an http handler (shruggr/skein#125, moved out of skein-static): `serve(a, req, tree, rowOptions(req))` answers the request from the tree under the row's `root`, with its `index` for a directory, a 301 for a directory named without its `/`, the blob's CID as the ETag (304 on `If-None-Match`), the content type by extension, 404 (missing, `..`, NUL, a bad escape) and 405 (`Allow: GET, HEAD`) |
 | `cbor` | `src/cbor.zig` | dag-cbor values, canonical encode/decode, the CID of a value |
 | `cid` | `src/cid.zig` | CIDs: parse, format; the codecs skein uses (raw, dag-cbor, git-raw, bitcoin-block, bitcoin-tx) |
 | `mst` | `src/mst.zig` | Merkle search trees over dag-cbor blocks: the kernel's index maps and every app's maps |
@@ -167,13 +168,13 @@ merged commit.
 ## Build and test
 
 ```
-zig build test         # cid, cbor, mst, secp, dagjson, app; chain/test.zig; the wallet's tests and vector corpus (47 tests)
+zig build test         # cid, cbor, mst, secp, dagjson, files, app; chain/test.zig; the wallet's tests and vector corpus (55 tests)
 zig build test-wasm    # the wallet's tests built for wasm32-wasi, under Node's WASI (needs node)
 ```
 
 The vector corpus (`wallet/vectors/*.json`) is made by go-sdk
 (`wallet/vectors/gen-go`) and cross-checked against the TS wallet-toolbox
-(`wallet/vectors/gen-ts`). A run prints its counts; at 0.5.1: tx 39 (fees
+(`wallet/vectors/gen-ts`). A run prints its counts; at 0.6.0: tx 39 (fees
 429), beef 27, merkle 43, headers 46, brc29 24, wire 13, signing 10,
 chronicle 3, wallet scenarios 6. The TS cross-check runs from a skein
 checkout beside this one, where `@bsv/sdk` resolves:
@@ -200,6 +201,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.6.0 | `files`: the file server for any http handler, moved out of shruggr/skein-static with its tests (shruggr/skein#125) |
 | 0.5.1 | `State.beefOf` serves a proven subject with its own BUMP and nothing above it |
 | 0.5.0 | the BEEF pointer record and `chain.record` (`beefOf`, `parsed`, `subjectOf`, `provenBy`), Outpoint BEEF in `beef.parse`/`serialize`, raw blocks in `MemStore` (shruggr/skein#121); no `State.abandonIfDue` (shruggr/skein-chain#1) |
 | 0.4.0 | the `chain` module split out of `wallet`, with the chain app's state (shruggr/skein#78) |
