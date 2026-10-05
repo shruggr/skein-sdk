@@ -573,14 +573,13 @@ pub const State = struct {
 
     // ------------------------------------------------------------ BEEF out
 
-    /// The Atomic BEEF (BRC-95 over BRC-96) of a transaction we hold: its ancestry back to proven
+    /// The Atomic BEEF (BRC-95 over BRC-96) of a transaction we hold. Proven: the transaction with
+    /// its BUMP and nothing above it. Unproven: its parents, each the same way, back to proven
     /// transactions (their BUMPs, merged per block), parents first, then the transaction.
     pub fn beefOf(self: *State, txid: [32]u8) !?[]const u8 {
-        const raw = (try self.txRaw(txid)) orelse return null;
-        const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+        if ((try self.txRaw(txid)) == null) return null;
         var acc = BeefAcc{ .st = self };
-        for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
-        try acc.entries.append(self.arena, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
+        try acc.visit(txid);
         acc.flagLeaves();
         return try beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .atomic = txid, .bumps = acc.bumps.items, .entries = acc.entries.items });
     }

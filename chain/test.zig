@@ -172,6 +172,68 @@ test "ingest: unproven in is registered; accepted by the first status, proven by
     _ = try w.st.save();
 }
 
+test "beefOf: a proven transaction is served with its BUMP alone, its parents not needed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    // The funding's input comes from a transaction nobody holds.
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{}));
+    const bytes = (try w.st.beefOf(w.fund.txid)).?;
+    const out = try beef.parse(a, bytes);
+    try std.testing.expectEqualSlices(u8, &w.fund.txid, &out.subject().?);
+    try std.testing.expectEqual(@as(usize, 1), out.entries.len);
+    try std.testing.expectEqual(beef.Format.raw_with_bump, out.entries[0].format);
+    try std.testing.expectEqualSlices(u8, w.fund.raw, out.entries[0].raw.?);
+    try std.testing.expectEqual(@as(usize, 1), out.bumps.len);
+    try std.testing.expectEqual(@as(u32, 1), out.bumps[0].block_height);
+    // Against headers alone: a state holding only the chain takes it as proven.
+    var ms2 = lib.store.MemStore.init(std.testing.allocator);
+    defer ms2.deinit();
+    var st2 = try State.load(a, ms2.store(), null, .regtest);
+    _ = try st2.addHeaders(&.{&w.h1});
+    const got = try st2.ingest(bytes);
+    try std.testing.expectEqual(lib.state.Status.proven, got.status);
+    try std.testing.expectEqual(@as(usize, 0), got.registered.len);
+}
+
+test "beefOf: an unproven child goes out over its proven parent; once proven, alone with its BUMP" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    const child = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{child}));
+    const unproven = try beef.parse(a, (try w.st.beefOf(child.txid)).?);
+    try std.testing.expectEqual(@as(usize, 2), unproven.entries.len);
+    try std.testing.expectEqualSlices(u8, &w.fund.txid, &unproven.entries[0].txid);
+    try std.testing.expectEqual(beef.Format.raw_with_bump, unproven.entries[0].format);
+    try std.testing.expectEqualSlices(u8, &child.txid, &unproven.entries[1].txid);
+    try std.testing.expectEqual(beef.Format.raw, unproven.entries[1].format);
+    try std.testing.expectEqual(@as(usize, 1), unproven.bumps.len);
+
+    // Mined at 2: the child alone, with its own BUMP; the parent no longer in it.
+    _ = try w.st.applyStatus(child.txid, "MINED", try soloPath(a, 2, child.txid));
+    const h2 = mine(hdr.hash(&w.h1), child.txid, 1_700_001_200);
+    _ = try w.st.addHeaders(&.{&h2});
+    try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(child.txid));
+    const bytes = (try w.st.beefOf(child.txid)).?;
+    const proven = try beef.parse(a, bytes);
+    try std.testing.expectEqual(@as(usize, 1), proven.entries.len);
+    try std.testing.expectEqualSlices(u8, &child.txid, &proven.entries[0].txid);
+    try std.testing.expectEqual(beef.Format.raw_with_bump, proven.entries[0].format);
+    try std.testing.expectEqual(@as(u32, 2), proven.bumps[0].block_height);
+    var ms2 = lib.store.MemStore.init(std.testing.allocator);
+    defer ms2.deinit();
+    var st2 = try State.load(a, ms2.store(), null, .regtest);
+    _ = try st2.addHeaders(&.{ &w.h1, &h2 });
+    try std.testing.expectEqual(lib.state.Status.proven, (try st2.ingest(bytes)).status);
+}
+
 test "a rejection walks the spends; a proven competing spend is a double spend; never mined stays unproven" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
