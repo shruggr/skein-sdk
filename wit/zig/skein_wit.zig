@@ -134,6 +134,14 @@ pub fn emit(p: [*]const u8, n: u32, out: [*]u8, cap: u32) i32 {
     return holdCid(r, out, cap);
 }
 
+pub fn authfetch(p: [*]const u8, n: u32, out: [*]u8, cap: u32) i32 {
+    var d = list(p, n);
+    var r: c.program_list_u8_t = undefined;
+    var e: c.program_string_t = undefined;
+    if (!c.skein_kernel_skein_authfetch(&d, &r, &e)) return fail(&e);
+    return hold(r, out, cap);
+}
+
 pub fn deadline(until: i64) i32 {
     var e: c.program_string_t = undefined;
     if (!c.skein_kernel_skein_deadline(until, &e)) return fail(&e);

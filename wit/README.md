@@ -34,10 +34,12 @@ the adapter and the canonical-ABI glue are instructions too. Every other
 field of an update is the same.
 
 The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `await`,
-`head`, `advance`, `wallet`, `emit`, `deadline`, `call` and
-`edges` (#42: the edges into a record, from the kernel's index; docs/VM.md "Edges").
-There is no `http` and no `libp2p` (#70, #67: format 6 removed them); a
-handle is looked up by launching the `resolve` program.
+`head`, `advance`, `wallet`, `emit`, `deadline`, `call`,
+`edges` (#42: the edges into a record, from the kernel's index; docs/VM.md "Edges")
+and `authfetch` (shruggr/skein#126: the kernel's BRC-104 client, a recorded call).
+There is no plain `http` and no `libp2p` (#70, #67: format 6 removed them;
+a `fetch` is an intention the runtime answers, #126); a handle is looked up by
+launching the `resolve` program.
 
 - **`call`** (#40) runs a program record as a function: its entry, with
   `input()` = `{kind: "call", fn, arg, …}`, and returns what it wrote to

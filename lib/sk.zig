@@ -137,7 +137,7 @@ pub fn launch(a: Allocator, prog: []const u8, args: []const u8) ![]u8 {
 // table is the kernel's, changed by admin messages (box `dispatch`) from the
 // owner or a delegate, never by a program import.
 
-/// A BRC-100 wire frame to the oracle → its result frame.
+/// A BRC-100 wire frame to the signer → its result frame (a recorded call in a step).
 pub fn wallet(a: Allocator, frame: []const u8) ![]u8 {
     return result(a, raw.wallet, .{ frame.ptr, n32(frame.len) });
 }

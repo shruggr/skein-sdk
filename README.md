@@ -10,7 +10,7 @@ programs build against it too, so each file has one copy, here. Version
 
 | module | file | what |
 |---|---|---|
-| `sk` | `lib/sk.zig` | the preview1 `skein` imports (`input`, `get`, `put`, `putblock`, `keep`, `head`, `advance`, `edges`, `launch`, `await`, `deadline`, `call`, `emit`, `wallet`) and helpers over them: kept records, messages, the address book, trees |
+| `sk` | `lib/sk.zig` | the preview1 `skein` imports (`input`, `get`, `put`, `putblock`, `keep`, `head`, `advance`, `edges`, `launch`, `await`, `deadline`, `call`, `emit`, `wallet`, `authfetch`) and helpers over them: kept records, messages, the intentions the runtime answers (`deadline`, `fetch`: shruggr/skein#126), `authfetch` (the kernel's BRC-104 client), the address book (`peers`, `peerOf`, `peerAt`: no roles), trees |
 | `app` | `lib/app.zig` | calling an app: `{fn, args}` dispatched by the manifest's `provides` (read from `<app>/app`), args checked against the declared shapes, `writes: false` enforced, the answer message to the sender, the `/call` route, the app's state |
 | `files` | `lib/files.zig` | files from a git tree for an http handler (shruggr/skein#125, moved out of skein-static): `serve(a, req, tree, rowOptions(req))` answers the request from the tree under the row's `root`, with its `index` for a directory, a 301 for a directory named without its `/`, the blob's CID as the ETag (304 on `If-None-Match`), the content type by extension, 404 (missing, `..`, NUL, a bad escape) and 405 (`Allow: GET, HEAD`) |
 | `cbor` | `src/cbor.zig` | dag-cbor values, canonical encode/decode, the CID of a value |
@@ -19,7 +19,7 @@ programs build against it too, so each file has one copy, here. Version
 | `secp` | `src/secp.zig` | BRC-42 "anyone" child keys and ECDSA verification, pure Zig |
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
 | `message` | `lib/message.zig` | BRC-169 messages: build, sign through the signer, verify with the sender's key alone |
-| `brc104` | `lib/brc104.zig` | BRC-103/104 framing for programs |
+| `brc104` | `lib/brc104.zig` | BRC-103/104 framing for a server program (the front door); a client is the kernel's `authfetch` |
 | `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF (V1, V2, Atomic, Outpoint), the BEEF pointer record and `record.beefOf` (shruggr/skein#121: the exact bytes back from the record the kernel's door writes), SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads |
 | `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (re-exported under the same names): BRC-29, the transaction builder, the BRC-100 wire frames |
 | `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk` over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build |

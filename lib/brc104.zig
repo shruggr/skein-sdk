@@ -1,11 +1,12 @@
-//! BRC-103/104 over HTTP inside the VM (#40), both sides: the front door
-//! verifies requests and signs responses; the messagebox's delivery is a
-//! client (a handshake, then signed requests). Every signature, HMAC and key
-//! goes through the oracle (the `wallet` import: BRC-100 wire frames): in a
-//! kernel call it is answered and not recorded, in a step it is a recorded
-//! call. The framing is @bsv/sdk's SimplifiedFetchTransport's, so the stock
-//! AuthFetch talks to the front door and the front door's peers are stock
-//! servers too.
+//! BRC-103/104 over HTTP inside the VM (#40): the server side — the front
+//! door verifies requests and signs responses. The client is the kernel's
+//! (shruggr/skein#126: the `authfetch` import, sk.authfetch: the session,
+//! the request's signature and the answer's check happen in the kernel, a
+//! recorded call). Every signature, HMAC and key goes through the signer
+//! (the `wallet` import: BRC-100 wire frames): in a kernel call it is
+//! answered and not recorded, in a step it is a recorded call. The framing is
+//! @bsv/sdk's SimplifiedFetchTransport's, so the stock AuthFetch talks to the
+//! front door.
 const std = @import("std");
 const cbor = @import("cbor");
 const sk = @import("sk");
@@ -19,7 +20,7 @@ pub const VERSION = "0.1";
 
 const b64 = std.base64.standard;
 
-// ---------------------------------------------------------------- BRC-100 wire frames (the oracle)
+// ---------------------------------------------------------------- BRC-100 wire frames (the signer)
 
 pub const Counterparty = union(enum) { self, anyone, other: []const u8 };
 

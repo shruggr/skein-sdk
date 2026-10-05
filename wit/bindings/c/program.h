@@ -97,22 +97,32 @@ extern bool skein_kernel_skein_head(program_string_t *name, skein_kernel_skein_o
 // genesis `scopes` name). There is no `subscribe`: the dispatch table is
 // the kernel's (docs/MESSAGES.md).
 extern bool skein_kernel_skein_advance(program_string_t *name, skein_kernel_skein_cid_t *tree, program_string_t *err);
-// A BRC-100 wallet wire request frame → its result frame: the oracle,
-// answered synchronously and recorded (an `oracle` record on the update).
+// A BRC-100 wallet wire request frame → its result frame: the signer,
+// answered synchronously and recorded (an `oracle` record on the update —
+// the record's kind keeps the signer's old name).
 extern bool skein_kernel_skein_wallet(program_list_u8_t *frame, program_list_u8_t *ret, program_string_t *err);
 // The one outbound primitive (#70): emit a signed message. `message` is
 // dag-cbor {to: bytes(33), box, body: <dag-cbor bytes>, subject?: <cid>};
 // the result is the message's CID. `to` must be in the address book (the
-// head `peers`); the kernel signs the message through the oracle, lists
+// head `peers`); the kernel signs the message through the signer, lists
 // it on the step's update (`emitted`) and sends it by the recipient's
 // transport when the step ends without error. The answer is an entry:
 // `await` the CID and end the step. docs/VM.md, "emit".
 extern bool skein_kernel_skein_emit(program_list_u8_t *message, skein_kernel_skein_cid_t *ret, program_string_t *err);
 // If this step ends waiting, rest no later than `until-ms` (ms since the
-// epoch, after the step's time): sugar for a wake-me message to the
-// address book's waker (#70), emitted and awaited when the step ends; its
-// answer steps the thread with `woke`.
+// epoch, after the step's time): an intention (shruggr/skein#126) — the
+// kernel records a `deadline` event on the step, which it awaits; the
+// runtime's answer at that time steps the thread with `woke`.
 extern bool skein_kernel_skein_deadline(int64_t until_ms, program_string_t *err);
+// A BRC-104 request from this instance (shruggr/skein#126): `request` is
+// dag-cbor {url: <the server's base URL>, method?, path?, headers?: {name:
+// text}, body?: bytes, timeoutMs?}; the result is dag-cbor {status,
+// headers, body}. The kernel holds the BRC-103 session with the server,
+// signs the request and checks the answer through the signer, and the
+// runtime moves the bytes; the exchange is a recorded call on the step.
+// No answer at all is an error starting "transient: ". The one direct
+// HTTP path a program has.
+extern bool skein_kernel_skein_authfetch(program_list_u8_t *request, program_list_u8_t *ret, program_string_t *err);
 // An in-VM call (#40): run `program` (a program record) as a function —
 // its entry, with `input()` = {kind: "call", fn, arg, …} — and return what
 // it wrote to stdout (a non-zero exit is the error, its last stderr line).
