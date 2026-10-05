@@ -4,8 +4,9 @@
 //! that did not fit (kernel-zig/src/program.zig), wrapped so a program says
 //! `sk.get(a, cid)` and gets the bytes or an error whose message
 //! `lastError()` holds. Below the imports, what a handler builds on them:
-//! its thread's kept records, messages, delivery through the messagebox's
-//! `send`, the address book and resolving a handle, and trees.
+//! its thread's kept records, messages (`send`), the intentions the runtime
+//! answers (`deadline`, `fetch`; shruggr/skein#126), `authfetch` (the kernel's
+//! BRC-104 client), the address book and resolving a handle, and trees.
 const std = @import("std");
 const cbor = @import("cbor");
 
@@ -34,6 +35,7 @@ pub const raw = struct {
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn authfetch(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
 };
 
 /// The edges into `to` (#42): dag-cbor [{from, seq, rel, locator}] from the
@@ -169,9 +171,35 @@ pub fn broadcast(a: Allocator, tx: []const u8, beef: ?[]const u8) ![]u8 {
     return result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
 }
 
-/// Rest until `until_ms` at most (#70: a wake-me to the waker, emitted when the step ends; its answer steps the thread with `woke`).
+/// Rest until `until_ms` at most (shruggr/skein#126: an intention — the kernel
+/// records a `deadline` event on the step when it ends waiting, the runtime
+/// keeps it, and its answer at that time steps the thread with `woke`).
 pub fn deadline(until_ms: i64) !void {
     if (raw.deadline(until_ms) < 0) return failed();
+}
+
+/// What `authfetch` asks a server (shruggr/skein#126): `path` (with its query)
+/// under the server's base URL, the method, headers (a map {name: text}; the
+/// x-bsv-auth headers are the kernel's), the body, a timeout.
+pub const AuthRequest = struct { method: []const u8 = "POST", path: []const u8 = "/", headers: ?Value = null, body: ?[]const u8 = null, timeout_ms: ?i64 = null };
+
+/// A BRC-104 request from this instance to the server at `url` (its base URL,
+/// e.g. a messagebox's) → {status, headers, body} (shruggr/skein#126). The
+/// kernel holds the BRC-103 session with that server, signs the request and
+/// checks the answer's signature through the signer; the runtime only moves
+/// the bytes. The exchange is a recorded call on the step (replay serves it).
+/// No answer at all is an error whose message starts "transient: ". The one
+/// direct HTTP path a program has: plain `fetch` goes through the host's proxy.
+pub fn authfetch(a: Allocator, url: []const u8, req: AuthRequest) !Value {
+    var q = cbor.MapBuilder.init(a);
+    try q.put("url", .{ .string = url });
+    try q.put("method", .{ .string = req.method });
+    try q.put("path", .{ .string = req.path });
+    if (req.headers) |h| try q.put("headers", h);
+    if (req.body) |b| try q.put("body", .{ .bytes = b });
+    if (req.timeout_ms) |t| try q.put("timeoutMs", cbor.int(t));
+    const bytes = try cbor.encode(a, q.value());
+    return cbor.decode(a, try result(a, raw.authfetch, .{ bytes.ptr, n32(bytes.len) }));
 }
 
 /// An in-VM call: `prog`'s function `func` with `arg` → what it wrote to stdout.
@@ -329,8 +357,8 @@ pub fn send(a: Allocator, to: []const u8, box: []const u8, body: Value) ![]const
 }
 
 /// The address book (#70, the head `peers`): its peer records {kind: "peer",
-/// key, transport, address, role?, handle?, domain?, since, source}, this
-/// step's own writes included.
+/// key, transport, address, handle?, domain?, since, source}, this step's own
+/// writes included.
 pub fn peers(a: Allocator) ![]const Value {
     const root = (try head(a, "peers")) orelse return &.{};
     const t = try get(a, root);
@@ -360,14 +388,16 @@ pub fn peerOf(a: Allocator, key: []const u8) !?Value {
     return null;
 }
 
-/// The key of the provider playing `role` for this instance (#70: `fetch`,
-/// `libp2p`, `waker`; #69: `cron`; #65: `status`): the address book entry
-/// with that role — on this host (`local`) or a remote one (`mailbox`).
-pub fn provider(a: Allocator, role: []const u8) ![]const u8 {
-    for (try peers(a)) |p| if (std.mem.eql(u8, Value.str(p.get("role")) orelse "", role)) {
+/// The key the address book reaches at (`transport`, `address`) — e.g. a
+/// service on this host, ("local", "cron") — or null. The address book has no
+/// roles (shruggr/skein#126): an entry is a key, a transport and an address.
+pub fn peerAt(a: Allocator, transport: []const u8, address: []const u8) !?[]const u8 {
+    for (try peers(a)) |p| {
+        if (!std.mem.eql(u8, Value.str(p.get("transport")) orelse "", transport)) continue;
+        if (!std.mem.eql(u8, Value.str(p.get("address")) orelse "", address)) continue;
         if (Value.bytesOf(p.get("key"))) |k| return k;
-    };
-    return report(try std.fmt.allocPrint(a, "no {s} provider in the address book (an entry with role \"{s}\")", .{ role, role }));
+    }
+    return null;
 }
 
 /// Resolve a BRC-169 handle (#70: external communication is a thread): launch
@@ -383,17 +413,33 @@ pub fn launchResolve(a: Allocator, in: Value, handle: []const u8, domain: []cons
     return launch(a, rp, try put(a, q.value()));
 }
 
-/// One HTTP request through the `fetch` provider (#70): {method, url,
-/// headers?, body?, timeoutMs?} emitted to it (box "fetch") → the message's
-/// CID; awaited here. Its answer, the reply's body, is {replyTo, status,
-/// headers, body} or {replyTo, error} (no answer at all).
+/// One HTTP request as an intention (shruggr/skein#126): the event {event:
+/// "fetch", method, url, headers?, body?, timeoutMs?, maxBytes?} recorded on
+/// the step (the kernel adds the thread and step) → its CID, awaited here. The
+/// runtime sends it as the host is wired — signed with the instance's key, to
+/// its HTTP proxy — and the proxy's signed answer steps the thread with
+/// `reply` (replyOf): the body {replyTo: <this CID>, request, status, headers,
+/// body} or {replyTo, request, error} (no answer at all). No program reaches
+/// HTTP itself; `authfetch` is the one direct path, signed in the kernel.
 pub fn fetch(a: Allocator, method: []const u8, url: []const u8, headers: ?Value, body: ?[]const u8) ![]const u8 {
+    return fetchWith(a, method, url, headers, body, .{});
+}
+
+pub const FetchLimits = struct { timeout_ms: ?i64 = null, max_bytes: ?i64 = null };
+
+/// `fetch` with a timeout and a cap on the response body (`maxBytes`: a
+/// larger response is not carried in; the answer is {error}).
+pub fn fetchWith(a: Allocator, method: []const u8, url: []const u8, headers: ?Value, body: ?[]const u8, limits: FetchLimits) ![]const u8 {
     var q = cbor.MapBuilder.init(a);
+    try q.put("event", .{ .string = "fetch" });
     try q.put("method", .{ .string = method });
     try q.put("url", .{ .string = url });
     if (headers) |h| try q.put("headers", h);
     if (body) |b| try q.put("body", .{ .bytes = b });
-    const id = try emit(a, try provider(a, "fetch"), "fetch", q.value(), null);
+    if (limits.timeout_ms) |t| try q.put("timeoutMs", cbor.int(t));
+    if (limits.max_bytes) |m| try q.put("maxBytes", cbor.int(m));
+    const bytes = try cbor.encode(a, q.value());
+    const id = try result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
     try awaitRecord(id);
     return id;
 }
