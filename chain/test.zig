@@ -241,3 +241,81 @@ test "a reorg turns a proven transaction back to unproven: its broadcast registe
     try std.testing.expect(try st2.map("unproven").has(&child.txid));
     _ = try st2.save();
 }
+
+/// The pointer record the door would write for `bytes` (skein kernel-zig/src/beef.zig `record`),
+/// its blocks put: each transaction under its txid, each BUMP's bytes as a raw block.
+fn pointerOf(a: std.mem.Allocator, s: lib.store.Store, bytes: []const u8) ![]const u8 {
+    const cbor = lib.cbor;
+    const b = try beef.parse(a, bytes);
+    const txs = try a.alloc(cbor.Value, b.entries.len);
+    const marks = try a.alloc(cbor.Value, b.entries.len);
+    for (b.entries, txs, marks) |e, *t, *m| {
+        const c = try a.dupe(u8, &lib.store.hashCid(.tx, e.txid));
+        if (e.raw) |r| try s.putBlock(c, r);
+        t.* = .{ .cid = c };
+        m.* = switch (e.format) {
+            .txid_only => .{ .text = "txid" },
+            .raw_with_bump => .{ .uint = e.bump.? },
+            .raw => .null,
+        };
+    }
+    const bumps = try a.alloc(cbor.Value, b.bumps.len);
+    for (b.bumps, bumps) |*p, *v| {
+        const pb = try p.bytes(a);
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(pb, &d, .{});
+        const c = try a.dupe(u8, &([_]u8{ 0x01, 0x55, 0x12, 0x20 } ++ d));
+        try s.putBlock(c, pb);
+        v.* = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "height", .value = .{ .uint = p.block_height } },
+            .{ .key = "path", .value = .{ .cid = c } },
+            .{ .key = "block", .value = .null },
+            .{ .key = "proves", .value = .{ .array = &.{} } },
+        }) };
+    }
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "beef" } },
+        .{ .key = "form", .value = .{ .text = if (b.vout != null) "outpoint" else if (b.atomic != null) "atomic" else "beef" } },
+        .{ .key = "version", .value = .{ .uint = if (b.version == beef.V1) 1 else 2 } },
+        .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &lib.store.hashCid(.tx, b.subject().?)) } },
+        .{ .key = "txs", .value = .{ .array = txs } },
+        .{ .key = "marks", .value = .{ .array = marks } },
+        .{ .key = "bumps", .value = .{ .array = bumps } },
+    });
+    if (b.vout) |o| try es.append(a, .{ .key = "vout", .value = .{ .uint = o } });
+    return s.putValue(a, .{ .map = es.items });
+}
+
+test "record: beefOf gives back the exact bytes of every form (V2 Atomic, V1, Outpoint, V2 with a txid-only entry)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const fund = try funding(a, 2);
+    const child = try spend(a, &fund.tx, 0, 9_000);
+    const atomic = try beefOf(a, &.{.{ fund, 1 }}, &.{child});
+    const parsed = try beef.parse(a, atomic);
+    var v1 = parsed;
+    v1.atomic = null;
+    v1.version = beef.V1;
+    var outpoint = parsed;
+    outpoint.vout = 1;
+    var txid_only = parsed;
+    txid_only.atomic = null;
+    const es = try a.dupe(beef.Entry, parsed.entries);
+    es[0] = .{ .txid = fund.txid, .format = .txid_only };
+    txid_only.entries = es;
+    for ([_][]const u8{ atomic, try beef.serialize(a, v1), try beef.serialize(a, outpoint), try beef.serialize(a, txid_only) }) |wire| {
+        const rc = try pointerOf(a, s, wire);
+        try std.testing.expectEqualSlices(u8, wire, try lib.record.beefOf(a, s, rc));
+        const got = try lib.record.parsed(a, s, rc);
+        try std.testing.expectEqualSlices(u8, &child.txid, &got.subject().?);
+    }
+    const op = try beef.parse(a, try beef.serialize(a, outpoint));
+    try std.testing.expectEqual(@as(?u32, 1), op.vout);
+    // Not a pointer record: refused.
+    try std.testing.expectError(error.NotARecord, lib.record.encode(a, s, .{ .map = &.{} }));
+}

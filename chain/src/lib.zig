@@ -14,6 +14,8 @@ pub const spv = @import("spv.zig");
 pub const merkle = @import("merkle.zig");
 pub const store = @import("store.zig");
 pub const state = @import("state.zig");
+/// The BEEF pointer record (shruggr/skein#121) and `beefOf`, its encoder.
+pub const record = @import("record.zig");
 /// bsvz itself, for programs built on this library.
 pub const bsvz = @import("bsvz");
 

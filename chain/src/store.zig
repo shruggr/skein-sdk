@@ -227,7 +227,7 @@ pub const MemStore = struct {
         return arena.dupe(u8, &cid);
     }
     /// As the kernel's putblock: the bytes must hash to the CID (bitcoin-tx,
-    /// bitcoin-block, or dag-cbor sha2-256 — index nodes).
+    /// bitcoin-block, dag-cbor sha2-256 — index nodes — or raw sha2-256).
     fn putBlockImpl(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
         const self: *MemStore = @ptrCast(@alignCast(ptr));
         if (bitcoinHash(cid)) |h| {
@@ -235,6 +235,11 @@ pub const MemStore = struct {
             if (!std.mem.eql(u8, &h, &dblSha256(bytes))) return error.HashMismatch;
         } else if (cid.len == 36 and std.mem.eql(u8, cid[0..4], &.{ 0x01, 0x71, 0x12, 0x20 })) {
             if (!std.mem.eql(u8, cid, &cbor.cidOf(bytes))) return error.HashMismatch;
+        } else if (cid.len == 36 and std.mem.eql(u8, cid[0..4], &.{ 0x01, 0x55, 0x12, 0x20 })) {
+            // raw, sha2-256: a BUMP's bytes as received (shruggr/skein#121, record.zig).
+            var d: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
+            if (!std.mem.eql(u8, cid[4..36], &d)) return error.HashMismatch;
         } else return error.UnsupportedCid;
         try self.hold(cid, bytes);
     }

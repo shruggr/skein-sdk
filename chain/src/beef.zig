@@ -1,4 +1,4 @@
-//! BEEF (BRC-62 V1, BRC-96 V2, BRC-95 Atomic): parse and serialize, keeping
+//! BEEF (BRC-62 V1, BRC-96 V2, BRC-95 Atomic, BRC-158 Outpoint): parse and serialize, keeping
 //! the transactions in the order they were written. bsvz's own Beef keeps
 //! them in a hash map and serializes in txid order, which breaks BRC-96's
 //! parents-first rule; only its MerklePath and Transaction parsers are used
@@ -13,6 +13,8 @@ const VarInt = bsvz.primitives.varint.VarInt;
 pub const V1: u32 = 0xEFBE0001;
 pub const V2: u32 = 0xEFBE0002;
 pub const ATOMIC: u32 = 0x01010101;
+/// BRC-158 (Outpoint BEEF): 16 a7 be ef, then the subject txid and vout (u32 LE), then a BEEF.
+pub const OUTPOINT: u32 = 0xEFBEA716;
 
 pub const Error = error{ InvalidBeef, OutOfMemory };
 
@@ -30,8 +32,10 @@ pub const Entry = struct {
 
 pub const Beef = struct {
     version: u32,
-    /// BRC-95: the txid an Atomic BEEF names.
+    /// BRC-95: the txid an Atomic BEEF names (BRC-158: an Outpoint BEEF's, with `vout`).
     atomic: ?[32]u8 = null,
+    /// BRC-158: the subject output of an Outpoint BEEF (`atomic` its txid).
+    vout: ?u32 = null,
     bumps: []MerklePath,
     entries: []Entry,
 
@@ -91,11 +95,18 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Beef {
     if (@import("builtin").is_test) parses += 1;
     var pos: usize = 0;
     var atomic: ?[32]u8 = null;
+    var vout: ?u32 = null;
     var version = try readU32(bytes, &pos);
     if (version == ATOMIC) {
         if (bytes.len < 36) return error.InvalidBeef;
         atomic = bytes[4..36].*;
         pos = 36;
+        version = try readU32(bytes, &pos);
+    } else if (version == OUTPOINT) {
+        if (bytes.len < 40) return error.InvalidBeef;
+        atomic = bytes[4..36].*;
+        pos = 36;
+        vout = try readU32(bytes, &pos);
         version = try readU32(bytes, &pos);
     }
     if (version != V1 and version != V2) return error.InvalidBeef;
@@ -152,7 +163,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Beef {
         for (entries) |e| found = found or std.mem.eql(u8, &e.txid, &a);
         if (!found) return error.InvalidBeef;
     }
-    return .{ .version = version, .atomic = atomic, .bumps = bumps, .entries = entries };
+    return .{ .version = version, .atomic = atomic, .vout = vout, .bumps = bumps, .entries = entries };
 }
 
 fn appendVarInt(arena: std.mem.Allocator, out: *std.ArrayList(u8), v: u64) Error!void {
@@ -167,9 +178,13 @@ pub fn serialize(arena: std.mem.Allocator, b: Beef) Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     if (b.atomic) |a| {
         var hdr: [4]u8 = undefined;
-        std.mem.writeInt(u32, &hdr, ATOMIC, .little);
+        std.mem.writeInt(u32, &hdr, if (b.vout != null) OUTPOINT else ATOMIC, .little);
         try out.appendSlice(arena, &hdr);
         try out.appendSlice(arena, &a);
+        if (b.vout) |o| {
+            std.mem.writeInt(u32, &hdr, o, .little);
+            try out.appendSlice(arena, &hdr);
+        }
     }
     var ver: [4]u8 = undefined;
     std.mem.writeInt(u32, &ver, b.version, .little);
