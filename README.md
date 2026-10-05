@@ -40,15 +40,15 @@ builder, BRC-29 and wire code.
 Depend on it by tag:
 
 ```
-zig fetch --save=skein_sdk https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.4.0.tar.gz
+zig fetch --save=skein_sdk https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.5.0.tar.gz
 ```
 
 which writes into `build.zig.zon`:
 
 ```zig
 .skein_sdk = .{
-    .url = "https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.4.0.tar.gz",
-    .hash = "skein_sdk-0.4.0-YroFBDfGGADreMJWF41zqUyuS71zsF4uG8GNoPswWhek",
+    .url = "https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.5.0.tar.gz",
+    .hash = "skein_sdk-0.5.0-YroFBKL5GAAdwSFcYmJGKTF-kEUynbJ5vUdcU6e1gCdx",
 },
 ```
 
@@ -173,7 +173,7 @@ zig build test-wasm    # the wallet's tests built for wasm32-wasi, under Node's 
 
 The vector corpus (`wallet/vectors/*.json`) is made by go-sdk
 (`wallet/vectors/gen-go`) and cross-checked against the TS wallet-toolbox
-(`wallet/vectors/gen-ts`). A run prints its counts; at 0.4.0: tx 39 (fees
+(`wallet/vectors/gen-ts`). A run prints its counts; at 0.5.0: tx 39 (fees
 429), beef 27, merkle 43, headers 46, brc29 24, wire 13, signing 10,
 chronicle 3, wallet scenarios 6. The TS cross-check runs from a skein
 checkout beside this one, where `@bsv/sdk` resolves:
