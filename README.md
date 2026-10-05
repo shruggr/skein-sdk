@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.6.0**, Zig 0.16.0.
+**0.6.1**, Zig 0.16.0.
 
 ## What it is
 
@@ -201,6 +201,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.6.1 | `message`: a claim (box `claim`) may name no recipient — signed before the instance it claims exists, forwarded into it by the host; the same signing (shruggr/skein#127) |
 | 0.6.0 | `files`: the file server for any http handler, moved out of shruggr/skein-static with its tests (shruggr/skein#125) |
 | 0.5.1 | `State.beefOf` serves a proven subject with its own BUMP and nothing above it |
 | 0.5.0 | the BEEF pointer record and `chain.record` (`beefOf`, `parsed`, `subjectOf`, `provenBy`), Outpoint BEEF in `beef.parse`/`serialize`, raw blocks in `MemStore` (shruggr/skein#121); no `State.abandonIfDue` (shruggr/skein-chain#1) |
