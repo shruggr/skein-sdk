@@ -41,15 +41,15 @@ builder, BRC-29 and wire code.
 Depend on it by tag:
 
 ```
-zig fetch --save=skein_sdk https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.6.1.tar.gz
+zig fetch --save=skein_sdk https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.7.0.tar.gz
 ```
 
 which writes into `build.zig.zon`:
 
 ```zig
 .skein_sdk = .{
-    .url = "https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.6.1.tar.gz",
-    .hash = "skein_sdk-0.6.1-YroFBNdYGQDZiDWNAfQaa2mlBwwqDnXB6KCn1_D2VkDb",
+    .url = "https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.7.0.tar.gz",
+    .hash = "skein_sdk-0.7.0-YroFBHZxGQAQgBOa5JKn0SzPRUGb99bko_dg4ZkBFAzC",
 },
 ```
 
