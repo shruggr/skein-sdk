@@ -18,7 +18,7 @@ programs build against it too, so each file has one copy, here. Version
 | `mst` | `src/mst.zig` | Merkle search trees over dag-cbor blocks: the kernel's index maps and every app's maps |
 | `secp` | `src/secp.zig` | BRC-42 "anyone" child keys and ECDSA verification, pure Zig |
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
-| `message` | `lib/message.zig` | BRC-169 messages: build, sign through the signer, verify with the sender's key alone |
+| `message` | `lib/message.zig` | the mail record: `shapeProblem` (its shape and body; who sent it is the transport's to prove — a BRC-104 session, libp2p) and `problem` (plus the signature of the records that sign themselves: a claim, a host provider's answer; BRC-169's signing, checked with the sender's key alone) |
 | `brc104` | `lib/brc104.zig` | BRC-103/104 framing for a server program (the front door); a client is the kernel's `authfetch` |
 | `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF (V1, V2, Atomic, Outpoint), the BEEF pointer record and `record.beefOf` (shruggr/skein#121: the exact bytes back from the record the kernel's door writes), SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads |
 | `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (re-exported under the same names): BRC-29, the transaction builder, the BRC-100 wire frames |
@@ -201,6 +201,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.7.2 | `message`: `shapeProblem` — a mail record carries no signature of its sender (shruggr/skein#126 step 4: the BRC-104 session or libp2p proves it); `problem` stays for a claim and a host provider's answer |
 | 0.7.1 | chain: a proven transaction's broadcast watchers survive a reorg; the proof in the new block tells them again (shruggr/skein-chain#2) |
 | 0.7.0 | intentions, `authfetch` (the kernel's BRC-104 client), no `provider(role)` (shruggr/skein#126) |
 | 0.6.1 | `message`: a claim (box `claim`) may name no recipient — signed before the instance it claims exists, forwarded into it by the host; the same signing (shruggr/skein#127) |

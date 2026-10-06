@@ -142,7 +142,8 @@ pub fn wallet(a: Allocator, frame: []const u8) ![]u8 {
     return result(a, raw.wallet, .{ frame.ptr, n32(frame.len) });
 }
 
-/// Emit a signed message (#70): `body` (a record) to identity `to` in `box`,
+/// Emit a message (#70; unsigned, shruggr/skein#126 step 4: the transport that
+/// carries it proves its sender): `body` (a record) to identity `to` in `box`,
 /// about `subject` if given → the message's CID. `to` must be in the address
 /// book; the message goes out when this step ends without error. Its answer
 /// is an entry: `awaitRecord` the CID and end the step, and the reply steps
