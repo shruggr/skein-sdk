@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.7.2**, Zig 0.16.0.
+**0.8.0**, Zig 0.16.0.
 
 ## What it is
 
@@ -20,7 +20,7 @@ programs build against it too, so each file has one copy, here. Version
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
 | `message` | `lib/message.zig` | the mail record: `shapeProblem` (its shape and body; who sent it is the transport's to prove — a BRC-104 session, libp2p) and `problem` (plus the signature of the records that sign themselves: a claim, a host provider's answer; BRC-169's signing, checked with the sender's key alone) |
 | `brc104` | `lib/brc104.zig` | BRC-103/104 framing for a server program (the front door); a client is the kernel's `authfetch` |
-| `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF (V1, V2, Atomic, Outpoint), the BEEF pointer record and `record.beefOf` (shruggr/skein#121: the exact bytes back from the record the kernel's door writes), SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads |
+| `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF (V1, V2, Atomic, Outpoint), the BEEF pointer record and `record.beefOf` (shruggr/skein#121: the exact bytes back from the record the kernel's door writes), SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads; `image`: the header chain an image tree carries (`chain/headers/<first>`, `chain/tip`; shruggr/skein#132) and `load`, which fills an empty state's best chain from it |
 | `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (re-exported under the same names): BRC-29, the transaction builder, the BRC-100 wire frames |
 | `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk` over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build |
 | `cabi` | `wit/zig/cabi.zig` | `malloc`/`realloc`/`free`/`abort`/`strlen` for wit-bindgen's C bindings, without wasi-libc |
@@ -201,6 +201,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.8.0 | chain `image` (shruggr/skein#132): the header-chain layout of an image tree — `chain/headers/<first height, 8 digits>` blocks of 2016 raw headers in height order, `chain/tip` `{height, hash}` — `find`, `load` (fills an empty state's `headers` and `heights` from it, verified from genesis as `Chain.add` verifies: genesis, links, targets, proof of work) and `write`; `mst` `Forest.build` (a map from sorted entries in one pass, its nodes handed to a sink as made: the same root as putting them); `MemStore` holds git-raw objects; `Maps.sink` |
 | 0.7.2 | `message`: `shapeProblem` — a mail record carries no signature of its sender (shruggr/skein#126 step 4: the BRC-104 session or libp2p proves it); `problem` stays for a claim and a host provider's answer |
 | 0.7.1 | chain: a proven transaction's broadcast watchers survive a reorg; the proof in the new block tells them again (shruggr/skein-chain#2) |
 | 0.7.0 | intentions, `authfetch` (the kernel's BRC-104 client), no `provider(role)` (shruggr/skein#126) |

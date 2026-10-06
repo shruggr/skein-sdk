@@ -241,6 +241,70 @@ pub const Forest = struct {
         return f.putAt(root, k, level(k), v);
     }
 
+    /// The tree holding exactly `entries` (keys strictly increasing), built
+    /// bottom-up in one pass and handed to `sink` node by node as it is
+    /// made: the same root as putting them one by one (a tree is a function
+    /// of its contents), without the nodes each put would write and drop on
+    /// the way, and without holding the tree in memory (nothing pending,
+    /// nothing cached) — a map of a million keys from nothing
+    /// (shruggr/skein#132: an image's header chain). The root's CID is in
+    /// the forest's arena.
+    pub fn build(f: *Forest, entries: []const KV, sink: Sink) !?[]const u8 {
+        const levels = try f.gpa.alloc(u8, entries.len);
+        defer f.gpa.free(levels);
+        for (entries, levels, 0..) |e, *l, i| {
+            if (i > 0 and !lt(entries[i - 1].key, e.key)) return error.NotSorted;
+            l.* = level(e.key);
+        }
+        var scratch = std.heap.ArenaAllocator.init(f.gpa);
+        defer scratch.deinit();
+        return f.buildRange(entries, levels, sink, &scratch);
+    }
+
+    /// The tree of a run of sorted entries: the keys of its highest level in
+    /// one node, the runs between them its subtrees; the node encoded as
+    /// `make` encodes it, put, and only its CID kept.
+    fn buildRange(f: *Forest, entries: []const KV, levels: []const u8, sink: Sink, scratch: *std.heap.ArenaAllocator) !?[]const u8 {
+        if (entries.len == 0) return null;
+        const top = std.mem.max(u8, levels);
+        var n: usize = 0;
+        for (levels) |l| n += @intFromBool(l == top);
+        const rights = try f.gpa.alloc(?[]const u8, n);
+        defer f.gpa.free(rights);
+        const keys = try f.gpa.alloc(usize, n);
+        defer f.gpa.free(keys);
+        var left: ?[]const u8 = null;
+        var j: usize = 0;
+        var start: usize = 0;
+        for (levels, 0..) |l, i| {
+            if (l != top) continue;
+            const gap = try f.buildRange(entries[start..i], levels[start..i], sink, scratch);
+            if (j == 0) left = gap else rights[j - 1] = gap;
+            keys[j] = i;
+            j += 1;
+            start = i + 1;
+        }
+        rights[j - 1] = try f.buildRange(entries[start..], levels[start..], sink, scratch);
+        defer _ = scratch.reset(.retain_capacity);
+        const a = scratch.allocator();
+        const items = try a.alloc(Value, n);
+        for (keys, rights, items) |k, r, *x| {
+            const t = try a.alloc(Value, 3);
+            t[0] = .{ .bytes = entries[k].key };
+            t[1] = entries[k].value;
+            t[2] = if (r) |c| .{ .cid = c } else .null;
+            x.* = .{ .array = t };
+        }
+        const pair = try a.alloc(Value, 2);
+        pair[0] = if (left) |l| .{ .cid = l } else .null;
+        pair[1] = .{ .array = items };
+        const blk = try cbor.block(a, .{ .array = pair });
+        try sink.put(sink.ctx, blk.cid, blk.bytes);
+        f.flushed_nodes += 1;
+        f.flushed_bytes += blk.bytes.len;
+        return try f.al().dupe(u8, blk.cid);
+    }
+
     fn putAt(f: *Forest, root: ?[]const u8, key: []const u8, lvl: u8, value: Value) !?[]const u8 {
         const c = root orelse return f.make(null, &.{.{ .key = key, .value = value, .right = null }});
         const n = try f.load(c);
@@ -508,6 +572,45 @@ test "mst: canonical — same set, same root, whatever the order; deletes undo p
         r3 = try f.put(r3, testKey(&kb, i), .{ .int = @intCast(i) });
     }
     try std.testing.expectEqualSlices(u8, r1.?, r3.?);
+}
+
+test "mst: build — sorted entries in one pass, the same root as putting them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem = Mem{ .map = std.StringHashMap([]u8).init(a) };
+    var f = Forest.init(std.testing.allocator, mem.blocks());
+    defer f.deinit();
+    for ([_]usize{ 0, 1, 2, 33, 3000 }) |N| {
+        var r1: ?[]const u8 = null;
+        const kvs = try a.alloc(KV, N);
+        for (0..N) |i| {
+            var kb: [8]u8 = undefined;
+            const k = try a.dupe(u8, testKey(&kb, i));
+            r1 = try f.put(r1, k, .{ .int = @intCast(i) });
+            kvs[i] = .{ .key = k, .value = .{ .int = @intCast(i) } };
+        }
+        r1 = try keep(a, r1);
+        std.mem.sort(KV, kvs, {}, struct {
+            fn less(_: void, x: KV, y: KV) bool {
+                return lt(x.key, y.key);
+            }
+        }.less);
+        // Built into a store of its own: every node is there, read by a fresh forest.
+        var mem2 = Mem{ .map = std.StringHashMap([]u8).init(a) };
+        const r2 = try f.build(kvs, mem2.sink());
+        if (N == 0) {
+            try std.testing.expect(r1 == null and r2 == null);
+        } else try std.testing.expectEqualSlices(u8, r1.?, r2.?);
+        var f2 = Forest.init(std.testing.allocator, mem2.blocks());
+        defer f2.deinit();
+        try std.testing.expectEqual(N, try f2.count(r2));
+        for (kvs) |kv| try std.testing.expect(cbor.eql(kv.value, (try f2.get(a, r2, kv.key)).?));
+        if (N > 1) {
+            std.mem.swap(KV, &kvs[0], &kvs[1]);
+            try std.testing.expectError(error.NotSorted, f.build(kvs, mem2.sink()));
+        }
+    }
 }
 
 test "mst: copy-on-write — old roots stay readable, one put writes one path" {

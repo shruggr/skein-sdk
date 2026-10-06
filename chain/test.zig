@@ -406,3 +406,118 @@ test "record: beefOf gives back the exact bytes of every form (V2 Atomic, V1, Ou
     // Not a pointer record: refused.
     try std.testing.expectError(error.NotARecord, lib.record.encode(a, s, .{ .map = &.{} }));
 }
+
+/// A regtest chain from genesis: `n` headers, the genesis first.
+fn regtestChain(a: std.mem.Allocator, n: usize) ![][80]u8 {
+    const out = try a.alloc([80]u8, n);
+    out[0] = lib.chain.Network.regtest.genesis();
+    for (out[1..], 1..) |*h, i| h.* = mine(hdr.hash(&out[i - 1]), .{@as(u8, @truncate(i))} ** 32, 1_700_000_000 + @as(u32, @intCast(i)) * 600);
+    return out;
+}
+
+test "image: a header chain in an image tree loads into an empty state — the same state as adding the headers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const img = lib.image;
+    // Three blocks: two full (2016 each), the last partial.
+    const hs = try regtestChain(a, 2 * img.per_block + 5);
+    const w = try img.write(a, s, hs);
+    const found = (try img.find(a, s, &w.root)).?;
+    try std.testing.expectEqual(@as(usize, 3), found.blocks.len);
+    try std.testing.expectEqual(@as(u32, @intCast(hs.len - 1)), found.tip.height);
+
+    var st = try State.load(a, s, null, .regtest);
+    const got = (try img.load(&st, &w.root)).?;
+    try std.testing.expectEqual(@as(u32, @intCast(hs.len)), got.headers);
+    try std.testing.expectEqual(@as(u32, @intCast(hs.len - 1)), got.tip);
+    const loaded = try st.save();
+
+    // The same chain added as a run from genesis: the same state record.
+    var st2 = try State.load(a, s, null, .regtest);
+    const runs = try a.alloc([]const u8, hs.len - 1);
+    for (hs[1..], runs) |*h, *r| r.* = h;
+    _ = try st2.addHeaders(runs);
+    try std.testing.expectEqualStrings(try st2.save(), loaded);
+
+    // Read back from the saved record; the tip stream continues past the image's tip.
+    var st3 = try State.load(a, s, loaded, .regtest);
+    try std.testing.expectEqual(@as(?u32, @intCast(hs.len - 1)), try st3.chain().tip());
+    try std.testing.expectEqualSlices(u8, &hs[2016], &(try st3.chain().at(2016)).?.raw);
+    try std.testing.expectEqual(@as(?u32, 4000), try st3.chain().heightOf(hdr.hash(&hs[4000])));
+    const next = mine(hdr.hash(&hs[hs.len - 1]), .{0xee} ** 32, 1_800_000_000);
+    const r = try st3.addHeaders(&.{&next});
+    try std.testing.expectEqual(@as(u32, 1), r.added);
+    try std.testing.expectEqual(@as(u32, @intCast(hs.len)), r.tip);
+
+    // Loaded once only: a state with headers is refused.
+    try std.testing.expectError(error.NotEmpty, img.load(&st3, &w.root));
+}
+
+test "image: no chain in the tree is null; another network, a broken link, a bad target, a wrong tip refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const img = lib.image;
+    const hs = try regtestChain(a, 40);
+
+    // A tree with no `chain`: nothing loaded, the state untouched.
+    const empty = img.gitCid("tree 0\x00");
+    try s.putBlock(&empty, "tree 0\x00");
+    var st = try State.load(a, s, null, .regtest);
+    try std.testing.expect((try img.load(&st, &empty)) == null);
+    try std.testing.expect((try st.chain().tip()) == null);
+
+    // A regtest chain into a mainnet state.
+    const w = try img.write(a, s, hs);
+    var main_st = try State.load(a, s, null, .main);
+    try std.testing.expectError(error.WrongNetwork, img.load(&main_st, &w.root));
+
+    // Two headers swapped: the link breaks.
+    const swapped = try a.dupe([80]u8, hs);
+    std.mem.swap([80]u8, &swapped[10], &swapped[11]);
+    var st1 = try State.load(a, s, null, .regtest);
+    try std.testing.expectError(error.BadLink, img.load(&st1, &(try img.write(a, s, swapped)).root));
+
+    // The last header's bits unusable.
+    const bad = try a.dupe([80]u8, hs);
+    std.mem.writeInt(u32, bad[39][72..76], 0, .little);
+    var st2 = try State.load(a, s, null, .regtest);
+    try std.testing.expectError(error.BadTarget, img.load(&st2, &(try img.write(a, s, bad)).root));
+
+    // A tip that is not the last header: the chain part of one tree, the tip of another.
+    const short = try img.write(a, s, hs[0..39]);
+    var es: std.ArrayList(u8) = .empty;
+    const chain_obj = try s.get(a, &w.chain);
+    const short_obj = try s.get(a, &short.chain);
+    // Rebuild `chain` from w's headers tree and short's tip.
+    const nul_w = std.mem.indexOfScalar(u8, chain_obj, 0).?;
+    const nul_s = std.mem.indexOfScalar(u8, short_obj, 0).?;
+    const body_w = chain_obj[nul_w + 1 ..];
+    const body_s = short_obj[nul_s + 1 ..];
+    const headers_entry_len = "40000 headers\x00".len + 20;
+    try es.appendSlice(a, body_w[0..headers_entry_len]);
+    try es.appendSlice(a, body_s[headers_entry_len..]);
+    const mixed = try std.fmt.allocPrint(a, "tree {d}\x00{s}", .{ es.items.len, es.items });
+    const mixed_cid = img.gitCid(mixed);
+    try s.putBlock(&mixed_cid, mixed);
+    const root_body = try std.fmt.allocPrint(a, "40000 chain\x00{s}", .{mixed_cid[4..24]});
+    const root = try std.fmt.allocPrint(a, "tree {d}\x00{s}", .{ root_body.len, root_body });
+    const root_cid = img.gitCid(root);
+    try s.putBlock(&root_cid, root);
+    var st3 = try State.load(a, s, null, .regtest);
+    try std.testing.expectError(error.BadImage, img.load(&st3, &root_cid));
+
+    // The tip text.
+    const t = try img.parseTip(a, try img.tipText(a, .{ .height = 7, .hash = hdr.hash(&hs[7]) }));
+    try std.testing.expectEqual(@as(u32, 7), t.height);
+    try std.testing.expectEqualSlices(u8, &hdr.hash(&hs[7]), &t.hash);
+    var nb: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("00004032", img.blockName(&nb, 4032));
+}

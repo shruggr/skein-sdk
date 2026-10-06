@@ -227,7 +227,7 @@ pub const MemStore = struct {
         return arena.dupe(u8, &cid);
     }
     /// As the kernel's putblock: the bytes must hash to the CID (bitcoin-tx,
-    /// bitcoin-block, dag-cbor sha2-256 — index nodes — or raw sha2-256).
+    /// bitcoin-block, dag-cbor sha2-256 — index nodes — raw sha2-256, or git-raw sha1).
     fn putBlockImpl(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
         const self: *MemStore = @ptrCast(@alignCast(ptr));
         if (bitcoinHash(cid)) |h| {
@@ -240,6 +240,11 @@ pub const MemStore = struct {
             var d: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
             if (!std.mem.eql(u8, cid[4..36], &d)) return error.HashMismatch;
+        } else if (cid.len == 24 and std.mem.eql(u8, cid[0..4], &.{ 0x01, 0x78, 0x11, 0x14 })) {
+            // git-raw, sha1: an image tree's objects (shruggr/skein#132, image.zig).
+            var d: [20]u8 = undefined;
+            std.crypto.hash.Sha1.hash(bytes, &d, .{});
+            if (!std.mem.eql(u8, cid[4..24], &d)) return error.HashMismatch;
         } else return error.UnsupportedCid;
         try self.hold(cid, bytes);
     }
@@ -277,6 +282,11 @@ pub const Maps = struct {
     fn sinkPut(ctx: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
         const m: *Maps = @ptrCast(@alignCast(ctx));
         try m.store.putBlock(cid, bytes);
+    }
+
+    /// Where a node goes when it is written: the store (`putblock`).
+    pub fn sink(self: *Maps) mst.Forest.Sink {
+        return .{ .ctx = self, .put = sinkPut };
     }
 
     pub fn map(self: *Maps, root: ?[]const u8) Map {
