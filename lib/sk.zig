@@ -134,8 +134,8 @@ pub fn launch(a: Allocator, prog: []const u8, args: []const u8) ![]u8 {
 }
 
 // There is no `subscribe` (skein-sdk 0.3.0, shruggr/skein#77): the dispatch
-// table is the kernel's, changed by admin messages (box `dispatch`) from the
-// owner or a delegate, never by a program import.
+// table is the kernel's, changed by admin messages (box `dispatch`) from
+// root (shruggr/skein#143), never by a program import.
 
 /// A BRC-100 wire frame to the signer → its result frame (a recorded call in a step).
 pub fn wallet(a: Allocator, frame: []const u8) ![]u8 {

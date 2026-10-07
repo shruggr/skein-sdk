@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.8.0**, Zig 0.16.0.
+**0.9.0**, Zig 0.16.0.
 
 ## What it is
 
@@ -12,6 +12,7 @@ programs build against it too, so each file has one copy, here. Version
 |---|---|---|
 | `sk` | `lib/sk.zig` | the preview1 `skein` imports (`input`, `get`, `put`, `putblock`, `keep`, `head`, `advance`, `edges`, `launch`, `await`, `deadline`, `call`, `emit`, `wallet`, `authfetch`) and helpers over them: kept records, messages, the intentions the runtime answers (`deadline`, `fetch`: shruggr/skein#126), `authfetch` (the kernel's BRC-104 client), the address book (`peers`, `peerOf`, `peerAt`: no roles), trees |
 | `app` | `lib/app.zig` | calling an app: `{fn, args}` dispatched by the manifest's `provides` (read from `<app>/app`), args checked against the declared shapes, `writes: false` enforced, the answer message to the sender, the `/call` route, the app's state |
+| `filter` | `lib/filter.zig` | answering as a filter (skein `docs/APPS.md` §2, shruggr/skein#143): `reject`, `answer`, `pass` (a principal, a rewritten request, blocks), `answerOf` (a route handler's http answer as a filter's), `isFilter`, `write` |
 | `files` | `lib/files.zig` | files from a git tree for an http handler (shruggr/skein#125, moved out of skein-static): `serve(a, req, tree, rowOptions(req))` answers the request from the tree under the row's `root`, with its `index` for a directory, a 301 for a directory named without its `/`, the blob's CID as the ETag (304 on `If-None-Match`), the content type by extension, 404 (missing, `..`, NUL, a bad escape) and 405 (`Allow: GET, HEAD`) |
 | `cbor` | `src/cbor.zig` | dag-cbor values, canonical encode/decode, the CID of a value |
 | `cid` | `src/cid.zig` | CIDs: parse, format; the codecs skein uses (raw, dag-cbor, git-raw, bitcoin-block, bitcoin-tx) |
@@ -137,17 +138,23 @@ Its tree is `bin/counter.wasm` (the built module) and `etc/app.json`:
     "get": { "writes": false, "args": {}, "answer": { "count": "int" } },
     "add": { "writes": true, "args": { "by": "int" }, "answer": { "count": "int" } } } }],
   "requires": [],
-  "dispatch": [{ "address": "counter", "sender": "$owner", "program": "counter" }]
+  "routes": [{ "address": "", "handler": "counter.message" }],
+  "roles": { "root": ["message"] }
 }
 ```
 
-`skein-host install <dir> --instance <handle>` installs it; the owner then
-sends `{fn: "demo.counter.add", args: {by: 2}}` to box `counter`.
+`skein-host install <dir> --instance <handle>` installs it; root then
+sends `{fn: "demo.counter.add", args: {by: 2}}` to box `counter` (the
+route's function `message` is gated by `root`; no `roles`: anyone who can
+reach the box).
 
 Three callers reach a function with one definition: a message `{fn, args}`
 in the app's box (answered to the sender `{fn, request, replyTo, result |
 error: {code, message}}`), the route `{transport: "http", address: "/call",
-fn: "call"}` (answered on the connection), and an in-VM `call`. The error
+filters: ["kernel.brc104"], handler: "<role>.call"}` (answered on the
+connection), and an in-VM `call`. Who may call is the kernel's: a route's
+filters and the gate (the manifest's `roles`) run before the handler
+(shruggr/skein#143). The error
 codes and the HTTP statuses are at the top of `lib/app.zig`. The app's state
 is the `state` link of its app record, the root of `<app>/app`: an app writes
 only heads under its own name.
@@ -168,7 +175,7 @@ merged commit.
 ## Build and test
 
 ```
-zig build test         # cid, cbor, mst, secp, dagjson, files, app; chain/test.zig; the wallet's tests and vector corpus (55 tests)
+zig build test         # cid, cbor, mst, secp, dagjson, files, filter, app; chain/test.zig; the wallet's tests and vector corpus (55 tests)
 zig build test-wasm    # the wallet's tests built for wasm32-wasi, under Node's WASI (needs node)
 ```
 
@@ -201,6 +208,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.9.0 | routes, filters, roles (shruggr/skein#143): `filter`, the module a filter answers with (`{reject}`, `{answer}`, `{pass}`); `app`: no `admitted`, no `not-admitted` — the `/call` route no longer reads the dispatch rows' senders (there are none): the kernel's filters and gate admit the caller before the handler runs; no `owner` anywhere in the step or call input |
 | 0.8.0 | chain `image` (shruggr/skein#132): the header-chain layout of an image tree — `chain/headers/<first height, 8 digits>` blocks of 2016 raw headers in height order, `chain/tip` `{height, hash}` — `find`, `load` (fills an empty state's `headers` and `heights` from it, verified from genesis as `Chain.add` verifies: genesis, links, targets, proof of work) and `write`; `mst` `Forest.build` (a map from sorted entries in one pass, its nodes handed to a sink as made: the same root as putting them); `MemStore` holds git-raw objects; `Maps.sink` |
 | 0.7.2 | `message`: `shapeProblem` — a mail record carries no signature of its sender (shruggr/skein#126 step 4: the BRC-104 session or libp2p proves it); `problem` stays for a claim and a host provider's answer |
 | 0.7.1 | chain: a proven transaction's broadcast watchers survive a reorg; the proof in the new block tells them again (shruggr/skein-chain#2) |

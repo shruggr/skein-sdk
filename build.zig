@@ -14,6 +14,8 @@
 //   files      files from a git tree for an http handler: paths, index,      lib/files.zig
 //              301, ETag/304, content types, 404/405 (imports cbor, sk;
 //              shruggr/skein#125, moved out of skein-static)
+//   filter     answering as a filter (skein docs/APPS.md §2, #143):         lib/filter.zig
+//              {reject} | {answer} | {pass} (imports cbor, sk)
 //   app        calling an app (skein docs/APPS.md §4): {fn, args} dispatch     lib/app.zig
 //              by the manifest's `provides`, args checked, `writes` enforced,
 //              the answer message; the `/call` route (imports cbor, sk, dagjson)
@@ -55,6 +57,7 @@ pub fn build(b: *std.Build) void {
     const dagjson = b.addModule("dagjson", .{ .root_source_file = b.path("lib/dagjson.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "cbor", .module = c.cbor }} });
     const message = b.addModule("message", .{ .root_source_file = b.path("lib/message.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "secp", .module = secp } } });
     const files = b.addModule("files", .{ .root_source_file = b.path("lib/files.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
+    const filter = b.addModule("filter", .{ .root_source_file = b.path("lib/filter.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
     const app = b.addModule("app", .{ .root_source_file = b.path("lib/app.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk }, .{ .name = "dagjson", .module = dagjson } } });
 
     // The component glue: no wasi-libc (wit/README.md says why).
@@ -66,7 +69,7 @@ pub fn build(b: *std.Build) void {
     wit.addObjectFile(b.path("wit/bindings/c/program_component_type.o"));
 
     const test_step = b.step("test", "every module's tests and the wallet's vector corpus, natively");
-    for ([_]*std.Build.Module{ c.cid, c.cbor, c.mst, secp, dagjson, message, files, app }) |m| {
+    for ([_]*std.Build.Module{ c.cid, c.cbor, c.mst, secp, dagjson, message, files, filter, app }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 

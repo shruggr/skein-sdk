@@ -29,14 +29,14 @@
 //!                                 the address book to be answered; else the answer is only the
 //!                                 step's result (stdout, in the log). Either way the step's stdout
 //!                                 is the answer as DAG-JSON.
-//!   an HTTP route                 {path: "/call", program: <the handler's role>, fn: "call"}: the
-//!                                 front door calls fn "call" with the request; the body is
+//!   an HTTP route                 a route {transport: "http", address: "/call", handler: "<role>.call"}:
+//!                                 the front door calls fn "call" with the request; the body is
 //!                                 {fn, args} (JSON, or dag-cbor as application/cbor); the answer,
 //!                                 on the connection: 200 {fn, result} | an error status {fn, error}.
-//!                                 The caller must be admitted to the app's box as a message
-//!                                 would be (a mailbox row for (caller, <app>) or (anyone,
-//!                                 <app>) in the call's `dispatch`); an open route (sender "*")
-//!                                 has no caller, so only a box open to anyone admits it.
+//!                                 Who may call is the kernel's (shruggr/skein#143): the route's
+//!                                 filters (`kernel.brc104`: the caller is the client's key) and
+//!                                 the gate (the manifest's `roles` for the route's fn) ran before
+//!                                 the handler; the request's `caller` is the door's principal.
 //!   an in-VM call                 call(<handler program>, "<interface>.<function>", args) → result
 //!                                 (dag-cbor), or the call's error.
 //!
@@ -58,12 +58,13 @@
 //! it wrote before failing stands: check first, write last.
 //!
 //! Error codes: `bad-request` (not {fn, args}, not JSON), `unknown-fn` (not
-//! provided, or not implemented), `bad-args`, `not-admitted` (the route's
-//! caller), `read-only`, `failed` (the function's own error). Over HTTP:
-//! 400, 404, 400, 403, 409, 500.
+//! provided, or not implemented), `bad-args`, `read-only`, `failed` (the
+//! function's own error). Over HTTP: 400, 404, 400, 409, 500. (No
+//! `not-admitted` since skein-sdk 0.9.0: the kernel's gate refuses a caller
+//! before the handler runs.)
 //!
 //! **State.** The app's head `<app>/app` is its handler's (§1): the root record is the
-//! manifest the owner installed, and the app keeps its own state as the
+//! manifest root installed, and the app keeps its own state as the
 //! root's `state` link — `Call.state()` reads it, `Call.setState(v)` puts
 //! `v` and advances the head to the root with `state` replaced. An install
 //! of a new version keeps `state`.
@@ -86,14 +87,12 @@ pub const Code = enum {
     @"bad-request",
     @"unknown-fn",
     @"bad-args",
-    @"not-admitted",
     @"read-only",
     failed,
 
     pub fn status(c: Code) u16 {
         return switch (c) {
             .@"bad-request", .@"bad-args" => 400,
-            .@"not-admitted" => 403,
             .@"unknown-fn" => 404,
             .@"read-only" => 409,
             .failed => 500,
@@ -120,7 +119,8 @@ pub const Call = struct {
     name: []const u8,
     decl: Value,
     args: Value,
-    /// Who asked: the message's sender, the route's caller; null on an open route or an in-VM call.
+    /// Who asked: the message's sender, the route's caller (the door's principal); null when the
+    /// route's filters named none, or an in-VM call.
     sender: ?[]const u8,
     /// The declaration's `writes`.
     writes: bool,
@@ -326,35 +326,12 @@ fn onCall(a: Allocator, in: Value, app: []const u8, fns: []const Function, name:
     };
 }
 
-/// Whether the input's dispatch rows (#77: the kernel's table, handed to a
-/// call as `dispatch`) admit `caller` (null: anyone) to `box`: a `mailbox`
-/// row for the box (or any box, "*") whose sender is "*" admits anyone, one
-/// whose sender is a key admits that identity.
-pub fn admitted(in: Value, caller: ?[]const u8, box: []const u8) bool {
-    const rows = in.get("dispatch") orelse return false;
-    if (rows != .array) return false;
-    for (rows.array) |r| {
-        if (!eql(u8, Value.str(r.get("transport")) orelse "", "mailbox")) continue;
-        const addr = Value.str(r.get("address")) orelse continue;
-        if (!eql(u8, addr, "*") and !eql(u8, addr, box)) continue;
-        const sender = r.get("sender") orelse continue;
-        if (Value.str(sender)) |t| {
-            if (eql(u8, t, "*")) return true;
-            continue;
-        }
-        const s = Value.bytesOf(sender) orelse continue;
-        if (caller) |c| if (eql(u8, s, c)) return true;
-    }
-    return false;
-}
-
 /// The `/call` route: {fn, args} in the HTTP body → the answer on the connection.
 fn onRoute(a: Allocator, in: Value, app: []const u8, fns: []const Function, req: Value) !Value {
     const caller = Value.bytesOf(req.get("caller"));
     var name: []const u8 = "";
     const outcome: Outcome = blk: {
         if (!eql(u8, Value.str(req.get("method")) orelse "", "POST")) break :blk .{ .err = .{ .code = .@"bad-request", .message = "POST {fn, args}" } };
-        if (!admitted(in, caller, app)) break :blk .{ .err = .{ .code = .@"not-admitted", .message = try std.fmt.allocPrint(a, "the caller is not admitted to box {s}", .{app}) } };
         const raw = Value.bytesOf(req.get("body")) orelse "";
         const ct = Value.str(req.get("contentType")) orelse "";
         const body = (if (eql(u8, ct, "application/cbor")) cbor.decode(a, raw) else dagjson.decode(a, raw)) catch
@@ -478,35 +455,6 @@ test "a function's declaration by its full name" {
     try std.testing.expect((try declOf(a, m, "amm.pool.nope")) == null);
     try std.testing.expect((try declOf(a, m, "amm.poolquote")) == null);
     try std.testing.expect((try declOf(a, m, "amm.pool")) == null);
-}
-
-test "admission by the dispatch rows" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const k1 = [_]u8{2} ++ [_]u8{1} ** 32;
-    const k2 = [_]u8{3} ++ [_]u8{2} ** 32;
-    var r1 = cbor.MapBuilder.init(a);
-    try r1.put("transport", cbor.string("mailbox"));
-    try r1.put("sender", .{ .bytes = &k1 });
-    try r1.put("address", cbor.string("demo"));
-    var r2 = cbor.MapBuilder.init(a);
-    try r2.put("transport", cbor.string("mailbox"));
-    try r2.put("sender", cbor.string("*"));
-    try r2.put("address", cbor.string("open"));
-    var r3 = cbor.MapBuilder.init(a);
-    try r3.put("transport", cbor.string("http"));
-    try r3.put("sender", cbor.string("*"));
-    try r3.put("address", cbor.string("other"));
-    var in = cbor.MapBuilder.init(a);
-    try in.put("dispatch", .{ .array = &.{ r1.value(), r2.value(), r3.value() } });
-    const v = in.value();
-    try std.testing.expect(admitted(v, &k1, "demo"));
-    try std.testing.expect(!admitted(v, &k2, "demo"));
-    try std.testing.expect(!admitted(v, null, "demo"));
-    try std.testing.expect(admitted(v, null, "open"));
-    try std.testing.expect(admitted(v, &k2, "open"));
-    try std.testing.expect(!admitted(v, &k1, "other"));
 }
 
 test "withField" {
