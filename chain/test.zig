@@ -234,6 +234,45 @@ test "beefOf: an unproven child goes out over its proven parent; once proven, al
     try std.testing.expectEqual(lib.state.Status.proven, (try st2.ingest(bytes)).status);
 }
 
+test "ingest: a Subject BEEF (BRC-233) — its subject, not the last; a transaction beside it that is no ancestor; each still checked" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    const deploy = try spend(a, &w.fund.tx, 0, 9_000);
+    const icon = try spend(a, &w.fund.tx, 1, 9_000);
+    var b = try beef.parse(a, try beefOf(a, &.{.{ w.fund, 1 }}, &.{ deploy, icon }));
+    b.atomic = deploy.txid;
+    b.form = .subject;
+    const bytes = try beef.serialize(a, b);
+    try std.testing.expectEqualSlices(u8, &.{ 0x57, 0x09, 0xbe, 0xef }, bytes[0..4]);
+    const back = try beef.parse(a, bytes);
+    try std.testing.expectEqual(beef.Form.subject, back.formOf());
+    try std.testing.expectEqualSlices(u8, &deploy.txid, &back.subject().?);
+    const got = try w.st.ingest(bytes);
+    try std.testing.expectEqualSlices(u8, &lib.store.hashCid(.tx, deploy.txid), got.tx);
+    try std.testing.expectEqual(@as(usize, 2), got.registered.len);
+    // A V1 inside, or a subject not in it: not a Subject BEEF.
+    var v1 = b;
+    v1.version = beef.V1;
+    try std.testing.expectError(error.InvalidBeef, beef.serialize(a, v1));
+    const in_v1 = try std.mem.concat(a, u8, &.{ bytes[0..36], try beef.serialize(a, .{ .version = beef.V1, .bumps = b.bumps, .entries = b.entries }) });
+    try std.testing.expectError(error.InvalidBeef, beef.parse(a, in_v1));
+    var missing = b;
+    missing.atomic = .{0x99} ** 32;
+    try std.testing.expectError(error.InvalidBeef, beef.parse(a, try beef.serialize(a, missing)));
+    // Each transaction still passes the BRC-62 check: one whose input is neither proven nor in the bag fails.
+    var ms2 = lib.store.MemStore.init(std.testing.allocator);
+    defer ms2.deinit();
+    var w2 = try world(a, ms2.store(), 2);
+    var orphan = b;
+    orphan.bumps = &.{};
+    orphan.entries = b.entries[1..];
+    try std.testing.expect(if (w2.st.ingest(try beef.serialize(a, orphan))) |_| false else |_| true);
+}
+
 test "a rejection walks the spends; a proven competing spend is a double spend; never mined stays unproven" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -329,9 +368,9 @@ test "a reorg turns a proven transaction back to unproven, its broadcast registe
     _ = try st3.save();
 }
 
-/// The pointer record the door would write for `bytes` (skein kernel-zig/src/beef.zig `record`),
-/// its blocks put: each transaction under its txid, each BUMP's bytes as a raw block.
-fn pointerOf(a: std.mem.Allocator, s: lib.store.Store, bytes: []const u8) ![]const u8 {
+/// The envelope the door would put for `bytes` (skein kernel-zig/src/beef.zig `envelope`), its
+/// pointer record and blocks put: each transaction under its txid, each BUMP's bytes as a raw block.
+fn envelopeOf(a: std.mem.Allocator, s: lib.store.Store, bytes: []const u8) !lib.cbor.Value {
     const cbor = lib.cbor;
     const b = try beef.parse(a, bytes);
     const txs = try a.alloc(cbor.Value, b.entries.len);
@@ -360,21 +399,25 @@ fn pointerOf(a: std.mem.Allocator, s: lib.store.Store, bytes: []const u8) ![]con
             .{ .key = "proves", .value = .{ .array = &.{} } },
         }) };
     }
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.appendSlice(a, &.{
+    const rc = try s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "kind", .value = .{ .text = "beef" } },
-        .{ .key = "form", .value = .{ .text = if (b.vout != null) "outpoint" else if (b.atomic != null) "atomic" else "beef" } },
         .{ .key = "version", .value = .{ .uint = if (b.version == beef.V1) 1 else 2 } },
-        .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &lib.store.hashCid(.tx, b.subject().?)) } },
         .{ .key = "txs", .value = .{ .array = txs } },
         .{ .key = "marks", .value = .{ .array = marks } },
         .{ .key = "bumps", .value = .{ .array = bumps } },
+    }) });
+    const form = b.formOf();
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "form", .value = .{ .text = @tagName(form) } },
+        .{ .key = "beef", .value = .{ .cid = rc } },
     });
+    if (form != .beef) try es.append(a, .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &lib.store.hashCid(.tx, b.atomic.?)) } });
     if (b.vout) |o| try es.append(a, .{ .key = "vout", .value = .{ .uint = o } });
-    return s.putValue(a, .{ .map = es.items });
+    return .{ .map = es.items };
 }
 
-test "record: beefOf gives back the exact bytes of every form (V2 Atomic, V1, Outpoint, V2 with a txid-only entry)" {
+test "record: wireOf gives back the exact bytes of every form (V2 Atomic, V1, Outpoint, V2 with a txid-only entry, Subject)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -395,14 +438,24 @@ test "record: beefOf gives back the exact bytes of every form (V2 Atomic, V1, Ou
     const es = try a.dupe(beef.Entry, parsed.entries);
     es[0] = .{ .txid = fund.txid, .format = .txid_only };
     txid_only.entries = es;
-    for ([_][]const u8{ atomic, try beef.serialize(a, v1), try beef.serialize(a, outpoint), try beef.serialize(a, txid_only) }) |wire| {
-        const rc = try pointerOf(a, s, wire);
-        try std.testing.expectEqualSlices(u8, wire, try lib.record.beefOf(a, s, rc));
-        const got = try lib.record.parsed(a, s, rc);
+    var subject = parsed;
+    subject.form = .subject;
+    for ([_][]const u8{ atomic, try beef.serialize(a, v1), try beef.serialize(a, outpoint), try beef.serialize(a, txid_only), try beef.serialize(a, subject) }) |wire| {
+        const env = try envelopeOf(a, s, wire);
+        try std.testing.expectEqualSlices(u8, wire, try lib.record.wireOf(a, s, env));
+        const got = try lib.record.parsed(a, s, env);
         try std.testing.expectEqualSlices(u8, &child.txid, &got.subject().?);
+        const e = lib.record.envelopeOf(env).?;
+        try std.testing.expectEqualSlices(u8, &child.txid, &lib.record.subjectOf(e, try s.getValue(a, e.beef)).?);
     }
     const op = try beef.parse(a, try beef.serialize(a, outpoint));
     try std.testing.expectEqual(@as(?u32, 1), op.vout);
+    // Atomic and Subject over one BEEF: one pointer record, the BEEF alone.
+    const ea = lib.record.envelopeOf(try envelopeOf(a, s, atomic)).?;
+    const es2 = lib.record.envelopeOf(try envelopeOf(a, s, try beef.serialize(a, subject))).?;
+    try std.testing.expectEqualSlices(u8, ea.beef, es2.beef);
+    try std.testing.expectEqual(beef.Form.subject, es2.form);
+    try std.testing.expectEqualSlices(u8, atomic[36..], try lib.record.beefOf(a, s, ea.beef));
     // Not a pointer record: refused.
     try std.testing.expectError(error.NotARecord, lib.record.encode(a, s, .{ .map = &.{} }));
 }

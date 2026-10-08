@@ -552,7 +552,8 @@ pub const State = struct {
         }
     };
 
-    /// Ingest a BEEF (V1, V2 or Atomic; its subject the atomic txid, else the last transaction): SPV
+    /// Ingest a BEEF (V1, V2, Atomic, Outpoint or Subject — BRC-233, its other transactions any; its
+    /// subject the envelope's txid, else the last transaction): SPV
     /// against our chain (every BUMP's root our header's at its height; every unproven transaction's
     /// inputs held or earlier in the BEEF, their scripts verified), then every transaction it carries
     /// recorded, every proof it carries put, and each one left unproven registered for broadcast
