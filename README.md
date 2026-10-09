@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.10.0**, Zig 0.16.0.
+**0.11.0**, Zig 0.16.0.
 
 ## What it is
 
@@ -208,6 +208,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.11.0 | the BEEF envelope beside the pointer record (shruggr/skein#146): the pointer record `{kind: "beef", version, txs, marks, bumps}` is the BEEF alone, no form/subject/vout; the envelope `{form, beef, subject?, vout?}` sits beside it where the bytes were; Subject BEEF (BRC-233) is one more form, `"subject"`; `record.subjectOf(env, rec)`, `record.parsed(env)`, `record.wireOf(env)` take the envelope; `record.beefOf(record)` is the BEEF without envelope |
 | 0.10.0 | the wallet takes caller-supplied inputs (shruggr/skein#93): createAction `inputs` (`outpoint`, `unlockingScript` or `unlockingScriptLength`, `inputDescription`, `sequenceNumber`) and `inputBEEF`; a signable draft when any input lacks its script; signAction `spends`; fee and change over caller and wallet inputs together; the builder signs only the wallet's own inputs |
 | 0.9.0 | routes, filters, roles (shruggr/skein#143): `filter`, the module a filter answers with (`{reject}`, `{answer}`, `{pass}`); `app`: no `admitted`, no `not-admitted` — the `/call` route no longer reads the dispatch rows' senders (there are none): the kernel's filters and gate admit the caller before the handler runs; no `owner` anywhere in the step or call input |
 | 0.8.0 | chain `image` (shruggr/skein#132): the header-chain layout of an image tree — `chain/headers/<first height, 8 digits>` blocks of 2016 raw headers in height order, `chain/tip` `{height, hash}` — `find`, `load` (fills an empty state's `headers` and `heights` from it, verified from genesis as `Chain.add` verifies: genesis, links, targets, proof of work) and `write`; `mst` `Forest.build` (a map from sorted entries in one pass, its nodes handed to a sink as made: the same root as putting them); `MemStore` holds git-raw objects; `Maps.sink` |
