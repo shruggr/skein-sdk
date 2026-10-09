@@ -621,19 +621,27 @@ test "vectors: spends signed through the oracle — frames, sighash, fee, change
     for (arr(v, "cases")) |c| {
         var vo = VectorOracle{};
         var inputs: std.ArrayList(lib.builder.Input) = .empty;
+        var ours: usize = 0;
         for (arr(c, "inputs")) |in| {
-            try vo.frames.put(a, str(in, "getPublicKeyFrame"), str(in, "getPublicKeyResult"));
-            try vo.frames.put(a, str(in, "createSignatureFrame"), str(in, "createSignatureResult"));
             const src = try bsvz.transaction.Transaction.parse(a, try unhex(a, str(in, "sourceTx")));
             const vout: u32 = @intCast(int(in, "vout"));
             try std.testing.expectEqualStrings(str(in, "lockingScript"), try hexOf(a, src.outputs[vout].locking_script.bytes));
-            try inputs.append(a, .{
+            var input = lib.builder.Input{
                 .source_txid = try hdr.fromHex(str(in, "sourceTxid")),
                 .vout = vout,
                 .satoshis = @intCast(int(in, "satoshis")),
                 .locking_script = src.outputs[vout].locking_script.bytes,
-                .key = try keyOf(in),
-            });
+            };
+            if (in.object.get("caller")) |cu| {
+                // #93: a caller's input, estimated at its unlockingScriptLength; no oracle call of ours.
+                input.unlocking_script_length = @intCast(int(cu, "unlockingScriptLength"));
+            } else {
+                try vo.frames.put(a, str(in, "getPublicKeyFrame"), str(in, "getPublicKeyResult"));
+                try vo.frames.put(a, str(in, "createSignatureFrame"), str(in, "createSignatureResult"));
+                input.key = try keyOf(in);
+                ours += 1;
+            }
+            try inputs.append(a, input);
         }
         const ch = c.object.get("change").?;
         try vo.frames.put(a, str(ch, "getPublicKeyFrame"), str(ch, "getPublicKeyResult"));
@@ -642,13 +650,40 @@ test "vectors: spends signed through the oracle — frames, sighash, fee, change
         const rate: u64 = @intCast(int(c, "satsPerKb"));
 
         var ws = lib.builder.WireSigner{ .ctx = &vo, .call = VectorOracle.call };
+        if (ours < inputs.items.len) {
+            // #93, as createAction then signAction: a signable draft first (a caller's input
+            // without its script cannot be signed for), then the caller's own unlock — its
+            // createSignature (the existing oracle call, its own protocol and keyID) over its
+            // input's sighash in the draft — handed back as the spend.
+            try std.testing.expectError(error.MissingUnlockingScript, lib.builder.build(a, ws.signer(), inputs.items, outputs.items, try keyOf(ch), rate, true));
+            const draft = try lib.builder.build(a, ws.signer(), inputs.items, outputs.items, try keyOf(ch), rate, false);
+            try std.testing.expectEqual(@as(u64, @intCast(int(c, "fee"))), draft.fee);
+            for (arr(c, "inputs"), inputs.items, 0..) |jin, *in, i| {
+                const cu = jin.object.get("caller") orelse continue;
+                const d = try bsvz.transaction.sighash.digest(a, &draft.tx, i, bsvz.script.Script.init(in.locking_script), @intCast(in.satoshis), lib.builder.sighash_all_forkid);
+                try std.testing.expectEqualStrings(str(jin, "sighash"), try hexOf(a, &d.bytes));
+                const frame = try lib.wire.createSignatureFrame(a, @intCast(int(cu, "securityLevel")), str(cu, "protocol"), str(cu, "keyID"), .self, d.bytes);
+                try std.testing.expectEqualStrings(str(cu, "createSignatureFrame"), try hexOf(a, frame));
+                const der = try lib.wire.signatureResult(try unhex(a, str(cu, "createSignatureResult")));
+                var unlock: std.ArrayList(u8) = .empty; // <DER ‖ ALL|FORKID>: go-sdk's PushDrop unlock
+                try unlock.append(a, @intCast(der.len + 1));
+                try unlock.appendSlice(a, der);
+                try unlock.append(a, @intCast(lib.builder.sighash_all_forkid));
+                try std.testing.expectEqualStrings(str(jin, "unlockingScript"), try hexOf(a, unlock.items));
+                // Longer than it said it would be: refused (the fee was paid for that length).
+                in.unlocking_script = try a.alloc(u8, in.unlocking_script_length + 1);
+                try std.testing.expectError(error.UnlockingScriptTooLong, lib.builder.build(a, ws.signer(), inputs.items, outputs.items, try keyOf(ch), rate, true));
+                in.unlocking_script = unlock.items;
+            }
+            vo.calls = 0;
+        }
         const built = try lib.builder.build(a, ws.signer(), inputs.items, outputs.items, try keyOf(ch), rate, true);
         try std.testing.expectEqual(@as(u64, @intCast(int(c, "fee"))), built.fee);
         const cs = ch.object.get("satoshis").?;
         if (cs == .null) try std.testing.expect(built.change == null) else try std.testing.expectEqual(@as(u64, @intCast(cs.integer)), built.change.?.satoshis);
         try std.testing.expectEqualStrings(str(c, "tx"), try hexOf(a, built.raw));
         try std.testing.expectEqualStrings(str(c, "txid"), &hdr.toHex(built.txid));
-        try std.testing.expectEqual(1 + 2 * inputs.items.len, vo.calls);
+        try std.testing.expectEqual(1 + 2 * ours, vo.calls);
         // The preimage and sighash, and each input's script, checked here too.
         for (arr(c, "inputs"), inputs.items, 0..) |jin, in, i| {
             const pre = try bsvz.transaction.sighash.formatPreimage(a, &built.tx, i, bsvz.script.Script.init(in.locking_script), @intCast(in.satoshis), lib.builder.sighash_all_forkid);
