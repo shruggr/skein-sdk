@@ -1,5 +1,5 @@
 {
-  "about": "The builder's spends signed through a ProtoWallet oracle (go-sdk), every call as a BRC-100 wire frame: getPublicKey (call 8; protocol [2, \"3241645161d8\"], keyID, counterparty the sender or self, forSelf) for each input's and the change key, createSignature (call 15) with hashToDirectlySign = CalcInputSignatureHash(i, ALL|FORKID). Inputs spend vout 1 of their source; outputs in order, then the change (P2PKH to the change key) unless the change is zero. Fee: SatoshisPerKilobyte over the size with 106-byte P2PKH unlocking estimates, change included. Every input verified by go-sdk's interpreter.",
+  "about": "The builder's spends signed through a ProtoWallet oracle (go-sdk), every call as a BRC-100 wire frame: getPublicKey (call 8; protocol [2, \"3241645161d8\"], keyID, counterparty the sender or self, forSelf) for each input's and the change key, createSignature (call 15) with hashToDirectlySign = CalcInputSignatureHash(i, ALL|FORKID). Inputs spend vout 1 of their source; outputs in order, then the change (P2PKH to the change key) unless the change is zero. Fee: SatoshisPerKilobyte over the size with 106-byte P2PKH unlocking estimates, change included. A caller-supplied input (`caller`, #93: BRC-100 createAction inputs) is not the wallet's to sign: it is estimated at its unlockingScriptLength, and its unlocking script is the caller's own (createSignature over its own key and the same sighash), handed in as a signAction spend. Every input verified by go-sdk's interpreter.",
   "cases": [
     {
       "name": "one-payment-in",
@@ -202,6 +202,70 @@
       "fee": 4593,
       "tx": "0100000002e91a220650ab565acf639df6835b831dff9d3d396a1ccb439cb96cb4a77056fd010000006a47304402202f77f5c7b43115b0ad9bfb36c48088c37e625dac735c5d844a7b71b2ac99852f02201d7094d01eba3366014ad06e9dd343931d29a1a0ace0296bb65f7803e17410c2412102e959fcbd381c3d8ae4dbc9dae03fcbb0f9fc6120d0b9ddf96a5ff954f16fef33ffffffffd46b46538b0517a8f7238c2564fc79d18612f60084ea123cf6d98c66acf384b4010000006b4830450221009bdc277333f73898f6545eb36783decb4f5104c518a93f7de33b4025c5c27ab70220153e65ecf89736e10e4f730932eb67e92b6542a5c3861571e1097226ecdb4f5c4121023e032009adf6d04cdff68c47d56e6b405daafe7c8cb132bfe38775450088f6f6ffffffff0288130000000000001976a914dd495107c823cecd0e074689a80476ca9fdb85c388ac7c0d0000000000001976a9140715191bf103812309d752df84cfa27c3c517e3388ac00000000",
       "txid": "78f32bf5984b5e2bd02f03085ec02ceee708ed409436052d219bd9cd12685532"
+    },
+    {
+      "name": "caller-pushdrop-in",
+      "satsPerKb": 100,
+      "inputs": [
+        {
+          "caller": {
+            "securityLevel": 2,
+            "protocol": "skein name",
+            "keyID": "1",
+            "counterparty": "self",
+            "fields": [
+              "736b65696e",
+              "6e616d652d7631"
+            ],
+            "unlockingScriptLength": 73,
+            "createSignatureFrame": "0f00020a736b65696e206e616d6501310b00ff02590076a9d33ed3bfa80afb8885f68739f514cbba43dc470a95ae4d12e742393300",
+            "createSignatureResult": "00304402204d87c53045910014bc23f2c3eac853a93643a1f24a367ae33be7c8ec0bca4b2502202f6ab7651e77aa65146c2787cb442d61be9f559bba5e8cf867debc4d4699fb11"
+          },
+          "sourceTx": "0100000001875800c47c39c44b03caa9b8bf69178c4bcb0b95000000000000000000000000000000000151ffffffff02e803000000000000016a01000000000000007b21035e50f713c4de06697d87fc6702730aa17967103473ca4bbb98a2b0e7347a4bb5ac05736b65696e076e616d652d7631473045022100bddf039015457228832a93bc35088ad156b025ba062d7ce5da7a82a7571fc289022003ff59e39b3e718f80f51cbf828091320bc357506163e99b9f3159bb980afedc6d7500000000",
+          "sourceTxid": "764f4c2d960815045460d86fe7315fe889734e34a8baf47a41d54356bbf5bb88",
+          "vout": 1,
+          "satoshis": 1,
+          "lockingScript": "21035e50f713c4de06697d87fc6702730aa17967103473ca4bbb98a2b0e7347a4bb5ac05736b65696e076e616d652d7631473045022100bddf039015457228832a93bc35088ad156b025ba062d7ce5da7a82a7571fc289022003ff59e39b3e718f80f51cbf828091320bc357506163e99b9f3159bb980afedc6d75",
+          "preimage": "01000000ca25d69424db418c8d04e3dc327f7513cff9448c7716e3ae4a2b92bae94a65e8752adad0a7b9ceca853768aebb6965eca126a62965f698a0c1bc43d83db632ad88bbf5bb5643d5417af4baa8344e7389e85f31e76fd86054041508962d4c4f76010000007b21035e50f713c4de06697d87fc6702730aa17967103473ca4bbb98a2b0e7347a4bb5ac05736b65696e076e616d652d7631473045022100bddf039015457228832a93bc35088ad156b025ba062d7ce5da7a82a7571fc289022003ff59e39b3e718f80f51cbf828091320bc357506163e99b9f3159bb980afedc6d750100000000000000ffffffff6c91c4ac7b1bcf50947d9adce6f4664f0691e619d847a4389130a8a5e6bfacab0000000041000000",
+          "sighash": "590076a9d33ed3bfa80afb8885f68739f514cbba43dc470a95ae4d12e7423933",
+          "unlockingScript": "47304402204d87c53045910014bc23f2c3eac853a93643a1f24a367ae33be7c8ec0bca4b2502202f6ab7651e77aa65146c2787cb442d61be9f559bba5e8cf867debc4d4699fb1141"
+        },
+        {
+          "keyID": "cHJlZml4NA== c3VmZml4NA==",
+          "counterparty": "036054306b4303e155ed77befd55cf9533d2bfb82b32688ebd1d30071569b07cc3",
+          "sourceTx": "0100000001ecc29373ec0c33663179b146e273193ccb39762f000000000000000000000000000000000151ffffffff02e803000000000000016a88130000000000001976a914b54df4f8d0e2205e450ca2fb2c91a301c91312b388ac00000000",
+          "sourceTxid": "ddc615fcb967ceae5b329dc33702c361844325ba8ed6095439c555f2526b1945",
+          "vout": 1,
+          "satoshis": 5000,
+          "lockingScript": "76a914b54df4f8d0e2205e450ca2fb2c91a301c91312b388ac",
+          "getPublicKeyFrame": "080000020c3332343136343531363164381963484a6c5a6d6c344e413d3d206333566d5a6d6c344e413d3d036054306b4303e155ed77befd55cf9533d2bfb82b32688ebd1d30071569b07cc300ff0100",
+          "getPublicKeyResult": "0002684b3ad18547d2709f97632426188944851647d4c00d12d4fc6ef16da61831da",
+          "publicKey": "02684b3ad18547d2709f97632426188944851647d4c00d12d4fc6ef16da61831da",
+          "preimage": "01000000ca25d69424db418c8d04e3dc327f7513cff9448c7716e3ae4a2b92bae94a65e8752adad0a7b9ceca853768aebb6965eca126a62965f698a0c1bc43d83db632ad45196b52f255c5395409d68eba25438461c30237c39d325baece67b9fc15c6dd010000001976a914b54df4f8d0e2205e450ca2fb2c91a301c91312b388ac8813000000000000ffffffff6c91c4ac7b1bcf50947d9adce6f4664f0691e619d847a4389130a8a5e6bfacab0000000041000000",
+          "sighash": "6367eb5c0e0eab1d7e1a79f240af434383864b062822104d3d4b6a5994cc68ad",
+          "createSignatureFrame": "0f00020c3332343136343531363164381963484a6c5a6d6c344e413d3d206333566d5a6d6c344e413d3d036054306b4303e155ed77befd55cf9533d2bfb82b32688ebd1d30071569b07cc300ff026367eb5c0e0eab1d7e1a79f240af434383864b062822104d3d4b6a5994cc68ad00",
+          "createSignatureResult": "003045022100e5617cf67d925aa408e467fd6ce2c06bf5b5ec0b82bf7778eeb9cdcab2c072a502206c9a3d37283b81213179d146ae3cdf1875703269955eafabf2915b95703b15a3",
+          "unlockingScript": "483045022100e5617cf67d925aa408e467fd6ce2c06bf5b5ec0b82bf7778eeb9cdcab2c072a502206c9a3d37283b81213179d146ae3cdf1875703269955eafabf2915b95703b15a3412102684b3ad18547d2709f97632426188944851647d4c00d12d4fc6ef16da61831da"
+        }
+      ],
+      "outputs": [
+        {
+          "satoshis": 1,
+          "lockingScript": "2103d219a3bac2a64b914e1b75d8dee4f82c947959c4621b6deb0fe0673f85651587ac05736b65696e076e616d652d7632473045022100e24edb21f5ee9508b206b0062a2fc8b2d5bc5175bf0af8b21fa30ab4896e8bcc0220533595ab549aa52869d9cb5757c685c12cef81320e1fd54c02ce8d25a343f3576d75"
+        }
+      ],
+      "change": {
+        "keyID": "Y2g= NA==",
+        "counterparty": "self",
+        "getPublicKeyFrame": "080000020c333234313634353136316438095932673d204e413d3d0b00ff0100",
+        "getPublicKeyResult": "00028368689153a3011609117801d2b70c539ec3b6ba9ca34ae97c329536ddff1797",
+        "publicKey": "028368689153a3011609117801d2b70c539ec3b6ba9ca34ae97c329536ddff1797",
+        "lockingScript": "76a914fc4d4c4f11470b4cbab9e0353eb26cf584a6c55f88ac",
+        "satoshis": 4956
+      },
+      "fee": 44,
+      "tx": "010000000288bbf5bb5643d5417af4baa8344e7389e85f31e76fd86054041508962d4c4f76010000004847304402204d87c53045910014bc23f2c3eac853a93643a1f24a367ae33be7c8ec0bca4b2502202f6ab7651e77aa65146c2787cb442d61be9f559bba5e8cf867debc4d4699fb1141ffffffff45196b52f255c5395409d68eba25438461c30237c39d325baece67b9fc15c6dd010000006b483045022100e5617cf67d925aa408e467fd6ce2c06bf5b5ec0b82bf7778eeb9cdcab2c072a502206c9a3d37283b81213179d146ae3cdf1875703269955eafabf2915b95703b15a3412102684b3ad18547d2709f97632426188944851647d4c00d12d4fc6ef16da61831daffffffff0201000000000000007b2103d219a3bac2a64b914e1b75d8dee4f82c947959c4621b6deb0fe0673f85651587ac05736b65696e076e616d652d7632473045022100e24edb21f5ee9508b206b0062a2fc8b2d5bc5175bf0af8b21fa30ab4896e8bcc0220533595ab549aa52869d9cb5757c685c12cef81320e1fd54c02ce8d25a343f3576d755c130000000000001976a914fc4d4c4f11470b4cbab9e0353eb26cf584a6c55f88ac00000000",
+      "txid": "4c11e178bb7854dd92343c30d9142b191864ec8ad7a3c624ed03ef6cc9733fd9"
     }
   ],
   "identityKey": "0210ef9d341707c4bf705f27eed0c392dfdc69e009434f17f5617d8b3a51974dd3",

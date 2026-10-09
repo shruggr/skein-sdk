@@ -9,6 +9,13 @@
 //! BIP143/ForkID sighash (ALL|FORKID) as hashToDirectlySign — the oracle
 //! never sees anything but a key reference and a 32-byte hash, and nothing
 //! here holds a key. Vectors: vectors/signing.json (go-sdk ProtoWallet).
+//!
+//! A caller's input (#93, BRC-100 createAction `inputs`) is not ours to sign:
+//! no key, its unlocking script is the caller's (given at createAction or as
+//! a signAction spend), estimated for the fee at its unlockingScriptLength.
+//! It counts toward the inputs' total like any other; the wallet signs only
+//! its own (each sighash is BIP143's, which commits to no other input's
+//! unlocking script, so the order of signing does not matter).
 const std = @import("std");
 const bsvz = @import("bsvz");
 const wire = @import("wire.zig");
@@ -64,7 +71,14 @@ pub const Input = struct {
     vout: u32,
     satoshis: u64,
     locking_script: []const u8,
-    key: Key,
+    /// Ours: the BRC-29 key the oracle signs this P2PKH input with. Null: a caller's input.
+    key: ?Key = null,
+    /// A caller's input: its unlocking script, once given.
+    unlocking_script: ?[]const u8 = null,
+    /// The unlocking script's length for the fee: P2PKH's estimate for ours, the caller's
+    /// unlockingScriptLength (or its script's length) for a caller's.
+    unlocking_script_length: usize = p2pkh_unlock_estimate,
+    sequence: u32 = 0xffffffff,
 };
 
 pub const Output = struct { satoshis: u64, locking_script: []const u8 };
@@ -83,12 +97,22 @@ pub fn feeFor(tx: *const Transaction, sats_per_kb: u64) !u64 {
     return model.computeFee(tx);
 }
 
-/// The fee for these inputs and outputs (change included), unsigned.
+/// The fee for `n_inputs` of ours (P2PKH) and these outputs (change included), unsigned.
 pub fn estimateFee(arena: std.mem.Allocator, n_inputs: usize, outputs: []const Output, change_script_len: usize, sats_per_kb: u64) !u64 {
-    const placeholder = try arena.alloc(u8, p2pkh_unlock_estimate);
-    @memset(placeholder, 0);
-    const ins = try arena.alloc(bsvz.transaction.Input, n_inputs);
-    for (ins) |*in| in.* = .{ .previous_outpoint = .{ .txid = .zero(), .index = 0 }, .unlocking_script = Script.init(placeholder), .sequence = 0xffffffff };
+    const ins = try arena.alloc(Input, n_inputs);
+    for (ins) |*in| in.* = .{ .source_txid = @splat(0), .vout = 0, .satoshis = 0, .locking_script = &.{} };
+    return estimateFeeFor(arena, ins, outputs, change_script_len, sats_per_kb);
+}
+
+/// The fee for these inputs (each at its unlocking script's length) and
+/// outputs (change included), unsigned.
+pub fn estimateFeeFor(arena: std.mem.Allocator, inputs: []const Input, outputs: []const Output, change_script_len: usize, sats_per_kb: u64) !u64 {
+    const ins = try arena.alloc(bsvz.transaction.Input, inputs.len);
+    for (inputs, ins) |src, *in| {
+        const placeholder = try arena.alloc(u8, src.unlocking_script_length);
+        @memset(placeholder, 0);
+        in.* = .{ .previous_outpoint = .{ .txid = .zero(), .index = 0 }, .unlocking_script = Script.init(placeholder), .sequence = src.sequence };
+    }
     const outs = try arena.alloc(bsvz.transaction.Output, outputs.len + 1);
     for (outputs, outs[0..outputs.len]) |o, *x| x.* = .{ .satoshis = @intCast(o.satoshis), .locking_script = Script.init(o.locking_script) };
     const cs = try arena.alloc(u8, change_script_len);
@@ -98,13 +122,47 @@ pub fn estimateFee(arena: std.mem.Allocator, n_inputs: usize, outputs: []const O
     return feeFor(&tx, sats_per_kb);
 }
 
+/// The caller's inputs, then ours from `funding` (largest first, as given)
+/// until they cover the outputs and the fee over all of them (a P2PKH change
+/// output included). None of ours when the caller's cover it; a funding coin
+/// the caller names is not taken twice.
+pub fn select(arena: std.mem.Allocator, caller: []const Input, funding: []const Input, outputs: []const Output, sats_per_kb: u64) ![]Input {
+    var all: std.ArrayList(Input) = .empty;
+    try all.appendSlice(arena, caller);
+    var need: u64 = 0;
+    for (outputs) |o| need += o.satoshis;
+    var have: u64 = 0;
+    for (caller) |in| have += in.satoshis;
+    var i: usize = 0;
+    while (true) {
+        if (all.items.len > 0 and have >= need + try estimateFeeFor(arena, all.items, outputs, 25, sats_per_kb)) return all.items;
+        while (i < funding.len) : (i += 1) {
+            const f = funding[i];
+            const named = for (caller) |c| {
+                if (c.vout == f.vout and std.mem.eql(u8, &c.source_txid, &f.source_txid)) break true;
+            } else false;
+            if (!named) break;
+        }
+        if (i == funding.len) return error.InsufficientFunds;
+        try all.append(arena, funding[i]);
+        have += funding[i].satoshis;
+        i += 1;
+    }
+}
+
 /// Build and sign: inputs in order, the outputs in order, then the change
-/// (P2PKH to `change_key`) unless it comes to zero.
+/// (P2PKH to `change_key`) unless it comes to zero. With `sign`, every input
+/// of ours is signed and every caller's input must carry its unlocking
+/// script; without, a signable draft (ours unsigned, the caller's as given).
 pub fn build(arena: std.mem.Allocator, signer: Signer, inputs: []const Input, outputs: []const Output, change_key: Key, sats_per_kb: u64, sign: bool) !Built {
     if (inputs.len == 0) return error.NoInputs;
+    for (inputs) |in| if (in.key == null) {
+        if (in.unlocking_script) |u| if (u.len > in.unlocking_script_length) return error.UnlockingScriptTooLong;
+        if (sign and in.unlocking_script == null) return error.MissingUnlockingScript;
+    };
     const change_pub = try signer.publicKey(arena, change_key);
     const change_script = try arena.dupe(u8, &brc29.p2pkh(change_pub));
-    const fee = try estimateFee(arena, inputs.len, outputs, change_script.len, sats_per_kb);
+    const fee = try estimateFeeFor(arena, inputs, outputs, change_script.len, sats_per_kb);
     var total_in: u64 = 0;
     for (inputs) |in| total_in += in.satoshis;
     var total_out: u64 = 0;
@@ -115,8 +173,8 @@ pub fn build(arena: std.mem.Allocator, signer: Signer, inputs: []const Input, ou
     const ins = try arena.alloc(bsvz.transaction.Input, inputs.len);
     for (inputs, ins) |in, *x| x.* = .{
         .previous_outpoint = .{ .txid = .{ .bytes = in.source_txid }, .index = in.vout },
-        .unlocking_script = Script.empty(),
-        .sequence = 0xffffffff,
+        .unlocking_script = if (in.key == null) Script.init(in.unlocking_script orelse &.{}) else Script.empty(),
+        .sequence = in.sequence,
     };
     const n_out = outputs.len + @as(usize, if (change > 0) 1 else 0);
     const outs = try arena.alloc(bsvz.transaction.Output, n_out);
@@ -124,12 +182,13 @@ pub fn build(arena: std.mem.Allocator, signer: Signer, inputs: []const Input, ou
     if (change > 0) outs[outputs.len] = .{ .satoshis = @intCast(change), .locking_script = Script.init(change_script) };
     var tx = Transaction{ .version = 1, .inputs = ins, .outputs = outs, .lock_time = 0 };
 
-    // Sign each input through the oracle (unless building a signable draft).
+    // Sign each input of ours through the oracle (unless building a signable draft).
     if (sign) for (inputs, 0..) |in, i| {
-        const pub_key = try signer.publicKey(arena, in.key);
+        const key = in.key orelse continue;
+        const pub_key = try signer.publicKey(arena, key);
         if (!brc29.pays(in.locking_script, pub_key)) return error.NotOurKey;
         const digest = try bsvz.transaction.sighash.digest(arena, &tx, i, Script.init(in.locking_script), @intCast(in.satoshis), sighash_all_forkid);
-        const der = try signer.sign(arena, in.key, digest.bytes);
+        const der = try signer.sign(arena, key, digest.bytes);
         ins[i].unlocking_script = Script.init(try unlockingScript(arena, der, pub_key));
     };
     const raw = try tx.serialize(arena);
