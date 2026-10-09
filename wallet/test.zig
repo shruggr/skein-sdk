@@ -976,10 +976,85 @@ test "wallet: headers, a BRC-29 payment internalized from Atomic BEEF, spendable
     } }, signer.signer(), "Y2hhbmdl", "MQ==", 100);
     try std.testing.expect(d.reference != null);
     try std.testing.expectEqual(@as(usize, 1), try w7.mapCount("actions")); // nothing recorded yet
-    const signed = try w7.signAction(d.reference.?, signer.signer());
+    const signed = try w7.signAction(d.reference.?, &.{}, signer.signer());
     try std.testing.expectEqualSlices(u8, &c1.txid, &signed.txid);
     try std.testing.expectEqualStrings(state5, try w7.save());
-    try std.testing.expectError(error.InputSpent, w7.signAction(d.reference.?, signer.signer()));
+    try std.testing.expectError(error.InputSpent, w7.signAction(d.reference.?, &.{}, signer.signer()));
+    counts.wallet += 1;
+
+    // #93: caller-supplied inputs (BRC-100 createAction `inputs`, signAction `spends`). A coin of
+    // the caller's in a basket of ours, locked to a key the caller holds (P2PKH here; a PushDrop
+    // token is the same motion, vectors/signing.json "caller-pushdrop-in").
+    const holder_priv = [_]u8{0x44} ** 32;
+    const holder_pub = try lib.brc29.identityKey(holder_priv);
+    const holder_script = lib.brc29.p2pkh(holder_pub);
+    var w8 = try lib.wallet.Wallet.load(a, s, state1, .regtest);
+    const c8 = try w8.createAction(.{ .description = "the caller's coin", .outputs = &.{.{ .satoshis = 500, .locking_script = &holder_script, .basket = "names" }} }, signer.signer(), "bg==", "MQ==", 100);
+    const state8 = try w8.save();
+    const coin_spec = (try lib.wallet.decodeInputs(a, &.{.{ .map = &.{
+        .{ .key = "outpoint", .value = .{ .text = try std.fmt.allocPrint(a, "{s}.0", .{&hdr.toHex(c8.txid)}) } },
+        .{ .key = "unlockingScriptLength", .value = .{ .uint = 108 } }, // P2PKH at most: 1+73+1+33
+        .{ .key = "inputDescription", .value = .{ .text = "the name coin" } },
+    } }}))[0];
+    try std.testing.expectEqualSlices(u8, &c8.txid, &coin_spec.txid);
+    const Unlock = struct {
+        /// The caller's own unlock of input `i` of a signable draft: its own key, its own sighash.
+        fn of(arena: std.mem.Allocator, signable: []const u8, i: usize, lock: []const u8, sats: u64, priv: [32]u8) ![]const u8 {
+            const b = try beef.parse(arena, signable);
+            const tx = b.find(b.atomic.?).?.tx.?;
+            const digest = try bsvz.transaction.sighash.digest(arena, &tx, i, bsvz.script.Script.init(lock), @intCast(sats), lib.builder.sighash_all_forkid);
+            const sig = try (try bsvz.primitives.ec.PrivateKey.fromBytes(priv)).signDigest(digest.bytes);
+            return lib.builder.unlockingScript(arena, try arena.dupe(u8, sig.asSlice()), try lib.brc29.identityKey(priv));
+        }
+        fn verifyAll(arena: std.mem.Allocator, done: []const u8, prevs: []const bsvz.transaction.Output) !void {
+            const b = try beef.parse(arena, done);
+            const tx = b.find(b.atomic.?).?.tx.?;
+            try std.testing.expectEqual(prevs.len, tx.inputs.len);
+            for (prevs, 0..) |p, i| try std.testing.expect(try bsvz.script.interpreter.verifyPrevout(.{ .allocator = arena, .tx = &tx, .input_index = i, .previous_output = p, .unlocking_script = tx.inputs[i].unlocking_script }));
+        }
+    };
+    const coin_out = bsvz.transaction.Output{ .satoshis = 500, .locking_script = bsvz.script.Script.init(&holder_script) };
+
+    // More out than the coin holds: a funding input of ours after it; signable (no unlock yet).
+    var w9 = try lib.wallet.Wallet.load(a, s, state8, .regtest);
+    const funding = (try w9.listOutputs("default", false))[0];
+    const d9 = try w9.createAction(.{ .description = "spend the coin forward", .inputs = &.{coin_spec}, .outputs = &.{.{ .satoshis = 700, .locking_script = &payee_script }} }, signer.signer(), "ZQ==", "MQ==", 100);
+    try std.testing.expect(d9.reference != null);
+    try std.testing.expectEqual(@as(usize, 2), try w9.mapCount("actions")); // nothing recorded yet
+    const unlock9 = try Unlock.of(a, d9.beef, 0, &holder_script, 500, holder_priv);
+    try std.testing.expectError(error.MissingUnlockingScript, w9.signAction(d9.reference.?, &.{}, signer.signer()));
+    try std.testing.expectError(error.BadSpend, w9.signAction(d9.reference.?, &.{.{ .index = 1, .unlocking_script = unlock9 }}, signer.signer()));
+    const s9 = try w9.signAction(d9.reference.?, try lib.wallet.decodeSpends(a, .{ .map = &.{.{ .key = "0", .value = .{ .map = &.{.{ .key = "unlockingScript", .value = .{ .bytes = unlock9 } }} } }} }), signer.signer());
+    try Unlock.verifyAll(a, s9.beef, &.{ coin_out, .{ .satoshis = @intCast(funding.satoshis), .locking_script = bsvz.script.Script.init(funding.locking_script) } });
+    // The caller's output order kept, our change last; the coin spent, out of its basket.
+    const t9 = (try beef.parse(a, s9.beef)).find(s9.txid).?.tx.?;
+    try std.testing.expectEqual(@as(usize, 2), t9.outputs.len);
+    try std.testing.expectEqualSlices(u8, &payee_script, t9.outputs[0].locking_script.bytes);
+    try std.testing.expectEqual(@as(usize, 0), (try w9.listOutputs("names", false)).len);
+    try std.testing.expectError(error.InputSpent, w9.createAction(.{ .description = "twice", .inputs = &.{coin_spec}, .outputs = &.{.{ .satoshis = 1, .locking_script = &payee_script }} }, signer.signer(), "ZQ==", "Mw==", 100));
+    const fee9 = try lib.builder.estimateFeeFor(a, &.{ .{ .source_txid = c8.txid, .vout = 0, .satoshis = 500, .locking_script = &holder_script, .unlocking_script_length = 108 }, .{ .source_txid = funding.txid, .vout = funding.vout, .satoshis = funding.satoshis, .locking_script = funding.locking_script } }, &.{.{ .satoshis = 700, .locking_script = &payee_script }}, 25, 100);
+    try std.testing.expectEqual(500 + funding.satoshis - 700 - fee9, @as(u64, @intCast(t9.outputs[1].satoshis)));
+
+    // The coin covers the outputs and the fee: no input of ours at all, the change ours.
+    var w10 = try lib.wallet.Wallet.load(a, s, state8, .regtest);
+    const d10 = try w10.createAction(.{ .description = "the coin alone", .inputs = &.{coin_spec}, .outputs = &.{.{ .satoshis = 200, .locking_script = &payee_script }} }, signer.signer(), "ZQ==", "Mg==", 100);
+    const s10 = try w10.signAction(d10.reference.?, &.{.{ .index = 0, .unlocking_script = try Unlock.of(a, d10.beef, 0, &holder_script, 500, holder_priv) }}, signer.signer());
+    try Unlock.verifyAll(a, s10.beef, &.{coin_out});
+    try std.testing.expectEqual(@as(usize, 2), (try w10.listOutputs("default", false)).len); // c8's change and this change
+
+    // A coin from a transaction the wallet never held: its source in inputBEEF. A wallet with
+    // the chain and nothing else spends the payer's funding coin (its BEEF: a proven parent and
+    // the coin's transaction); the ancestry, SPV-checked, is held once signed.
+    var w11 = try lib.wallet.Wallet.load(a, s, null, .regtest);
+    _ = try w11.addHeaders(try slices(a, chain));
+    const fund_spec = lib.wallet.CreateInput{ .txid = fund.atomic.?, .vout = 0, .unlocking_script_length = 108 };
+    try std.testing.expectError(error.UnknownInput, w11.createAction(.{ .description = "no beef", .inputs = &.{fund_spec}, .outputs = &.{.{ .satoshis = 100, .locking_script = &payee_script }} }, signer.signer(), "Zg==", "MQ==", 100));
+    const d11 = try w11.createAction(.{ .description = "from inputBEEF", .inputs = &.{fund_spec}, .input_beef = try unhex(a, fund_hex), .outputs = &.{.{ .satoshis = 100, .locking_script = &payee_script }} }, signer.signer(), "Zg==", "MQ==", 100);
+    try std.testing.expectEqual(@as(usize, 3), (try beef.parse(a, d11.beef)).entries.len);
+    const s11 = try w11.signAction(d11.reference.?, &.{.{ .index = 0, .unlocking_script = try Unlock.of(a, d11.beef, 0, fund_tx.outputs[0].locking_script.bytes, @intCast(fund_tx.outputs[0].satoshis), payer_priv) }}, signer.signer());
+    try Unlock.verifyAll(a, s11.beef, &.{fund_tx.outputs[0]});
+    try std.testing.expectEqual(@as(usize, 3), try w11.mapCount("txs"));
+    try std.testing.expectEqual(@as(usize, 1), (try w11.listOutputs("default", false)).len);
     counts.wallet += 1;
 }
 
@@ -1190,7 +1265,7 @@ test "settlement: a rejection bubbles through spends and drafts; inputs freed; m
     try std.testing.expectEqual(@as(usize, 0), (try w.listOutputs("tokens", true)).len);
     try std.testing.expect(!(try w.map("unproven").has(&ca.txid)) and try w.map("rejected").has(&ca.txid));
     try std.testing.expect(!(try w.map("unproven").has(&cb.txid)) and try w.map("rejected").has(&cb.txid));
-    try std.testing.expectError(error.DraftRejected, w.signAction(d.reference.?, signer.signer()));
+    try std.testing.expectError(error.DraftRejected, w.signAction(d.reference.?, &.{}, signer.signer()));
     // The payment funds a new spend.
     const again = try w.createAction(.{ .description = "again", .outputs = &.{.{ .satoshis = 300, .locking_script = &payee }} }, signer.signer(), "Yw==", "MQ==", 100);
     try std.testing.expectEqualSlices(u8, &p.pay_txid, &(try beef.parse(a, again.beef)).find(again.txid).?.tx.?.inputs[0].previous_outpoint.txid.bytes);
