@@ -16,7 +16,7 @@ pub const store = @import("store.zig");
 pub const state = @import("state.zig");
 /// The header chain an image tree carries (shruggr/skein#132): its layout, `load` into an empty state, `write`.
 pub const image = @import("image.zig");
-/// The BEEF pointer record (shruggr/skein#121) and `beefOf`, its encoder.
+/// The BEEF envelope and pointer record (shruggr/skein#121, #146): `wireOf`, `beefOf`, the encoders.
 pub const record = @import("record.zig");
 /// bsvz itself, for programs built on this library.
 pub const bsvz = @import("bsvz");

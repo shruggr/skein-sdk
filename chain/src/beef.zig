@@ -1,4 +1,5 @@
-//! BEEF (BRC-62 V1, BRC-96 V2, BRC-95 Atomic, BRC-158 Outpoint): parse and serialize, keeping
+//! BEEF (BRC-62 V1, BRC-96 V2, BRC-95 Atomic, BRC-158 Outpoint, BRC-233 Subject): parse and
+//! serialize, keeping
 //! the transactions in the order they were written. bsvz's own Beef keeps
 //! them in a hash map and serializes in txid order, which breaks BRC-96's
 //! parents-first rule; only its MerklePath and Transaction parsers are used
@@ -15,6 +16,12 @@ pub const V2: u32 = 0xEFBE0002;
 pub const ATOMIC: u32 = 0x01010101;
 /// BRC-158 (Outpoint BEEF): 16 a7 be ef, then the subject txid and vout (u32 LE), then a BEEF.
 pub const OUTPOINT: u32 = 0xEFBEA716;
+/// BRC-233 (Subject BEEF): 57 09 be ef, then the subject txid, then a BEEF V2; the subject must be
+/// in it, the other transactions any (not only the subject's ancestors).
+pub const SUBJECT: u32 = 0xEFBE0957;
+
+/// The envelope a BEEF came in (shruggr/skein#146): bare, Atomic, Outpoint or Subject.
+pub const Form = enum { beef, atomic, outpoint, subject };
 
 pub const Error = error{ InvalidBeef, OutOfMemory };
 
@@ -32,14 +39,27 @@ pub const Entry = struct {
 
 pub const Beef = struct {
     version: u32,
-    /// BRC-95: the txid an Atomic BEEF names (BRC-158: an Outpoint BEEF's, with `vout`).
+    /// BRC-95: the txid an Atomic BEEF names (BRC-158: an Outpoint BEEF's, with `vout`; BRC-233: a
+    /// Subject BEEF's, with `form` .subject).
     atomic: ?[32]u8 = null,
+    /// The envelope as parsed. Only .subject decides anything (`formOf`): the other forms follow
+    /// `atomic` and `vout`, so a Beef built or edited by hand needs none.
+    form: ?Form = null,
     /// BRC-158: the subject output of an Outpoint BEEF (`atomic` its txid).
     vout: ?u32 = null,
     bumps: []MerklePath,
     entries: []Entry,
 
-    /// The transaction the BEEF is about: an Atomic BEEF's, else the last one.
+    /// The envelope: bare with no `atomic`; Outpoint with a `vout`; Subject when `form` says so;
+    /// else Atomic.
+    pub fn formOf(self: Beef) Form {
+        if (self.atomic == null) return .beef;
+        if (self.vout != null) return .outpoint;
+        return if (self.form == .subject) .subject else .atomic;
+    }
+
+    /// The transaction the BEEF is about: an enveloped form's (Atomic, Outpoint, Subject), else the
+    /// last one.
     pub fn subject(self: Beef) ?[32]u8 {
         if (self.atomic) |a| return a;
         if (self.entries.len == 0) return null;
@@ -96,13 +116,17 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Beef {
     var pos: usize = 0;
     var atomic: ?[32]u8 = null;
     var vout: ?u32 = null;
+    var form: Form = .beef;
     var version = try readU32(bytes, &pos);
-    if (version == ATOMIC) {
+    if (version == ATOMIC or version == SUBJECT) {
         if (bytes.len < 36) return error.InvalidBeef;
+        form = if (version == ATOMIC) .atomic else .subject;
         atomic = bytes[4..36].*;
         pos = 36;
         version = try readU32(bytes, &pos);
+        if (form == .subject and version != V2) return error.InvalidBeef; // BRC-233: a BEEF V2 only
     } else if (version == OUTPOINT) {
+        form = .outpoint;
         if (bytes.len < 40) return error.InvalidBeef;
         atomic = bytes[4..36].*;
         pos = 36;
@@ -163,7 +187,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Beef {
         for (entries) |e| found = found or std.mem.eql(u8, &e.txid, &a);
         if (!found) return error.InvalidBeef;
     }
-    return .{ .version = version, .atomic = atomic, .vout = vout, .bumps = bumps, .entries = entries };
+    return .{ .version = version, .atomic = atomic, .form = form, .vout = vout, .bumps = bumps, .entries = entries };
 }
 
 fn appendVarInt(arena: std.mem.Allocator, out: *std.ArrayList(u8), v: u64) Error!void {
@@ -176,12 +200,21 @@ fn appendVarInt(arena: std.mem.Allocator, out: *std.ArrayList(u8), v: u64) Error
 /// keeps the writer's order, `build.order` produces one).
 pub fn serialize(arena: std.mem.Allocator, b: Beef) Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    if (b.atomic) |a| {
+    const form = b.formOf();
+    if (form != .beef) {
+        const a = b.atomic orelse return error.InvalidBeef;
+        if (form == .subject and b.version != V2) return error.InvalidBeef;
         var hdr: [4]u8 = undefined;
-        std.mem.writeInt(u32, &hdr, if (b.vout != null) OUTPOINT else ATOMIC, .little);
+        std.mem.writeInt(u32, &hdr, switch (form) {
+            .atomic => ATOMIC,
+            .outpoint => OUTPOINT,
+            .subject => SUBJECT,
+            .beef => unreachable,
+        }, .little);
         try out.appendSlice(arena, &hdr);
         try out.appendSlice(arena, &a);
-        if (b.vout) |o| {
+        if (form == .outpoint) {
+            const o = b.vout.?;
             std.mem.writeInt(u32, &hdr, o, .little);
             try out.appendSlice(arena, &hdr);
         }
