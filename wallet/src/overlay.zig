@@ -92,7 +92,7 @@ pub const Proven = struct { txid: [32]u8, height: u32, pos: merkle.Position };
 /// BUMP proves which transaction, which entries named a txid only.
 pub const Decoded = struct {
     subject: [32]u8,
-    /// Every transaction with its bytes, in BEEF order (parents first).
+    /// Every transaction with its bytes, parents first (the BEEF's order, sorted where it was not).
     txs: []const DecodedTx,
     /// The merkle nodes the BUMPs reveal, each once.
     nodes: []const merkle.Node,
@@ -127,14 +127,19 @@ fn flagged(p: merkle.MerklePath, txid: [32]u8) bool {
 /// nodes it reveals (hash-checked by the store). Nothing is kept here: in a
 /// front-door call the blocks live in the call's overlay; the step that
 /// admits the submission holds them (`holdDecoded`). Structure is checked
-/// (parents first, a BUMP that names a transaction holds it, BUMPs that
-/// agree with themselves); the chain and the scripts are `verifyDecoded`'s.
+/// (a BUMP that names a transaction holds it, BUMPs that agree with
+/// themselves; the transactions sorted parents-first, a writer's order not
+/// refused); the chain and the scripts are `verifyDecoded`'s.
 pub fn decode(a: std.mem.Allocator, s: store_mod.Store, bytes: []const u8) !Decoded {
-    const b = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
-    const subject = b.subject() orelse return error.InvalidBeef;
-    const entry = b.find(subject) orelse return error.InvalidBeef;
+    const parsed = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
+    const subject = parsed.subject() orelse return error.InvalidBeef;
+    const entry = parsed.find(subject) orelse return error.InvalidBeef;
     if (entry.raw == null) return error.InvalidBeef; // a txid-only subject
-    if (!beef_mod.parentsFirst(b)) return error.NotParentsFirst;
+    // Parents first: a writer's order sorted, not refused (beef.sorted); only a cycle is.
+    const b = beef_mod.sorted(a, parsed) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidBeef => return error.NotParentsFirst,
+    };
 
     // The BUMPs that prove something here: their nodes, and the root they reach.
     var bumps: std.ArrayList(Bump) = .empty;

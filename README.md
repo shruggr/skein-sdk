@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.11.0**, Zig 0.16.0.
+**0.11.1**, Zig 0.16.0.
 
 ## What it is
 
@@ -208,6 +208,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.11.1 | a BEEF out of order is sorted on read, not refused (David Case, 2026-10-22): `beef.order` / `beef.sorted` (a stable topological sort, every in-BEEF parent first, proven or not; an order that already holds is kept; a cycle is the only refusal), and SPV (`spv.verify`), the chain state's `ingest` and the wallet's overlay `decode` verify and record in that order, as ts-sdk and go-sdk read; the checks are as strict as before (BUMP roots against headers, an unproven transaction's inputs earlier or held, scripts, txid-only only when held). `parse` still keeps the wire's order; a bare BEEF's subject is still its last transaction as written |
 | 0.11.0 | the BEEF envelope beside the pointer record (shruggr/skein#146): the pointer record `{kind: "beef", version, txs, marks, bumps}` is the BEEF alone, no form/subject/vout; the envelope `{form, beef, subject?, vout?}` sits beside it where the bytes were; Subject BEEF (BRC-233) is one more form, `"subject"`; `record.subjectOf(env, rec)`, `record.parsed(env)`, `record.wireOf(env)` take the envelope; `record.beefOf(record)` is the BEEF without envelope |
 | 0.10.0 | the wallet takes caller-supplied inputs (shruggr/skein#93): createAction `inputs` (`outpoint`, `unlockingScript` or `unlockingScriptLength`, `inputDescription`, `sequenceNumber`) and `inputBEEF`; a signable draft when any input lacks its script; signAction `spends`; fee and change over caller and wallet inputs together; the builder signs only the wallet's own inputs |
 | 0.9.0 | routes, filters, roles (shruggr/skein#143): `filter`, the module a filter answers with (`{reject}`, `{answer}`, `{pass}`); `app`: no `admitted`, no `not-admitted` — the `/call` route no longer reads the dispatch rows' senders (there are none): the kernel's filters and gate admit the caller before the handler runs; no `owner` anywhere in the step or call input |

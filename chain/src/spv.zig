@@ -17,11 +17,23 @@ pub const Context = struct {
 };
 
 pub const Result = struct {
-    /// Per entry (BEEF order): proven by a BUMP checked against our header.
+    /// Per entry (the order of the BEEF given): proven by a BUMP checked against our header.
     proven: []bool,
 };
 
-pub fn verify(arena: std.mem.Allocator, b: beef_mod.Beef, ctx: Context) !Result {
+/// SPV over `given`, in its parents-first order (`beef_mod.order`: a writer that put a child before
+/// its parent is sorted, not refused, as ts-sdk and go-sdk read; the checks are the same).
+/// error.NotParentsFirst: a cycle, which no order resolves.
+pub fn verify(arena: std.mem.Allocator, given: beef_mod.Beef, ctx: Context) !Result {
+    const ord = beef_mod.order(arena, given.entries) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidBeef => return error.NotParentsFirst,
+    };
+    var b = given;
+    b.entries = try arena.alloc(beef_mod.Entry, given.entries.len);
+    for (b.entries, ord) |*e, j| e.* = given.entries[j];
+    std.debug.assert(beef_mod.parentsFirst(b));
+
     // BUMPs: every leaf a root can be computed for gives the same root, and
     // that root is our header's at the BUMP's height.
     for (b.bumps) |p| {
@@ -41,10 +53,9 @@ pub fn verify(arena: std.mem.Allocator, b: beef_mod.Beef, ctx: Context) !Result 
         if (!std.mem.eql(u8, &want, &r)) return error.RootMismatch;
     }
 
-    if (!beef_mod.parentsFirst(b)) return error.NotParentsFirst;
     const proven = try arena.alloc(bool, b.entries.len);
-    for (b.entries, 0..) |e, i| {
-        proven[i] = false;
+    @memset(proven, false);
+    for (b.entries, ord) |e, i| {
         switch (e.format) {
             .txid_only => {
                 if ((try ctx.knownRawFn(ctx.ptr, arena, e.txid)) == null) return error.UnknownTxidOnly;

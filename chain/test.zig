@@ -273,6 +273,77 @@ test "ingest: a Subject BEEF (BRC-233) — its subject, not the last; a transact
     try std.testing.expect(if (w2.st.ingest(try beef.serialize(a, orphan))) |_| false else |_| true);
 }
 
+test "ingest: out of order is sorted, then verified — a proven child before its proven parent (ts-sdk's writer), an unproven one before its parent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    // The failing shape (2026-10-22): child proven at 2 at index 0, its parent proven at 1 at index
+    // 1, the unproven subject last.
+    const child = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), child.txid, 1_700_001_200)});
+    const subj = try spend(a, &child.tx, 0, 8_000);
+    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{
+        try bsvz.spv.MerklePath.parse(a, try soloPath(a, 2, child.txid)),
+        try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, w.fund.txid)),
+    });
+    const wire = try beef.serialize(a, .{ .version = beef.V2, .atomic = subj.txid, .bumps = bumps, .entries = try a.dupe(beef.Entry, &.{
+        .{ .txid = child.txid, .format = .raw_with_bump, .bump = 0, .raw = child.raw, .tx = child.tx },
+        .{ .txid = w.fund.txid, .format = .raw_with_bump, .bump = 1, .raw = w.fund.raw, .tx = w.fund.tx },
+        .{ .txid = subj.txid, .format = .raw, .raw = subj.raw, .tx = subj.tx },
+    }) });
+    const parsed = try beef.parse(a, wire);
+    try std.testing.expect(!beef.parentsFirst(parsed)); // parse keeps the wire's order
+    const view = try beef.sorted(a, parsed);
+    try std.testing.expect(beef.parentsFirst(view));
+    try std.testing.expectEqualSlices(u8, &w.fund.txid, &view.entries[0].txid);
+    try std.testing.expectEqualSlices(u8, &child.txid, &view.entries[1].txid);
+    try std.testing.expectEqualSlices(u8, &subj.txid, &view.entries[2].txid);
+    try std.testing.expectEqual(@as(?usize, 1), view.entries[0].bump); // BUMP indices unchanged
+    try std.testing.expectEqualSlices(u8, &child.txid, &parsed.entries[0].txid);
+    const got = try w.st.ingest(wire);
+    try std.testing.expectEqualSlices(u8, &lib.store.hashCid(.tx, subj.txid), got.tx);
+    try std.testing.expectEqual(lib.state.Status.unproven, got.status);
+    try std.testing.expectEqual(@as(usize, 1), got.registered.len);
+    try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(child.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(w.fund.txid));
+
+    // Unproven before unproven: tb (spending ta) ahead of ta; registered parents first.
+    var ms2 = lib.store.MemStore.init(std.testing.allocator);
+    defer ms2.deinit();
+    var w2 = try world(a, ms2.store(), 2);
+    const ta = try spend(a, &w2.fund.tx, 0, 9_000);
+    const tb = try spend(a, &ta.tx, 0, 8_000);
+    const fund_bump = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, w2.fund.txid))});
+    const fund_entry: beef.Entry = .{ .txid = w2.fund.txid, .format = .raw_with_bump, .bump = 0, .raw = w2.fund.raw, .tx = w2.fund.tx };
+    const ta_entry: beef.Entry = .{ .txid = ta.txid, .format = .raw, .raw = ta.raw, .tx = ta.tx };
+    const tb_entry: beef.Entry = .{ .txid = tb.txid, .format = .raw, .raw = tb.raw, .tx = tb.tx };
+    const back = try beef.serialize(a, .{ .version = beef.V2, .atomic = tb.txid, .bumps = fund_bump, .entries = try a.dupe(beef.Entry, &.{ tb_entry, ta_entry, fund_entry }) });
+    const got2 = try w2.st.ingest(back);
+    try std.testing.expectEqualSlices(u8, &lib.store.hashCid(.tx, tb.txid), got2.tx);
+    try std.testing.expectEqual(@as(usize, 2), got2.registered.len);
+    try std.testing.expectEqualSlices(u8, &ta.txid, &got2.registered[0]);
+    try std.testing.expectEqualSlices(u8, &tb.txid, &got2.registered[1]);
+
+    // Still as strict: a parent genuinely missing fails MissingInput, sorted or not ...
+    var ms3 = lib.store.MemStore.init(std.testing.allocator);
+    defer ms3.deinit();
+    var w3 = try world(a, ms3.store(), 2);
+    const missing = try beef.serialize(a, .{ .version = beef.V2, .atomic = tb.txid, .bumps = fund_bump, .entries = try a.dupe(beef.Entry, &.{ tb_entry, fund_entry }) });
+    try std.testing.expectError(error.MissingInput, w3.st.ingest(missing));
+    // ... a txid-only parent not held fails UnknownTxidOnly ...
+    const txid_only = try beef.serialize(a, .{ .version = beef.V2, .atomic = tb.txid, .bumps = &.{}, .entries = try a.dupe(beef.Entry, &.{ tb_entry, .{ .txid = ta.txid, .format = .txid_only } }) });
+    try std.testing.expectError(error.UnknownTxidOnly, w3.st.ingest(txid_only));
+    // ... and a cycle (here a transaction naming itself as its input's source) is refused.
+    const self_ref = [_]beef.Entry{.{ .txid = ta.tx.inputs[0].previous_outpoint.txid.bytes, .format = .raw, .raw = ta.raw, .tx = ta.tx }};
+    try std.testing.expectError(error.InvalidBeef, beef.order(a, &self_ref));
+    // An order that already holds is kept as it is.
+    const ok = try beef.parse(a, try beefOf(a, &.{.{ w2.fund, 1 }}, &.{ ta, tb }));
+    try std.testing.expectEqual(ok.entries.ptr, (try beef.sorted(a, ok)).entries.ptr);
+}
+
 test "a rejection walks the spends; a proven competing spend is a double spend; never mined stays unproven" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

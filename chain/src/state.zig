@@ -555,18 +555,24 @@ pub const State = struct {
     /// Ingest a BEEF (V1, V2, Atomic, Outpoint or Subject — BRC-233, its other transactions any; its
     /// subject the envelope's txid, else the last transaction): SPV
     /// against our chain (every BUMP's root our header's at its height; every unproven transaction's
-    /// inputs held or earlier in the BEEF, their scripts verified), then every transaction it carries
+    /// inputs held or earlier in the BEEF once sorted parents-first — a writer's order is sorted, not
+    /// refused — their scripts verified), then every transaction it carries
     /// recorded, every proof it carries put, and each one left unproven registered for broadcast
     /// (`registered`). A transaction spending what a proven one already spends is rejected at once.
     pub fn ingest(self: *State, bytes: []const u8) !Ingested {
         const a = self.arena;
-        const b = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
-        const subject = b.subject() orelse return error.InvalidBeef;
-        const entry = b.find(subject) orelse return error.InvalidBeef;
+        const parsed = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
+        const subject = parsed.subject() orelse return error.InvalidBeef;
+        const entry = parsed.find(subject) orelse return error.InvalidBeef;
         if (entry.raw == null) {
             // A txid-only subject: only a transaction we already hold.
             if (!(try self.holds(subject))) return error.UnknownTxidOnly;
         }
+        // Parents first (a writer's order sorted, not refused): recorded and registered in it.
+        const b = beef_mod.sorted(a, parsed) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidBeef => return error.NotParentsFirst,
+        };
         var ctx = SpvCtx{ .st = self };
         const checked = try spv.verify(a, b, .{ .ptr = &ctx, .rootAtFn = SpvCtx.rootAt, .knownRawFn = SpvCtx.knownRaw });
         var registered: std.ArrayList([32]u8) = .empty;

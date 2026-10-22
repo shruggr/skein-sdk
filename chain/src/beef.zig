@@ -1,6 +1,7 @@
 //! BEEF (BRC-62 V1, BRC-96 V2, BRC-95 Atomic, BRC-158 Outpoint, BRC-233 Subject): parse and
 //! serialize, keeping
-//! the transactions in the order they were written. bsvz's own Beef keeps
+//! the transactions in the order they were written (`sorted` gives the
+//! parents-first view that verification and recording use). bsvz's own Beef keeps
 //! them in a hash map and serializes in txid order, which breaks BRC-96's
 //! parents-first rule; only its MerklePath and Transaction parsers are used
 //! here. All memory comes from the caller's arena.
@@ -248,7 +249,70 @@ pub fn serialize(arena: std.mem.Allocator, b: Beef) Error![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Whether every transaction's in-BEEF parents come before it.
+/// The entries' indices with every in-BEEF parent before its children (BRC-62 §Ordering, BRC-96):
+/// a stable topological sort. A writer's order that already holds is kept as it is; otherwise each
+/// entry is preceded by its parents not yet placed (proven or not: a BUMP proves a transaction, it
+/// does not reorder it), and txid-only entries stay where they were (they have no inputs to wait
+/// on). ts-sdk and go-sdk sort on read too, and some writers (ts-sdk's serializer emits proven
+/// transactions in encounter order) put a proven child before its proven parent. error.InvalidBeef:
+/// a cycle (a transaction spending itself or a descendant), which no order puts parents first.
+pub fn order(arena: std.mem.Allocator, entries: []const Entry) Error![]usize {
+    var at = std.AutoHashMapUnmanaged([32]u8, usize).empty;
+    try at.ensureTotalCapacity(arena, @intCast(entries.len));
+    for (entries, 0..) |e, i| at.putAssumeCapacity(e.txid, i);
+    // 0 not reached, 1 its parents being placed, 2 placed.
+    const mark = try arena.alloc(u8, entries.len);
+    @memset(mark, 0);
+    const out = try arena.alloc(usize, entries.len);
+    var n: usize = 0;
+    const Frame = struct { i: usize, k: usize = 0 };
+    var stack: std.ArrayList(Frame) = .empty;
+    for (0..entries.len) |root| {
+        if (mark[root] != 0) continue;
+        mark[root] = 1;
+        try stack.append(arena, .{ .i = root });
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            if (entries[top.i].tx) |t| if (top.k < t.inputs.len) {
+                const src = t.inputs[top.k].previous_outpoint.txid.bytes;
+                top.k += 1;
+                const j = at.get(src) orelse continue;
+                switch (mark[j]) {
+                    0 => {
+                        mark[j] = 1;
+                        try stack.append(arena, .{ .i = j });
+                    },
+                    1 => return error.InvalidBeef,
+                    else => {},
+                }
+                continue;
+            };
+            mark[top.i] = 2;
+            out[n] = top.i;
+            n += 1;
+            _ = stack.pop();
+        }
+    }
+    return out;
+}
+
+/// The same BEEF with its entries parents-first (`order`): a view to verify and record from, the
+/// parsed one (and the wire bytes, and a pointer record's indices) untouched. The BUMPs and their
+/// indices are the same. A bare BEEF's subject is the parsed one's last transaction: take it
+/// (`subject`) before sorting. An order that already holds gives `b` back as it is.
+pub fn sorted(arena: std.mem.Allocator, b: Beef) Error!Beef {
+    const ord = try order(arena, b.entries);
+    var same = true;
+    for (ord, 0..) |j, i| same = same and i == j;
+    if (same) return b;
+    const entries = try arena.alloc(Entry, b.entries.len);
+    for (entries, ord) |*e, j| e.* = b.entries[j];
+    var out = b;
+    out.entries = entries;
+    return out;
+}
+
+/// Whether every transaction's in-BEEF parents come before it (`sorted` makes it so).
 pub fn parentsFirst(b: Beef) bool {
     for (b.entries, 0..) |e, i| {
         const tx = e.tx orelse continue;
