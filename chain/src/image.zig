@@ -126,16 +126,28 @@ pub const Loaded = struct { headers: u32, tip: u32 };
 /// edges (#42) — and both maps are built in one pass, their nodes put as they are made
 /// (mst `build`).
 pub fn load(st: *state_mod.State, root: []const u8) !?Loaded {
-    const a = st.arena;
-    const found = (try find(a, st.store, root)) orelse return null;
-    if ((try st.chain().tip()) != null) return error.NotEmpty;
+    if ((try st.chain().tip()) != null) {
+        // Refused only when the tree carries a chain (as before: a tree without one is null).
+        if ((try find(st.arena, st.store, root)) == null) return null;
+        return error.NotEmpty;
+    }
+    return loadMaps(st.maps, st.map("headers"), st.map("heights"), st.network, root);
+}
+
+/// `load` over any pair of chain maps (the host chain's, shruggr/skein#156: `host.Host.import`):
+/// `headers` and `heights` must be empty; both are replaced by the image's, built in one pass.
+pub fn loadMaps(maps: *store_mod.Maps, headers: *store_mod.Map, heights: *store_mod.Map, network: chain_mod.Network, root: []const u8) !?Loaded {
+    const a = maps.arena;
+    const s = maps.store;
+    const found = (try find(a, s, root)) orelse return null;
+    if (headers.root != null or heights.root != null) return error.NotEmpty;
     const total = found.tip.height + 1;
     if (total > found.blocks.len * per_block or total <= (found.blocks.len - 1) * per_block) return error.BadImage;
     const hashes = try a.alloc([32]u8, total);
     var n: u32 = 0;
-    const genesis = st.network.genesis();
+    const genesis = network.genesis();
     for (found.blocks, 0..) |cid, bi| {
-        const raw = try body(try st.store.get(a, &cid), "blob");
+        const raw = try body(try s.get(a, &cid), "blob");
         const want: usize = if (bi + 1 < found.blocks.len) per_block else total - n;
         if (raw.len != want * hdr.size) return error.BadImage;
         var i: usize = 0;
@@ -147,7 +159,7 @@ pub fn load(st: *state_mod.State, root: []const u8) !?Loaded {
             try chain_mod.checkHeader(h);
             hashes[n] = hdr.hash(h);
             const c = store_mod.hashCid(.block, hashes[n]);
-            try st.store.putBlock(&c, h);
+            try s.putBlock(&c, h);
             n += 1;
         }
     }
@@ -166,10 +178,8 @@ pub fn load(st: *state_mod.State, root: []const u8) !?Loaded {
             return std.mem.order(u8, x.key, y.key) == .lt;
         }
     }.less);
-    const headers = st.map("headers");
-    const heights = st.map("heights");
-    headers.root = try st.maps.forest.build(by_height, st.maps.sink());
-    heights.root = try st.maps.forest.build(by_hash, st.maps.sink());
+    headers.root = try maps.forest.build(by_height, maps.sink());
+    heights.root = try maps.forest.build(by_hash, maps.sink());
     headers.dirty = true;
     heights.dirty = true;
     return .{ .headers = total, .tip = found.tip.height };

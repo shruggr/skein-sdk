@@ -16,6 +16,11 @@ pub const store = @import("store.zig");
 pub const state = @import("state.zig");
 /// The header chain an image tree carries (shruggr/skein#132): its layout, `load` into an empty state, `write`.
 pub const image = @import("image.zig");
+/// The host chain (shruggr/skein#156): the header chain a host keeps once for its instances, its record, the tracker's writes.
+pub const host = @import("host.zig");
+/// The one opener for readers of the chain app's `chain/state` (shruggr/skein-sdk#1): the record's own
+/// network; null is an empty state on `network`. Read only (the caller never saves it).
+pub const open = state.open;
 /// The BEEF envelope and pointer record (shruggr/skein#121, #146): `wireOf`, `beefOf`, the encoders.
 pub const record = @import("record.zig");
 /// bsvz itself, for programs built on this library.

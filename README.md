@@ -21,7 +21,7 @@ programs build against it too, so each file has one copy, here. Version
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
 | `message` | `lib/message.zig` | the mail record: `shapeProblem` (its shape and body; who sent it is the transport's to prove — a BRC-104 session, libp2p) and `problem` (plus the signature of the records that sign themselves: a claim, a host provider's answer; BRC-169's signing, checked with the sender's key alone) |
 | `brc104` | `lib/brc104.zig` | BRC-103/104 framing for a server program (the front door); a client is the kernel's `authfetch` |
-| `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF (V1, V2, Atomic, Outpoint, Subject — BRC-233), the BEEF envelope and pointer record and `record.wireOf` (shruggr/skein#121, #146: the exact bytes back from the envelope and the record the kernel's door writes), SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads; `image`: the header chain an image tree carries (`chain/headers/<first>`, `chain/tip`; shruggr/skein#132) and `load`, which fills an empty state's best chain from it |
+| `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF (V1, V2, Atomic, Outpoint, Subject — BRC-233), the BEEF envelope and pointer record and `record.wireOf` (shruggr/skein#121, #146: the exact bytes back from the envelope and the record the kernel's door writes), SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads; `image`: the header chain an image tree carries (`chain/headers/<first>`, `chain/tip`; shruggr/skein#132) and `load`, which fills an empty state's best chain from it; `host`: the host chain (shruggr/skein#156) — the record `{kind: "host-chain", network, maps: {headers, heights}, tip: {height, hash}}` the kernel's tracker keeps once per host (`Host.open`/`add`/`import`/`save`, `read`), which an instance's chain state points at (`State.pointAt`); `open`: the one opener for readers of `chain/state` (shruggr/skein-sdk#1) |
 | `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (re-exported under the same names): BRC-29, the transaction builder, the BRC-100 wire frames |
 | `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk` over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build |
 | `cabi` | `wit/zig/cabi.zig` | `malloc`/`realloc`/`free`/`abort`/`strlen` for wit-bindgen's C bindings, without wasi-libc |
@@ -76,8 +76,9 @@ const exe = b.addExecutable(.{
 b.installArtifact(exe);
 ```
 
-`.wallet = false` leaves out `chain` and `wallet` and never fetches bsvz;
-drop it to use them.
+`.wallet = false` leaves out `wallet` (the chain module stays: the skein
+kernel's host chain, shruggr/skein#156, uses it natively); `.wallet = false,
+.chain = false` leaves out both and never fetches bsvz.
 
 A minimal app handler, named `counter`, providing `demo.counter/1` with
 `get` and `add` (its manifest declares the interface; skein's
@@ -208,6 +209,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.12.0 | the host chain (shruggr/skein#156): `chain.host` — the host chain record and its tracker (`Host.open`, `add`, `import` from an image tree into an empty host chain, `save`; `read`); `State.pointAt(host record)`: an instance's chain state names the host chain's `headers` and `heights` roots instead of copying them, the fork found by walking back from its tip, proofs above a replaced fork reverted and their broadcasts registered again as `addHeaders` does, pending proofs retried; `image.loadMaps` (`load` over any pair of chain maps); `chain.open` (shruggr/skein-sdk#1): the one opener for readers of `chain/state`, network from the record; the `chain` module is built with `-Dwallet=false` too (`-Dchain=false` leaves it out) |
 | 0.11.1 | a BEEF out of order is sorted on read, not refused (David Case, 2026-10-22): `beef.order` / `beef.sorted` (a stable topological sort, every in-BEEF parent first, proven or not; an order that already holds is kept; a cycle is the only refusal), and SPV (`spv.verify`), the chain state's `ingest` and the wallet's overlay `decode` verify and record in that order, as ts-sdk and go-sdk read; the checks are as strict as before (BUMP roots against headers, an unproven transaction's inputs earlier or held, scripts, txid-only only when held). `parse` still keeps the wire's order; a bare BEEF's subject is still its last transaction as written |
 | 0.11.0 | the BEEF envelope beside the pointer record (shruggr/skein#146): the pointer record `{kind: "beef", version, txs, marks, bumps}` is the BEEF alone, no form/subject/vout; the envelope `{form, beef, subject?, vout?}` sits beside it where the bytes were; Subject BEEF (BRC-233) is one more form, `"subject"`; `record.subjectOf(env, rec)`, `record.parsed(env)`, `record.wireOf(env)` take the envelope; `record.beefOf(record)` is the BEEF without envelope |
 | 0.10.0 | the wallet takes caller-supplied inputs (shruggr/skein#93): createAction `inputs` (`outpoint`, `unlockingScript` or `unlockingScriptLength`, `inputDescription`, `sequenceNumber`) and `inputBEEF`; a signable draft when any input lacks its script; signAction `spends`; fee and change over caller and wallet inputs together; the builder signs only the wallet's own inputs |

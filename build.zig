@@ -37,15 +37,18 @@
 //   zig build test          every module's tests and the wallet's vector corpus, natively
 //   zig build test-wasm     the wallet's tests built for wasm32-wasi, run under Node's WASI
 //
-// bsvz is a lazy URL dependency (build.zig.zon): fetched only when the wallet
-// module is asked for. `-Dwallet=false` leaves the wallet out entirely (the
-// skein kernel builds that way: it needs the codecs only).
+// bsvz is a lazy URL dependency (build.zig.zon): fetched only when the chain
+// or wallet module is asked for. `-Dwallet=false` leaves the wallet out (the
+// skein kernel builds that way: it needs the codecs and, for the host chain,
+// shruggr/skein#156, the chain module); `-Dwallet=false -Dchain=false` leaves
+// both out (the codecs only: bsvz never fetched).
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const with_wallet = b.option(bool, "wallet", "include the wallet module (fetches bsvz)") orelse true;
+    const with_chain = (b.option(bool, "chain", "include the chain module (fetches bsvz; the wallet implies it)") orelse true) or with_wallet;
 
     const c = codecs(b, target, optimize);
     b.modules.put(b.graph.arena, "cid", c.cid) catch @panic("OOM");
@@ -73,14 +76,15 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 
-    if (!with_wallet) return;
+    if (!with_chain) return;
     const chain = chainModule(b, "chain/src/lib.zig", target, optimize, c.mst) orelse return;
     b.modules.put(b.graph.arena, "chain", chain) catch @panic("OOM");
-    const wallet = walletModule(b, "wallet/src/lib.zig", target, optimize, c.mst, chain) orelse return;
-    b.modules.put(b.graph.arena, "wallet", wallet) catch @panic("OOM");
-
     const ctests = b.addTest(.{ .root_module = chainModule(b, "chain/test.zig", target, optimize, c.mst).? });
     test_step.dependOn(&b.addRunArtifact(ctests).step);
+
+    if (!with_wallet) return;
+    const wallet = walletModule(b, "wallet/src/lib.zig", target, optimize, c.mst, chain) orelse return;
+    b.modules.put(b.graph.arena, "wallet", wallet) catch @panic("OOM");
     const wtests = b.addTest(.{ .root_module = walletModule(b, "wallet/test.zig", target, optimize, c.mst, chain).? });
     test_step.dependOn(&b.addRunArtifact(wtests).step);
 

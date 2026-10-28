@@ -645,3 +645,121 @@ test "image: no chain in the tree is null; another network, a broken link, a bad
     var nb: [8]u8 = undefined;
     try std.testing.expectEqualStrings("00004032", img.blockName(&nb, 4032));
 }
+
+// ------------------------------------------------------------ the host chain (shruggr/skein#156)
+
+/// The host chain after a run of headers: its record's CID.
+fn hostAdd(a: std.mem.Allocator, s: lib.store.Store, record: ?[]const u8, raws: []const []const u8) ![]const u8 {
+    var h = try lib.host.Host.open(a, s, record, .regtest);
+    _ = try h.add(raws);
+    return (try h.save()).?;
+}
+
+test "host chain: add, save, read back; an image imported into an empty host chain is the same record as the run; a second import refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const hs = try regtestChain(a, 2 * lib.image.per_block + 9);
+    const runs = try a.alloc([]const u8, hs.len - 1);
+    for (hs[1..], runs) |*h, *r| r.* = h;
+
+    // Empty: no record.
+    var empty = try lib.host.Host.open(a, s, null, .regtest);
+    try std.testing.expect((try empty.save()) == null);
+
+    const added = try hostAdd(a, s, null, runs);
+    const r = try lib.host.read(a, s, added);
+    try std.testing.expectEqual(lib.chain.Network.regtest, r.network);
+    try std.testing.expectEqual(@as(u32, @intCast(hs.len - 1)), r.tip.?.height);
+    try std.testing.expectEqualSlices(u8, &hdr.hash(&hs[hs.len - 1]), &r.tip.?.hash);
+
+    // The same chain from an image tree: the same record.
+    const w = try lib.image.write(a, s, hs);
+    var h2 = try lib.host.Host.open(a, s, null, .regtest);
+    const got = (try h2.import(&w.root)).?;
+    try std.testing.expectEqual(@as(u32, @intCast(hs.len)), got.headers);
+    try std.testing.expectEqualStrings(added, (try h2.save()).?);
+    try std.testing.expectError(error.NotEmpty, h2.import(&w.root));
+
+    // Another network's record refused; the tracker continues from a saved record.
+    try std.testing.expectError(error.NetworkMismatch, lib.host.Host.open(a, s, added, .main));
+    const next = mine(hdr.hash(&hs[hs.len - 1]), .{0xee} ** 32, 1_800_000_000);
+    const grown = try hostAdd(a, s, added, &.{&next});
+    try std.testing.expectEqual(@as(u32, @intCast(hs.len)), (try lib.host.read(a, s, grown)).tip.?.height);
+}
+
+test "pointAt: a state names the host chain's roots — the same state as adding the headers; a heavier branch reverts the proofs above the fork" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+
+    // Block 1 holds the funding; the host chain is at 1.
+    const fund = try funding(a, 1);
+    const h1 = mine(hdr.hash(&lib.chain.Network.regtest.genesis()), fund.txid, 1_700_000_600);
+    const host1 = try hostAdd(a, s, null, &.{&h1});
+
+    // A new state pointed at it: fork 0 (empty), nothing replaced; its maps are the host's.
+    var st = try State.load(a, s, null, .regtest);
+    const p1 = try st.pointAt(host1);
+    try std.testing.expectEqual(@as(u32, 1), p1.height);
+    try std.testing.expectEqual(@as(u32, 0), p1.fork);
+    try std.testing.expect(!p1.replaced);
+    const r1 = try lib.host.read(a, s, host1);
+    try std.testing.expectEqualSlices(u8, r1.headers.?, st.map("headers").root.?);
+    // The same as a state that added the header itself.
+    var copy = try State.load(a, s, null, .regtest);
+    _ = try copy.addHeaders(&.{&h1});
+    try std.testing.expectEqualStrings(try copy.save(), try st.save());
+
+    // The child, unproven, watched; mined at 2 on the host chain; its proof applies.
+    const child = try spend(a, &fund.tx, 0, 9_000);
+    _ = try st.ingest(try beefOf(a, &.{.{ fund, 1 }}, &.{child}));
+    try st.watch(child.txid, &caller, "chain", &request);
+    const h2 = mine(hdr.hash(&h1), child.txid, 1_700_001_200);
+    const host2 = try hostAdd(a, s, host1, &.{&h2});
+    const p2 = try st.pointAt(host2);
+    try std.testing.expectEqual(@as(u32, 2), p2.height);
+    try std.testing.expectEqual(@as(u32, 1), p2.fork);
+    try std.testing.expectEqual(State.Outcome.proven, try st.applyStatus(child.txid, "MINED", try soloPath(a, 2, child.txid)));
+    const proven = try st.save();
+
+    // The same host record again: nothing changes.
+    var again = try State.load(a, s, proven, .regtest);
+    const p2b = try again.pointAt(host2);
+    try std.testing.expectEqual(@as(u32, 2), p2b.fork);
+    try std.testing.expectEqualStrings(proven, try again.save());
+
+    // A heavier branch from 1 replacing 2: unproven again, its broadcast registered again with the watcher.
+    const alt2 = mine(hdr.hash(&h1), .{3} ** 32, 1_700_001_201);
+    const alt3 = mine(hdr.hash(&alt2), .{4} ** 32, 1_700_001_202);
+    const host3 = try hostAdd(a, s, host2, &.{ &alt2, &alt3 });
+    var st2 = try State.load(a, s, proven, .regtest);
+    const p3 = try st2.pointAt(host3);
+    try std.testing.expectEqual(@as(u32, 3), p3.height);
+    try std.testing.expectEqual(@as(u32, 1), p3.fork);
+    try std.testing.expect(p3.replaced);
+    try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(child.txid));
+    try std.testing.expectEqual(@as(usize, 1), st2.reverted.items.len);
+    try std.testing.expectEqual(@as(usize, 1), (try st2.broadcastRecord(child.txid)).?.getArray("watchers").?.len);
+    try std.testing.expect(try st2.map("unproven").has(&child.txid));
+    try std.testing.expectEqual(@as(?u32, 3), try st2.chain().tip());
+
+    // The opener (skein-sdk#1): the record's own network; null is empty on the given one.
+    const saved = try st2.save();
+    var ro = try lib.open(a, s, saved, .main);
+    try std.testing.expectEqual(lib.chain.Network.regtest, ro.network);
+    try std.testing.expectEqual(@as(?u32, 3), try ro.chain().tip());
+    var none = try lib.open(a, s, null, .@"test");
+    try std.testing.expectEqual(lib.chain.Network.@"test", none.network);
+    try std.testing.expect((try none.chain().tip()) == null);
+
+    // Another network's host record refused.
+    var main_st = try State.load(a, s, null, .main);
+    try std.testing.expectError(error.NetworkMismatch, main_st.pointAt(host3));
+}

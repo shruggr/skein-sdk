@@ -60,6 +60,7 @@ const spv = @import("spv.zig");
 const chain_mod = @import("chain.zig");
 const store_mod = @import("store.zig");
 const merkle = @import("merkle.zig");
+const host_mod = @import("host.zig");
 
 const Store = store_mod.Store;
 const Map = store_mod.Map;
@@ -333,6 +334,68 @@ pub const State = struct {
             try self.retryPendingProofs();
         }
         return res;
+    }
+
+    pub const Pointed = struct {
+        /// The host chain's tip height (0 for a chain with only the anchor).
+        height: u32,
+        /// The highest height where this state's best chain and the host's agree.
+        fork: u32,
+        /// Whether headers of this state's chain above the fork are not the host's (a reorg).
+        replaced: bool,
+    };
+
+    /// The host chain (shruggr/skein#156): this state's `headers` and `heights` become the host
+    /// chain record's (`host_cid`, skein-sdk `chain.host`) — pointed at, not copied. The fork is the
+    /// highest height of this state's best chain whose header the host's best chain holds at the
+    /// same height (walked back from this state's tip; an empty state forks at 0). Headers of ours
+    /// above it that the host's chain replaced revert the proofs against them, as `addHeaders` does
+    /// for a heavier branch: those transactions are unproven again and register their broadcasts
+    /// again (`reverted`); proofs that waited for a header are tried again. A record of another
+    /// network is refused (`error.NetworkMismatch`).
+    pub fn pointAt(self: *State, host_cid: []const u8) !Pointed {
+        const r = try host_mod.read(self.arena, self.store, host_cid);
+        if (r.network != self.network) return error.NetworkMismatch;
+        var hh = self.maps.map(r.headers);
+        var hs = self.maps.map(r.heights);
+        const theirs = chain_mod.Chain{ .arena = self.arena, .store = self.store, .headers = &hh, .heights = &hs, .network = self.network };
+        const host_tip = (try theirs.tip()) orelse 0;
+        const ours = self.chain();
+        const our_tip = try ours.tip();
+        var fork: u32 = 0;
+        if (our_tip) |t| {
+            var h = t;
+            while (true) {
+                const at = (try ours.at(h)) orelse return error.BadRecord;
+                if ((try theirs.heightOf(at.hash))) |x| if (x == h) {
+                    fork = h;
+                    break;
+                };
+                if (h == 0) break;
+                h -= 1;
+            }
+        }
+        const replaced = if (our_tip) |t| t > fork else false;
+        const same = !replaced and our_tip != null and our_tip.? == host_tip and
+            optEq(self.map("headers").root, r.headers) and optEq(self.map("heights").root, r.heights);
+        if (same) return .{ .height = host_tip, .fork = fork, .replaced = false };
+        const headers = self.map("headers");
+        const heights = self.map("heights");
+        headers.root = r.headers;
+        heights.root = r.heights;
+        headers.dirty = true;
+        heights.dirty = true;
+        for (try self.map("proofHeights").from(&store_mod.be32(fork + 1))) |kv| {
+            if (kv.key.len != 36) return error.BadIndex;
+            const txid: [32]u8 = kv.key[4..36].*;
+            try self.resettle(txid);
+            if (replaced and (try self.status(txid)) == .unproven and (try self.broadcastRecord(txid)) == null) {
+                try self.writeBroadcast(txid, null, .{ .tx_status = "", .watchers = try self.settledWatchers(txid) });
+                if (!contains(self.reverted.items, txid)) try self.reverted.append(self.arena, txid);
+            }
+        }
+        try self.retryPendingProofs();
+        return .{ .height = host_tip, .fork = fork, .replaced = replaced };
     }
 
     fn retryPendingProofs(self: *State) !void {
@@ -652,6 +715,20 @@ pub const State = struct {
         }
     };
 };
+
+fn optEq(x: ?[]const u8, y: ?[]const u8) bool {
+    if (x == null or y == null) return x == null and y == null;
+    return std.mem.eql(u8, x.?, y.?);
+}
+
+/// The chain state the `chain/state` record `state` names, for reading (shruggr/skein-sdk#1: the
+/// one opener every reader uses): its network is the record's own; null (no chain state yet) is an
+/// empty state on `network`. Nothing is written through it unless the caller saves.
+pub fn open(arena: std.mem.Allocator, s: Store, state: ?[]const u8, network: Network) !State {
+    var net = network;
+    if (state) |c| net = Network.parse((try s.getValue(arena, c)).getText("network") orelse "") orelse return error.BadChainState;
+    return State.load(arena, s, state, net);
+}
 
 fn contains(xs: []const [32]u8, t: [32]u8) bool {
     for (xs) |x| if (std.mem.eql(u8, &x, &t)) return true;
