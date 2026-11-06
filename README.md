@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.11.1**, Zig 0.16.0.
+**0.13.0**, Zig 0.16.0.
 
 ## What it is
 
@@ -16,7 +16,7 @@ programs build against it too, so each file has one copy, here. Version
 | `files` | `lib/files.zig` | files from a git tree for an http handler (shruggr/skein#125, moved out of skein-static): `serve(a, req, tree, rowOptions(req))` answers the request from the tree under the row's `root`, with its `index` for a directory, a 301 for a directory named without its `/`, the blob's CID as the ETag (304 on `If-None-Match`), the content type by extension, 404 (missing, `..`, NUL, a bad escape) and 405 (`Allow: GET, HEAD`) |
 | `cbor` | `src/cbor.zig` | dag-cbor values, canonical encode/decode, the CID of a value |
 | `cid` | `src/cid.zig` | CIDs: parse, format; the codecs skein uses (raw, dag-cbor, git-raw, bitcoin-block, bitcoin-tx) |
-| `mst` | `src/mst.zig` | Merkle search trees over dag-cbor blocks: the kernel's index maps and every app's maps |
+| `mst` | `src/mst.zig` | Merkle search trees over dag-cbor blocks: the kernel's index maps and every app's maps; `range`, `prefixed`, `floor` (the greatest key at or below one) |
 | `secp` | `src/secp.zig` | BRC-42 "anyone" child keys and ECDSA verification, pure Zig |
 | `dagjson` | `lib/dagjson.zig` | dag-json (manifests, `etc/*.json`) |
 | `message` | `lib/message.zig` | the mail record: `shapeProblem` (its shape and body; who sent it is the transport's to prove — a BRC-104 session, libp2p) and `problem` (plus the signature of the records that sign themselves: a claim, a host provider's answer; BRC-169's signing, checked with the sender's key alone) |
@@ -209,6 +209,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.13.0 | the floor of a key and a bounded range: `mst` `Forest.floor(root, key)` — the entry with the greatest key at or below `key` (null when none), by one descent, no scan; the chain store's `Map.floor(key)` and `Map.range(lo, hi)` (lo ≤ key < hi) |
 | 0.12.0 | the host chain (shruggr/skein#156): `chain.host` — the host chain record and its tracker (`Host.open`, `add`, `import` from an image tree into an empty host chain, `save`; `read`); `State.pointAt(host record)`: an instance's chain state names the host chain's `headers` and `heights` roots instead of copying them, the fork found by walking back from its tip, proofs above a replaced fork reverted and their broadcasts registered again as `addHeaders` does, pending proofs retried; `image.loadMaps` (`load` over any pair of chain maps); `chain.open` (shruggr/skein-sdk#1): the one opener for readers of `chain/state`, network from the record; the `chain` module is built with `-Dwallet=false` too (`-Dchain=false` leaves it out) |
 | 0.11.1 | a BEEF out of order is sorted on read, not refused (David Case, 2026-10-22): `beef.order` / `beef.sorted` (a stable topological sort, every in-BEEF parent first, proven or not; an order that already holds is kept; a cycle is the only refusal), and SPV (`spv.verify`), the chain state's `ingest` and the wallet's overlay `decode` verify and record in that order, as ts-sdk and go-sdk read; the checks are as strict as before (BUMP roots against headers, an unproven transaction's inputs earlier or held, scripts, txid-only only when held). `parse` still keeps the wire's order; a bare BEEF's subject is still its last transaction as written |
 | 0.11.0 | the BEEF envelope beside the pointer record (shruggr/skein#146): the pointer record `{kind: "beef", version, txs, marks, bumps}` is the BEEF alone, no form/subject/vout; the envelope `{form, beef, subject?, vout?}` sits beside it where the bytes were; Subject BEEF (BRC-233) is one more form, `"subject"`; `record.subjectOf(env, rec)`, `record.parsed(env)`, `record.wireOf(env)` take the envelope; `record.beefOf(record)` is the BEEF without envelope |

@@ -348,6 +348,16 @@ pub const Map = struct {
         try self.f().range(self.maps.arena, self.root, lo, null, &out);
         return out.items;
     }
+    /// Every entry with lo <= key < hi, in key order.
+    pub fn range(self: *Map, lo: []const u8, hi: []const u8) ![]mst.KV {
+        var out = std.array_list.Managed(mst.KV).init(self.maps.arena);
+        try self.f().range(self.maps.arena, self.root, lo, hi, &out);
+        return out.items;
+    }
+    /// The entry with the greatest key at or below `key`, or null: one descent.
+    pub fn floor(self: *Map, key: []const u8) !?mst.KV {
+        return self.f().floor(self.maps.arena, self.root, key);
+    }
     pub fn count(self: *Map) !usize {
         return self.f().count(self.root);
     }
@@ -420,4 +430,17 @@ test "maps: MST over the store, persistent across steps" {
     try std.testing.expect(!(try m2.remove(&be32(299))));
     try std.testing.expectEqualSlices(u8, &be32(298), (try m2.last()).?);
     try std.testing.expectEqual(@as(usize, 298 - 256 + 1), (try m2.prefixed(&.{ 0, 0, 1 })).len);
+    // range: lo <= key < hi
+    const r = try m2.range(&be32(10), &be32(20));
+    try std.testing.expectEqual(@as(usize, 10), r.len);
+    try std.testing.expectEqualSlices(u8, &be32(10), r[0].key);
+    try std.testing.expectEqualSlices(u8, &be32(19), r[9].key);
+    try std.testing.expectEqual(@as(usize, 0), (try m2.range(&be32(20), &be32(20))).len);
+    // floor: exact, between (299 is gone), below the first, empty
+    try std.testing.expectEqualSlices(u8, &be32(7), (try m2.floor(&be32(7))).?.key);
+    try std.testing.expectEqualSlices(u8, &be32(298), (try m2.floor(&be32(1000))).?.key);
+    try std.testing.expect((try m2.floor(&.{ 0, 0 })) == null);
+    var empty = maps2.map(null);
+    try std.testing.expect((try empty.floor(&be32(1))) == null);
+    try std.testing.expectEqual(@as(usize, 0), (try empty.range(&be32(0), &be32(9))).len);
 }

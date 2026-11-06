@@ -199,6 +199,27 @@ pub const Forest = struct {
         return null;
     }
 
+    /// The entry with the greatest key <= `key`, copied into `a`; null when
+    /// every key is above it (or the tree is empty). One descent: in each
+    /// node the key just below `key` is the best so far, and the gap before
+    /// `key`'s position holds every key between it and `key`.
+    pub fn floor(f: *Forest, a: std.mem.Allocator, root: ?[]const u8, key: []const u8) !?KV {
+        var best: ?Entry = null;
+        var cur = root;
+        while (cur) |c| {
+            const n = try f.load(c);
+            const i = search(n, key);
+            if (i < n.entries.len and std.mem.eql(u8, n.entries[i].key, key)) {
+                best = n.entries[i];
+                break;
+            }
+            if (i > 0) best = n.entries[i - 1];
+            cur = n.gapBefore(i);
+        }
+        const e = best orelse return null;
+        return .{ .key = try a.dupe(u8, e.key), .value = try clone(a, e.value) };
+    }
+
     /// Every entry with lo <= key < hi (null: unbounded), in key order, copied into `a`.
     pub fn range(f: *Forest, a: std.mem.Allocator, root: ?[]const u8, lo: ?[]const u8, hi: ?[]const u8, out: *std.array_list.Managed(KV)) !void {
         const c = root orelse return;
@@ -668,4 +689,57 @@ test "mst: prefix scans over composite keys" {
     try f.prefixed(a, root, "", &out);
     try std.testing.expectEqual(@as(usize, 7), out.items.len);
     try std.testing.expectEqualStrings("", out.items[0].key);
+}
+
+test "mst: floor — the greatest key at or below, by descent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem = Mem{ .map = std.StringHashMap([]u8).init(a) };
+    var f = Forest.init(std.testing.allocator, mem.blocks());
+    defer f.deinit();
+    // empty
+    try std.testing.expect((try f.floor(a, null, "x")) == null);
+    // even keys 0, 2, … as 8-byte big-endian numbers: many nodes, several levels
+    const N = 3000;
+    var root: ?[]const u8 = null;
+    var kb: [8]u8 = undefined;
+    for (0..N) |i| {
+        std.mem.writeInt(u64, &kb, 2 * i + 2, .big);
+        root = try f.put(root, &kb, .{ .int = @intCast(2 * i + 2) });
+    }
+    // the tree really has more than one node
+    try std.testing.expect((try f.load(root.?)).entries.len < N);
+    try f.flush(root, mem.sink());
+    root = try keep(a, root);
+    f.reset(true); // every node now comes from the blocks
+    var q: [8]u8 = undefined;
+    for (0..2 * N + 4) |x| {
+        std.mem.writeInt(u64, &q, x, .big);
+        const got = try f.floor(a, root, &q);
+        if (x < 2) {
+            // below the first key
+            try std.testing.expect(got == null);
+            continue;
+        }
+        // an exact hit on even x, the key just below on odd x, the last key past the end
+        const want: u64 = @min(x - x % 2, 2 * N);
+        try std.testing.expectEqual(want, std.mem.readInt(u64, got.?.key[0..8], .big));
+        try std.testing.expectEqual(@as(i128, want), got.?.value.int);
+    }
+    // a key shorter than the stored ones: below each with that prefix
+    try std.testing.expect((try f.floor(a, root, &.{0})) == null);
+    try std.testing.expectEqual(@as(u64, 2 * N), std.mem.readInt(u64, (try f.floor(a, root, &.{0xff})).?.key[0..8], .big));
+    // floor agrees with the last entry of range(null, key ++ 0) on random keys
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..200) |_| {
+        std.mem.writeInt(u64, &q, prng.random().uintLessThan(u64, 2 * N + 10), .big);
+        var hi: [9]u8 = undefined;
+        @memcpy(hi[0..8], &q);
+        hi[8] = 0;
+        var out = std.array_list.Managed(KV).init(a);
+        try f.range(a, root, null, &hi, &out);
+        const got = try f.floor(a, root, &q);
+        if (out.items.len == 0) try std.testing.expect(got == null) else try std.testing.expectEqualSlices(u8, out.items[out.items.len - 1].key, got.?.key);
+    }
 }
