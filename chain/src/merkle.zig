@@ -179,3 +179,119 @@ pub fn pathFor(a: std.mem.Allocator, s: Store, root: [32]u8, block_height: u32, 
     }
     return .{ .block_height = block_height, .path = levels };
 }
+
+/// A transaction to prove in a block: its txid and where it sits (`Position`, from `proofs`).
+pub const Leaf = struct { txid: [32]u8, pos: Position };
+
+/// ONE BUMP for several transactions of the block at `block_height` whose merkle root is `root`,
+/// selected from the nodes we hold in one flow, no merges: the descent of `pathFor` for every leaf
+/// at once, from the root, each node read once however many leaves pass under it, turning by the
+/// offsets' bits. At each level the entries are every leaf's siblings (BRC-74: a right sibling equal
+/// to the left is a duplicate) and, at the bottom, the leaves themselves (flagged txid), each offset
+/// once, in offset order. An entry whose two children the level below also gives is left out (it is
+/// computable): the rule `MerklePath.combine` applies, so the BUMP is the one `combine` makes of
+/// the leaves' one-leaf paths. Null when a node on the way is not held, the leaves disagree on the
+/// depth, or a descent does not end at its txid. A one-transaction block: the root is the txid.
+pub fn pathsFor(a: std.mem.Allocator, s: Store, root: [32]u8, block_height: u32, leaves: []const Leaf) !?MerklePath {
+    if (leaves.len == 0) return null;
+    if (std.mem.eql(u8, &root, &leaves[0].txid)) {
+        for (leaves[1..]) |l| if (!std.mem.eql(u8, &l.txid, &leaves[0].txid)) return null;
+        return pathFor(a, s, root, block_height, leaves[0].txid, leaves[0].pos);
+    }
+    const h: usize = leaves[0].pos.depth;
+    if (h == 0 or h > 64) return null;
+    const sorted = try a.dupe(Leaf, leaves);
+    std.mem.sort(Leaf, sorted, {}, struct {
+        fn lt(_: void, x: Leaf, y: Leaf) bool {
+            return x.pos.offset < y.pos.offset;
+        }
+    }.lt);
+    // One entry per (txid, offset): the same leaf twice is one leaf; two txids at one offset is no tree.
+    var n: usize = 0;
+    for (sorted) |l| {
+        if (l.pos.depth != h) return null;
+        if (h < 64 and l.pos.offset >> @intCast(h) != 0) return null;
+        if (n > 0 and sorted[n - 1].pos.offset == l.pos.offset) {
+            if (!std.mem.eql(u8, &sorted[n - 1].txid, &l.txid)) return null;
+            continue;
+        }
+        sorted[n] = l;
+        n += 1;
+    }
+    const levels = try a.alloc(std.ArrayList(PathElement), h);
+    for (levels) |*lv| lv.* = .empty;
+    var d = Descent{ .a = a, .s = s, .h = h, .levels = levels };
+    if (!try d.down(root, 0, sorted[0..n])) return null;
+    // Leave out what the level below makes (combine's rule: both children given there).
+    const out = try a.alloc([]PathElement, h);
+    out[0] = levels[0].items;
+    for (1..h) |i| {
+        const below = levels[i - 1].items;
+        var kept: std.ArrayList(PathElement) = .empty;
+        for (levels[i].items) |e| if (!(gives(below, 2 * e.offset) and gives(below, 2 * e.offset + 1))) try kept.append(a, e);
+        out[i] = kept.items;
+    }
+    return .{ .block_height = block_height, .path = out };
+}
+
+/// Whether a level (in offset order) gives an entry at `offset`.
+fn gives(level: []const PathElement, offset: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = level.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (level[mid].offset == offset) return true;
+        if (level[mid].offset < offset) lo = mid + 1 else hi = mid;
+    }
+    return false;
+}
+
+const Descent = struct {
+    a: std.mem.Allocator,
+    s: Store,
+    h: usize,
+    /// Bottom level first; each appended in offset order (left subtree before right).
+    levels: []std.ArrayList(PathElement),
+
+    /// The node `cur` at `depth` below the root, over `leaves` (non-empty, in offset order, all
+    /// under it): read once, split by the bit of this level, each side descended; the side with no
+    /// leaf is the other side's sibling.
+    fn down(d: *Descent, cur: [32]u8, depth: usize, leaves: []const Leaf) !bool {
+        const level = d.h - 1 - depth; // the children's level, counted from the bottom
+        const n = (try node(d.a, d.s, cur)) orelse return false;
+        const left: [32]u8 = n[0..32].*;
+        const right: [32]u8 = n[32..64].*;
+        const same = std.mem.eql(u8, &left, &right);
+        var split: usize = 0;
+        while (split < leaves.len and (leaves[split].pos.offset >> @intCast(level)) & 1 == 0) split += 1;
+        const lo = leaves[0..split];
+        const hi = leaves[split..];
+        if (hi.len > 0 and same) return false; // the duplicate right is no leaf of its own
+        const child = (leaves[0].pos.offset >> @intCast(level)) & ~@as(u64, 1); // the left child's offset
+        const lv = &d.levels[level];
+        if (level == 0) {
+            if (lo.len > 0) {
+                if (!std.mem.eql(u8, &left, &lo[0].txid)) return false;
+                try lv.append(d.a, .{ .offset = child, .hash = .{ .bytes = left }, .txid = true });
+            } else try lv.append(d.a, .{ .offset = child, .hash = .{ .bytes = left } });
+            if (hi.len > 0) {
+                if (!std.mem.eql(u8, &right, &hi[0].txid)) return false;
+                try lv.append(d.a, .{ .offset = child + 1, .hash = .{ .bytes = right }, .txid = true });
+            } else if (same) {
+                try lv.append(d.a, .{ .offset = child + 1, .duplicate = true });
+            } else try lv.append(d.a, .{ .offset = child + 1, .hash = .{ .bytes = right } });
+            return true;
+        }
+        // The left child is the sibling of the leaves under the right; the right child (or the
+        // duplicate) is the sibling of the leaves under the left. Both appended here, in offset
+        // order, before either side descends: the depth-first walk, left first, keeps every level
+        // in offset order.
+        if (hi.len > 0) try lv.append(d.a, .{ .offset = child, .hash = .{ .bytes = left } });
+        if (lo.len > 0) {
+            if (same) try lv.append(d.a, .{ .offset = child + 1, .duplicate = true }) else try lv.append(d.a, .{ .offset = child + 1, .hash = .{ .bytes = right } });
+        }
+        if (lo.len > 0 and !try d.down(left, depth + 1, lo)) return false;
+        if (hi.len > 0 and !try d.down(right, depth + 1, hi)) return false;
+        return true;
+    }
+};

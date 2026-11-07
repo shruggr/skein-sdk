@@ -1666,3 +1666,206 @@ fn cbor_cid(b: u8) [36]u8 {
 test "zz: vector counts" {
     std.debug.print("\nvectors passed: tx {d} (fees {d}), beef {d}, merkle {d}, headers {d}, brc29 {d}, wire {d}, signing {d}, chronicle {d}; wallet scenarios {d}\n", .{ counts.tx, counts.fee, counts.beef, counts.path, counts.header, counts.brc29, counts.wire, counts.sign, counts.chronicle, counts.wallet });
 }
+
+// ---------------------------------------------------------------- one BUMP per block, selected (no merges)
+
+/// Every node of a full tree into the store (64-byte bitcoin-tx blocks).
+fn putTree(s: lib.store.Store, tree: []const []const [32]u8) !void {
+    for (tree[0 .. tree.len - 1], 0..) |cur, k| {
+        var i: usize = 0;
+        while (i < cur.len) : (i += 2) {
+            const l = cur[i];
+            const r = if (i + 1 < cur.len) cur[i + 1] else l;
+            try lib.merkle.putNodes(s, &.{.{ .hash = tree[k + 1][i / 2], .bytes = l ++ r }});
+        }
+    }
+}
+
+/// The BUMP the accumulators made before: the one-leaf paths, `combine`d in `order`, txids flagged.
+fn combined(a: std.mem.Allocator, s: lib.store.Store, root: [32]u8, height: u32, leaves: []const lib.merkle.Leaf, order: []const usize) ![]const u8 {
+    var acc: ?bsvz.spv.MerklePath = null;
+    for (order) |k| {
+        const p = (try lib.merkle.pathFor(a, s, root, height, leaves[k].txid, leaves[k].pos)).?;
+        if (acc) |*q| try q.combine(&p, a) else acc = p;
+    }
+    for (acc.?.path[0]) |*l| if (l.hash) |h| for (leaves) |x| if (std.mem.eql(u8, &h.bytes, &x.txid)) {
+        l.txid = true;
+    };
+    return acc.?.bytes(a);
+}
+
+/// Every order of `0..k` (Heap's algorithm), each handed to `f`.
+fn eachOrder(a: std.mem.Allocator, k: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), []const usize) anyerror!void) !void {
+    const order = try a.alloc(usize, k);
+    for (order, 0..) |*o, i| o.* = i;
+    const c = try a.alloc(usize, k);
+    @memset(c, 0);
+    try f(ctx, order);
+    var i: usize = 1;
+    while (i < k) {
+        if (c[i] < i) {
+            if (i % 2 == 0) std.mem.swap(usize, &order[0], &order[i]) else std.mem.swap(usize, &order[c[i]], &order[i]);
+            try f(ctx, order);
+            c[i] += 1;
+            i = 1;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+}
+
+const Orders = struct {
+    a: std.mem.Allocator,
+    s: lib.store.Store,
+    root: [32]u8,
+    leaves: []const lib.merkle.Leaf,
+    first: ?[]const u8 = null,
+    same: bool = true,
+    ours: ?[]const u8 = null,
+    matched: bool = false,
+    fn one(self: *Orders, order: []const usize) !void {
+        const got = try combined(self.a, self.s, self.root, 1, self.leaves, order);
+        if (self.ours) |x| if (std.mem.eql(u8, x, got)) {
+            self.matched = true;
+        };
+        if (self.first) |f| {
+            if (!std.mem.eql(u8, f, got)) self.same = false;
+        } else self.first = got;
+    }
+};
+
+/// A block of `size` synthetic transactions, its whole tree in a MemStore.
+const Block = struct {
+    ms: lib.store.MemStore,
+    leaves: [][32]u8,
+    tree: []const []const [32]u8,
+    fn init(a: std.mem.Allocator, size: usize) !Block {
+        var b: Block = .{ .ms = lib.store.MemStore.init(std.testing.allocator), .leaves = try a.alloc([32]u8, size), .tree = undefined };
+        for (b.leaves, 0..) |*l, i| l.* = lib.store.dblSha256(std.mem.asBytes(&i));
+        b.tree = try fullTree(a, b.leaves);
+        try putTree(b.ms.store(), b.tree);
+        return b;
+    }
+    fn root(b: *const Block) [32]u8 {
+        return b.tree[b.tree.len - 1][0];
+    }
+    fn leaf(b: *const Block, i: usize) lib.merkle.Leaf {
+        return .{ .txid = b.leaves[i], .pos = .{ .depth = @intCast(b.tree.len - 1), .offset = i } };
+    }
+};
+
+test "pathsFor: one BUMP for several transactions of a block, selected in one descent — byte for byte the one combine makes of their one-leaf paths, in every order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Named cases: an odd block whose last leaf's sibling is the duplicate, leaf pairs, a whole small
+    // block, one leaf (= pathFor), a leaf named twice, a one-transaction block.
+    const Case = struct { size: usize, picks: []const usize };
+    const cases = [_]Case{
+        .{ .size = 7, .picks = &.{ 1, 4, 6 } },
+        .{ .size = 7, .picks = &.{6} },
+        .{ .size = 7, .picks = &.{ 6, 2, 3 } },
+        .{ .size = 13, .picks = &.{ 0, 5, 12 } },
+        .{ .size = 13, .picks = &.{ 12, 12, 1 } },
+        .{ .size = 2, .picks = &.{ 0, 1 } },
+        .{ .size = 4, .picks = &.{ 0, 1, 2, 3 } },
+        .{ .size = 1, .picks = &.{0} },
+        .{ .size = 1, .picks = &.{ 0, 0 } },
+        .{ .size = 100, .picks = &.{ 0, 99, 37 } },
+    };
+    for (cases) |c| {
+        var b = try Block.init(a, c.size);
+        defer b.ms.deinit();
+        var picks: std.ArrayList(lib.merkle.Leaf) = .empty;
+        for (c.picks) |i| try picks.append(a, b.leaf(i));
+        const got = (try lib.merkle.pathsFor(a, b.ms.store(), b.root(), 1, picks.items)).?;
+        var o = Orders{ .a = a, .s = b.ms.store(), .root = b.root(), .leaves = picks.items };
+        // Where combine's bytes depend on the order (1, 4, 6 of seven: the level-1 sibling of 1's
+        // pair comes back when 1's path is merged last), ours are those of one of the orders;
+        // elsewhere those of every order.
+        o.ours = try got.bytes(a);
+        try eachOrder(a, picks.items.len, &o, Orders.one);
+        if (o.same) try std.testing.expectEqualStrings(try hexOf(a, o.first.?), try hexOf(a, o.ours.?)) else try std.testing.expect(o.matched);
+        for (picks.items) |l| try std.testing.expectEqualSlices(u8, &b.root(), &beef.rootFor(a, got, l.txid).?);
+        if (c.picks.len == 1) try std.testing.expectEqualStrings(
+            try hexOf(a, try (try lib.merkle.pathFor(a, b.ms.store(), b.root(), 1, picks.items[0].txid, picks.items[0].pos)).?.bytes(a)),
+            try hexOf(a, try got.bytes(a)),
+        );
+    }
+
+    // Random leaf sets: every leaf proves the root; wherever combine gives the same bytes in every
+    // order, ours are those bytes. (combine's result depends on the order for some sets: an upper
+    // sibling it left out as computable can come back with a later path. Ours does not.)
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var same_orders: usize = 0;
+    for ([_]usize{ 2, 3, 7, 13, 64, 100, 257 }) |size| {
+        var b = try Block.init(a, size);
+        defer b.ms.deinit();
+        for (0..40) |_| {
+            const k = 1 + rnd.uintLessThan(usize, @min(size, 5));
+            var picks: std.ArrayList(lib.merkle.Leaf) = .empty;
+            for (0..k) |_| try picks.append(a, b.leaf(rnd.uintLessThan(usize, size)));
+            const got = (try lib.merkle.pathsFor(a, b.ms.store(), b.root(), 1, picks.items)).?;
+            for (picks.items) |l| try std.testing.expectEqualSlices(u8, &b.root(), &beef.rootFor(a, got, l.txid).?);
+            const back = try bsvz.spv.MerklePath.parse(a, try got.bytes(a));
+            try std.testing.expectEqualSlices(u8, try got.bytes(a), try back.bytes(a));
+            var o = Orders{ .a = a, .s = b.ms.store(), .root = b.root(), .leaves = picks.items };
+            try eachOrder(a, k, &o, Orders.one);
+            if (o.same) {
+                same_orders += 1;
+                try std.testing.expectEqualSlices(u8, o.first.?, try got.bytes(a));
+            }
+        }
+    }
+    try std.testing.expect(same_orders > 200); // 237 of 280 with this seed
+
+    // One read per node on the way, however many leaves pass under it: 1, 4, 6 of seven read the
+    // root, both nodes below it and the three leaf pairs' nodes.
+    {
+        var b = try Block.init(a, 7);
+        defer b.ms.deinit();
+        var cs = CountingStore{ .inner = b.ms.store() };
+        _ = (try lib.merkle.pathsFor(a, cs.store(), b.root(), 1, &.{ b.leaf(1), b.leaf(4), b.leaf(6) })).?;
+        try std.testing.expectEqual(@as(usize, 6), cs.reads);
+        // Null: a leaf at another txid's position, the duplicate right as a leaf, a node not held,
+        // leaves of different depths.
+        var wrong = b.leaf(1);
+        wrong.pos.offset = 2;
+        try std.testing.expect((try lib.merkle.pathsFor(a, b.ms.store(), b.root(), 1, &.{ b.leaf(4), wrong })) == null);
+        var dup = b.leaf(6);
+        dup.pos.offset = 7;
+        try std.testing.expect((try lib.merkle.pathsFor(a, b.ms.store(), b.root(), 1, &.{dup})) == null);
+        var deep = b.leaf(4);
+        deep.pos.depth = 4;
+        try std.testing.expect((try lib.merkle.pathsFor(a, b.ms.store(), b.root(), 1, &.{ b.leaf(1), deep })) == null);
+        var empty = lib.store.MemStore.init(std.testing.allocator);
+        defer empty.deinit();
+        try std.testing.expect((try lib.merkle.pathsFor(a, empty.store(), b.root(), 1, &.{ b.leaf(1), b.leaf(4) })) == null);
+    }
+}
+
+test "pathsFor: K leaves of one block — the one descent against the one-leaf paths combined (time, store reads)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var b = try Block.init(a, 4096);
+    defer b.ms.deinit();
+    const io = std.testing.io;
+    for ([_]usize{ 1, 10, 50 }) |k| {
+        var picks: std.ArrayList(lib.merkle.Leaf) = .empty;
+        for (0..k) |i| try picks.append(a, b.leaf(@intCast((@as(u64, i) * 2654435761) % 4096)));
+        const order = try a.alloc(usize, k);
+        for (order, 0..) |*o, i| o.* = i;
+        var old = CountingStore{ .inner = b.ms.store() };
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        _ = try combined(a, old.store(), b.root(), 1, picks.items, order);
+        const t1 = std.Io.Timestamp.now(io, .awake);
+        var new = CountingStore{ .inner = b.ms.store() };
+        _ = (try lib.merkle.pathsFor(a, new.store(), b.root(), 1, picks.items)).?;
+        const t2 = std.Io.Timestamp.now(io, .awake);
+        std.debug.print("pathsFor bench K={d}: combine {d} us, {d} reads; pathsFor {d} us, {d} reads\n", .{ k, @divTrunc(t0.durationTo(t1).nanoseconds, 1000), old.reads, @divTrunc(t1.durationTo(t2).nanoseconds, 1000), new.reads });
+        try std.testing.expect(new.reads <= old.reads);
+    }
+}

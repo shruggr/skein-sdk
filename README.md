@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.13.0**, Zig 0.16.0.
+**0.14.0**, Zig 0.16.0.
 
 ## What it is
 
@@ -209,6 +209,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.14.0 | one BUMP per block, selected with no merges: `merkle.pathsFor(root, height, leaves)` descends from the root for every leaf at once (each node read once), the BUMP being every leaf's siblings per level, each offset once, in offset order, an entry the level below makes left out; `State.bumps()` gathers proven transactions by block (`add` gives the block's index) and `build`s each block's BUMP once; `beefOf` uses it — `MerklePath.combine` is no longer called (it rebuilt and sorted every level per merge: K ancestors in one block cost O(K²) and more, reads ran out of fuel near 800 KB) |
 | 0.13.0 | the floor of a key and a bounded range: `mst` `Forest.floor(root, key)` — the entry with the greatest key at or below `key` (null when none), by one descent, no scan; the chain store's `Map.floor(key)` and `Map.range(lo, hi)` (lo ≤ key < hi) |
 | 0.12.0 | the host chain (shruggr/skein#156): `chain.host` — the host chain record and its tracker (`Host.open`, `add`, `import` from an image tree into an empty host chain, `save`; `read`); `State.pointAt(host record)`: an instance's chain state names the host chain's `headers` and `heights` roots instead of copying them, the fork found by walking back from its tip, proofs above a replaced fork reverted and their broadcasts registered again as `addHeaders` does, pending proofs retried; `image.loadMaps` (`load` over any pair of chain maps); `chain.open` (shruggr/skein-sdk#1): the one opener for readers of `chain/state`, network from the record; the `chain` module is built with `-Dwallet=false` too (`-Dchain=false` leaves it out) |
 | 0.11.1 | a BEEF out of order is sorted on read, not refused (David Case, 2026-10-22): `beef.order` / `beef.sorted` (a stable topological sort, every in-BEEF parent first, proven or not; an order that already holds is kept; a cycle is the only refusal), and SPV (`spv.verify`), the chain state's `ingest` and the wallet's overlay `decode` verify and record in that order, as ts-sdk and go-sdk read; the checks are as strict as before (BUMP roots against headers, an unproven transaction's inputs earlier or held, scripts, txid-only only when held). `parse` still keeps the wire's order; a bare BEEF's subject is still its last transaction as written |

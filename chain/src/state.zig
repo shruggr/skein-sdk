@@ -294,6 +294,46 @@ pub const State = struct {
         return merkle.pathFor(self.arena, self.store, root, height, txid, r.pos);
     }
 
+    /// The BUMPs of several proven transactions, one per block: gather them (`add`, which gives the
+    /// index of the transaction's block, blocks numbered in the order first named), then `build`
+    /// selects each block's BUMP from the tree's nodes in one descent (`merkle.pathsFor`), no merges.
+    pub fn bumps(self: *State) Bumps {
+        return .{ .st = self };
+    }
+
+    pub const Bumps = struct {
+        st: *State,
+        blocks: std.ArrayList(Block) = .empty,
+
+        const Block = struct { hash: [32]u8, height: u32, root: [32]u8, leaves: std.ArrayList(merkle.Leaf) = .empty };
+
+        /// A proven transaction's block's index; error.MissingProof when its proof's block is not on our best chain.
+        pub fn add(self: *Bumps, txid: [32]u8) !usize {
+            const a = self.st.arena;
+            const r = (try self.st.proofRecord(txid)) orelse return error.MissingProof;
+            const hash = store_mod.bitcoinHash(r.block) orelse return error.BadIndex;
+            for (self.blocks.items, 0..) |*b, i| if (std.mem.eql(u8, &b.hash, &hash)) {
+                try b.leaves.append(a, .{ .txid = txid, .pos = r.pos });
+                return i;
+            };
+            const height = (try self.st.chain().heightOf(hash)) orelse return error.MissingProof;
+            const raw = try self.st.store.get(a, r.block);
+            if (raw.len != hdr.size) return error.BadRecord;
+            var b: Block = .{ .hash = hash, .height = height, .root = (try hdr.Header.parse(raw[0..hdr.size])).merkle_root };
+            try b.leaves.append(a, .{ .txid = txid, .pos = r.pos });
+            try self.blocks.append(a, b);
+            return self.blocks.items.len - 1;
+        }
+
+        /// One BUMP per block, in index order.
+        pub fn build(self: *Bumps) ![]merkle.MerklePath {
+            const a = self.st.arena;
+            const out = try a.alloc(merkle.MerklePath, self.blocks.items.len);
+            for (self.blocks.items, out) |b, *p| p.* = (try merkle.pathsFor(a, self.st.store, b.root, b.height, b.leaves.items)) orelse return error.MissingProof;
+            return out;
+        }
+    };
+
     /// A merkle path (BRC-74) for a transaction we hold: proven, unless it was rejected first (it stays
     /// rejected). Every other held transaction spending one of the same outputs is rejected
     /// ("double-spent"). error.UnknownHeader when the header at its height is not held yet.
@@ -672,16 +712,19 @@ pub const State = struct {
     /// transactions (their BUMPs, merged per block), parents first, then the transaction.
     pub fn beefOf(self: *State, txid: [32]u8) !?[]const u8 {
         if ((try self.txRaw(txid)) == null) return null;
-        var acc = BeefAcc{ .st = self };
+        var acc = BeefAcc{ .st = self, .bumps = self.bumps() };
         try acc.visit(txid);
-        acc.flagLeaves();
-        return try beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .atomic = txid, .bumps = acc.bumps.items, .entries = acc.entries.items });
+        const paths = try acc.bumps.build();
+        flagLeaves(acc.entries.items, paths);
+        return try beef_mod.serialize(self.arena, .{ .version = beef_mod.V2, .atomic = txid, .bumps = paths, .entries = acc.entries.items });
     }
 
+    /// The ancestry walk: proven transactions noted by block (their BUMPs built after, one per block),
+    /// unproven ones over their parents, parents first.
     const BeefAcc = struct {
         st: *State,
         entries: std.ArrayList(beef_mod.Entry) = .empty,
-        bumps: std.ArrayList(bsvz.spv.MerklePath) = .empty,
+        bumps: Bumps,
 
         fn visit(acc: *BeefAcc, txid: [32]u8) anyerror!void {
             const a = acc.st.arena;
@@ -689,32 +732,25 @@ pub const State = struct {
             const raw = (try acc.st.txRaw(txid)) orelse return error.MissingAncestor;
             const tx = try bsvz.transaction.Transaction.parse(a, raw);
             if ((try acc.st.status(txid)) == .proven) {
-                const p = (try acc.st.proofFor(txid)) orelse return error.MissingProof;
-                const idx = for (acc.bumps.items, 0..) |*bp, i| {
-                    if (bp.block_height != p.block_height) continue;
-                    bp.combine(&p, a) catch continue;
-                    break i;
-                } else blk: {
-                    try acc.bumps.append(a, p);
-                    break :blk acc.bumps.items.len - 1;
-                };
+                const idx = try acc.bumps.add(txid);
                 try acc.entries.append(a, .{ .txid = txid, .format = .raw_with_bump, .bump = idx, .raw = raw, .tx = tx });
                 return;
             }
             for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
             try acc.entries.append(a, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
         }
-
-        fn flagLeaves(acc: *BeefAcc) void {
-            for (acc.entries.items) |e| {
-                const bi = e.bump orelse continue;
-                for (acc.bumps.items[bi].path[0]) |*l| if (l.hash) |h| if (std.mem.eql(u8, &h.bytes, &e.txid)) {
-                    l.txid = true;
-                };
-            }
-        }
     };
 };
+
+/// Flag each proven entry's leaf in its BUMP as a transaction (BRC-74 txid).
+pub fn flagLeaves(entries: []const beef_mod.Entry, paths: []merkle.MerklePath) void {
+    for (entries) |e| {
+        const bi = e.bump orelse continue;
+        for (paths[bi].path[0]) |*l| if (l.hash) |h| if (std.mem.eql(u8, &h.bytes, &e.txid)) {
+            l.txid = true;
+        };
+    }
+}
 
 fn optEq(x: ?[]const u8, y: ?[]const u8) bool {
     if (x == null or y == null) return x == null and y == null;

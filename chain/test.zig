@@ -234,6 +234,81 @@ test "beefOf: an unproven child goes out over its proven parent; once proven, al
     try std.testing.expectEqual(lib.state.Status.proven, (try st2.ingest(bytes)).status);
 }
 
+/// A transaction spending output 0 of each of `srcs` to our key (signed P2PKH).
+fn spendAll(a: std.mem.Allocator, srcs: []const *const bsvz.transaction.Transaction, sats: u64) !Tx {
+    var b = bsvz.transaction.Builder.init(a);
+    for (srcs) |src| try b.addInputFromTx(src, 0);
+    const script = p2pkh(try pub33());
+    try b.addOutput(.{ .satoshis = @intCast(sats), .locking_script = bsvz.script.Script.init(try a.dupe(u8, &script)) });
+    var tx = try b.build();
+    const key = try bsvz.crypto.PrivateKey.fromBytes(priv);
+    for (srcs, 0..) |src, i| {
+        const prev = src.outputs[0];
+        const u = try bsvz.transaction.templates.p2pkh_spend.signAndBuildUnlockingScript(a, &tx, i, prev.locking_script, prev.satoshis, key, bsvz.transaction.templates.p2pkh_spend.default_scope);
+        @constCast(tx.inputs)[i].unlocking_script = u;
+    }
+    const raw = try tx.serialize(a);
+    return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
+}
+
+/// The BUMP bytes of leaf `i` of a four-leaf block at `height` (leaves `l`).
+fn path4(a: std.mem.Allocator, height: u32, l: [4][32]u8, i: usize) ![]const u8 {
+    const n0 = lib.store.dblSha256(&(l[0] ++ l[1]));
+    const n1 = lib.store.dblSha256(&(l[2] ++ l[3]));
+    const PE = std.meta.Elem(std.meta.Elem(@FieldType(bsvz.spv.MerklePath, "path")));
+    const levels = try a.alloc([]PE, 2);
+    const leaf: PE = .{ .offset = i, .hash = .{ .bytes = l[i] }, .txid = true };
+    const sib: PE = .{ .offset = i ^ 1, .hash = .{ .bytes = l[i ^ 1] } };
+    levels[0] = try a.dupe(PE, if (i & 1 == 0) &.{ leaf, sib } else &.{ sib, leaf });
+    levels[1] = try a.dupe(PE, &.{.{ .offset = (i >> 1) ^ 1, .hash = .{ .bytes = if (i < 2) n1 else n0 } }});
+    const p: bsvz.spv.MerklePath = .{ .block_height = height, .path = levels };
+    return p.bytes(a);
+}
+
+test "beefOf: proven parents mined in one block go out under ONE BUMP for that block, selected from the tree's nodes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 3);
+    const c0 = try spend(a, &w.fund.tx, 0, 9_000);
+    const c1 = try spend(a, &w.fund.tx, 1, 9_000);
+    const c2 = try spend(a, &w.fund.tx, 2, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ c0, c1, c2 }));
+    // Block 2: c0, c1, c2 and one other transaction.
+    const block: [4][32]u8 = .{ c0.txid, c1.txid, c2.txid, .{0x99} ** 32 };
+    for ([_]Tx{ c0, c1, c2 }, 0..) |c, i| _ = try w.st.applyStatus(c.txid, "MINED", try path4(a, 2, block, i));
+    const root = lib.store.dblSha256(&(lib.store.dblSha256(&(block[0] ++ block[1])) ++ lib.store.dblSha256(&(block[2] ++ block[3]))));
+    const h2 = mine(hdr.hash(&w.h1), root, 1_700_001_200);
+    _ = try w.st.addHeaders(&.{&h2});
+    for ([_]Tx{ c0, c1, c2 }) |c| try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(c.txid));
+    // A grandchild of the funding spending c0 and c2, unmined: it goes out over both, one BUMP.
+    const g = try spendAll(a, &.{ &c0.tx, &c2.tx }, 17_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ c0, c2, g }));
+    const bytes = (try w.st.beefOf(g.txid)).?;
+    const out = try beef.parse(a, bytes);
+    try std.testing.expectEqual(@as(usize, 3), out.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), out.bumps.len);
+    try std.testing.expectEqual(@as(u32, 2), out.bumps[0].block_height);
+    for (out.entries[0..2]) |e| {
+        try std.testing.expectEqual(beef.Format.raw_with_bump, e.format);
+        try std.testing.expectEqual(@as(?usize, 0), e.bump);
+    }
+    // Both leaves (offsets 0 and 2, flagged), their siblings 1 and 3; nothing above (computable).
+    try std.testing.expectEqual(@as(usize, 4), out.bumps[0].path[0].len);
+    try std.testing.expectEqual(@as(usize, 0), out.bumps[0].path[1].len);
+    for (out.bumps[0].path[0], 0..) |l, i| try std.testing.expectEqual(i == 0 or i == 2, l.txid orelse false);
+    // Against headers alone it verifies.
+    var ms2 = lib.store.MemStore.init(std.testing.allocator);
+    defer ms2.deinit();
+    var st2 = try State.load(a, ms2.store(), null, .regtest);
+    _ = try st2.addHeaders(&.{ &w.h1, &h2 });
+    _ = try st2.ingest(bytes);
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(c0.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(c2.txid));
+}
+
 test "ingest: a Subject BEEF (BRC-233) — its subject, not the last; a transaction beside it that is no ancestor; each still checked" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
