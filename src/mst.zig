@@ -238,6 +238,32 @@ pub const Forest = struct {
         }
     }
 
+    /// The entries with lo <= key < hi (null: unbounded), GREATEST FIRST, at most `limit` of them,
+    /// copied into `a` (appended to `out`; it stops when `out` holds `limit`). A backward step from
+    /// the window's end: the walk goes right to left and returns at the `limit`-th entry or the
+    /// first key below `lo`, so it reads the nodes on the way to the entries it gives, never the
+    /// rest of the window.
+    pub fn rangeBack(f: *Forest, a: std.mem.Allocator, root: ?[]const u8, lo: ?[]const u8, hi: ?[]const u8, limit: usize, out: *std.array_list.Managed(KV)) !void {
+        if (out.items.len >= limit) return;
+        const c = root orelse return;
+        const n = try f.load(c);
+        var j: usize = n.entries.len;
+        while (true) {
+            // The gap before entry j: keys in (entries[j-1], entries[j]).
+            const gap_lo_ok = j == n.entries.len or lo == null or lt(lo.?, n.entries[j].key);
+            const gap_hi_ok = j == 0 or hi == null or lt(n.entries[j - 1].key, hi.?);
+            if (gap_lo_ok and gap_hi_ok) try f.rangeBack(a, n.gapBefore(j), lo, hi, limit, out);
+            if (out.items.len >= limit or j == 0) return;
+            j -= 1;
+            const k = n.entries[j].key;
+            if (lo != null and lt(k, lo.?)) return;
+            if (hi == null or lt(k, hi.?)) {
+                try out.append(.{ .key = try a.dupe(u8, k), .value = try clone(a, n.entries[j].value) });
+                if (out.items.len >= limit) return;
+            }
+        }
+    }
+
     /// Every entry whose key starts with `prefix`.
     pub fn prefixed(f: *Forest, a: std.mem.Allocator, root: ?[]const u8, prefix: []const u8, out: *std.array_list.Managed(KV)) !void {
         var hi_buf: [256]u8 = undefined;
@@ -689,6 +715,56 @@ test "mst: prefix scans over composite keys" {
     try f.prefixed(a, root, "", &out);
     try std.testing.expectEqual(@as(usize, 7), out.items.len);
     try std.testing.expectEqualStrings("", out.items[0].key);
+}
+
+test "mst: rangeBack — greatest first, stops at the limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem = Mem{ .map = std.StringHashMap([]u8).init(a) };
+    var f = Forest.init(std.testing.allocator, mem.blocks());
+    defer f.deinit();
+    var empty = std.array_list.Managed(KV).init(a);
+    try f.rangeBack(a, null, null, null, 10, &empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+    const N = 3000;
+    var root: ?[]const u8 = null;
+    var kb: [8]u8 = undefined;
+    for (0..N) |i| {
+        std.mem.writeInt(u64, &kb, 2 * i + 2, .big);
+        root = try f.put(root, &kb, .{ .int = @intCast(2 * i + 2) });
+    }
+    try f.flush(root, mem.sink());
+    root = try keep(a, root);
+    f.reset(true);
+    // against range(lo, hi) reversed and cut to the limit, on random windows and limits
+    var prng = std.Random.DefaultPrng.init(11);
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    for (0..300) |r| {
+        std.mem.writeInt(u64, &lo, prng.random().uintLessThan(u64, 2 * N + 10), .big);
+        std.mem.writeInt(u64, &hi, prng.random().uintLessThan(u64, 2 * N + 10), .big);
+        const limit = prng.random().uintLessThan(usize, 50) + 1;
+        const lo_o: ?[]const u8 = if (r % 5 == 0) null else &lo;
+        const hi_o: ?[]const u8 = if (r % 7 == 0) null else &hi;
+        var fwd = std.array_list.Managed(KV).init(a);
+        try f.range(a, root, lo_o, hi_o, &fwd);
+        var back = std.array_list.Managed(KV).init(a);
+        try f.rangeBack(a, root, lo_o, hi_o, limit, &back);
+        const want = @min(limit, fwd.items.len);
+        try std.testing.expectEqual(want, back.items.len);
+        for (back.items, 0..) |kv, i| {
+            const w = fwd.items[fwd.items.len - 1 - i];
+            try std.testing.expectEqualSlices(u8, w.key, kv.key);
+            try std.testing.expectEqual(w.value.int, kv.value.int);
+        }
+    }
+    // the reads it makes: a page of 10 from the end loads a few nodes, not the tree
+    f.reset(false);
+    var page = std.array_list.Managed(KV).init(a);
+    try f.rangeBack(a, root, null, null, 10, &page);
+    try std.testing.expectEqual(@as(u64, 2 * N), std.mem.readInt(u64, page.items[0].key[0..8], .big));
+    try std.testing.expect(f.cache.count() < 20);
 }
 
 test "mst: floor — the greatest key at or below, by descent" {
