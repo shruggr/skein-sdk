@@ -119,9 +119,10 @@ interface skein {
   /// place}. Kept when the step ends without error; refused in a kernel call.
   on: func(name: string, fn: string) -> result<_, string>;
 
-  /// End the calling app's subscriptions to `name` (shruggr/skein 0.5.2),
-  /// when the step ends without error; refused in a kernel call.
-  off: func(name: string) -> result<_, string>;
+  /// End the calling app's one subscription of `fn` to `name` (shruggr/skein
+  /// 0.5.3), the same two arguments as `on`; its other subscriptions to `name`
+  /// stay. When the step ends without error; refused in a kernel call.
+  off: func(name: string, fn: string) -> result<_, string>;
 }
 
 /// What a handler program imports beyond WASI's command world: skein's

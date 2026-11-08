@@ -38,7 +38,7 @@ pub const raw = struct {
     pub extern "skein" fn authfetch(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn events(q: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn on(name: [*]const u8, name_len: u32, func: [*]const u8, func_len: u32) i32;
-    pub extern "skein" fn off(name: [*]const u8, name_len: u32) i32;
+    pub extern "skein" fn off(name: [*]const u8, name_len: u32, func: [*]const u8, func_len: u32) i32;
 };
 
 /// A read of the event index (shruggr/skein 0.5.0): `query` {name | prefix, after?, limit?, latest?}
@@ -55,10 +55,11 @@ pub fn on(name: []const u8, func: []const u8) !void {
     if (raw.on(name.ptr, n32(name.len), func.ptr, n32(func.len)) < 0) return failed();
 }
 
-/// End the calling app's subscriptions to `name` (shruggr/skein 0.5.2), when the step ends without
-/// error; refused in a kernel call.
-pub fn off(name: []const u8) !void {
-    if (raw.off(name.ptr, n32(name.len)) < 0) return failed();
+/// End the calling app's one subscription of `func` to `name` (shruggr/skein 0.5.3) — the same two
+/// arguments as `on`; its other subscriptions to `name` stay. When the step ends without error;
+/// refused in a kernel call.
+pub fn off(name: []const u8, func: []const u8) !void {
+    if (raw.off(name.ptr, n32(name.len), func.ptr, n32(func.len)) < 0) return failed();
 }
 
 /// The edges into `to` (#42): dag-cbor [{from, seq, rel, locator}] from the

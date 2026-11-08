@@ -209,6 +209,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.17.1 | `sk.off(name, fn)` (shruggr/skein 0.5.3): the same two arguments as `sk.on`; ends only that one subscription, the app's others to the name stay; `wit/skein.wit` likewise |
 | 0.17.0 | subscriptions (shruggr/skein 0.5.2): `sk.on(name, fn)` and `sk.off(name)`, both in `wit/skein.wit`; `sk.route` removed (skein 0.5.1's `route` call is gone) |
 | 0.16.0 | the kernel's `events` read (shruggr/skein 0.5.0) and `route` call (0.5.1): `sk.events(a, query)`, `sk.route(a, transport, address, prefix)`, both in `wit/skein.wit` |
 | 0.15.0 | a backward step: `mst` `Forest.rangeBack(root, lo, hi, limit)` — the entries with lo ≤ key < hi (null: unbounded), greatest first, at most `limit`, walking right to left and returning at the limit (it reads the nodes on the way to what it gives, never the rest of the window); the chain store's `Map.rangeBack(lo, hi, limit)` |
