@@ -4,7 +4,7 @@ The Zig package a program for a [skein](https://github.com/shruggr/skein)
 is written against: the `skein` imports, the codecs, the app-calling helper,
 the chain library and the wallet library. skein's kernel and its own
 programs build against it too, so each file has one copy, here. Version
-**0.16.0**, Zig 0.16.0.
+**0.17.0**, Zig 0.16.0.
 
 ## What it is
 
@@ -209,6 +209,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.17.0 | subscriptions (shruggr/skein 0.5.2): `sk.on(name, fn)` and `sk.off(name)`, both in `wit/skein.wit`; `sk.route` removed (skein 0.5.1's `route` call is gone) |
 | 0.16.0 | the kernel's `events` read (shruggr/skein 0.5.0) and `route` call (0.5.1): `sk.events(a, query)`, `sk.route(a, transport, address, prefix)`, both in `wit/skein.wit` |
 | 0.15.0 | a backward step: `mst` `Forest.rangeBack(root, lo, hi, limit)` — the entries with lo ≤ key < hi (null: unbounded), greatest first, at most `limit`, walking right to left and returning at the limit (it reads the nodes on the way to what it gives, never the rest of the window); the chain store's `Map.rangeBack(lo, hi, limit)` |
 | 0.14.0 | one BUMP per block, selected with no merges: `merkle.pathsFor(root, height, leaves)` descends from the root for every leaf at once (each node read once), the BUMP being every leaf's siblings per level, each offset once, in offset order, an entry the level below makes left out; `State.bumps()` gathers proven transactions by block (`add` gives the block's index) and `build`s each block's BUMP once; `beefOf` uses it — `MerklePath.combine` is no longer called (it rebuilt and sorted every level per merge: K ancestors in one block cost O(K²) and more, reads ran out of fuel near 800 KB) |

@@ -112,14 +112,16 @@ interface skein {
   /// as it stands before this step's update.
   events: func(query: list<u8>) -> result<list<u8>, string>;
 
-  /// Create a route (shruggr/skein 0.5.1): `request` is dag-cbor {transport,
-  /// address, prefix?: true}, under an allowance — a dispatch row of that
-  /// transport with `dynamic: true` whose address it falls under (the whole
-  /// address or a path-segment prefix). The route takes the allowance's
-  /// handler, filters and settings; it is written to the dispatch table when
-  /// the step ends without error. Refused outside an allowance, and in a
-  /// kernel call.
-  route: func(request: list<u8>) -> result<_, string>;
+  /// Subscribe (shruggr/skein 0.5.2): `fn` — "<role>.<fn>", or "<fn>" for
+  /// an app with one program — of the calling app is stepped on each fact
+  /// named `name` exactly (no prefix) that lands after this step, each a
+  /// fresh step at the emitting entry with args {event, box: <the name>, fn,
+  /// place}. Kept when the step ends without error; refused in a kernel call.
+  on: func(name: string, fn: string) -> result<_, string>;
+
+  /// End the calling app's subscriptions to `name` (shruggr/skein 0.5.2),
+  /// when the step ends without error; refused in a kernel call.
+  off: func(name: string) -> result<_, string>;
 }
 
 /// What a handler program imports beyond WASI's command world: skein's

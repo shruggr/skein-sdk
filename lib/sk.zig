@@ -37,7 +37,8 @@ pub const raw = struct {
     pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn authfetch(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn events(q: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
-    pub extern "skein" fn route(req: [*]const u8, len: u32) i32;
+    pub extern "skein" fn on(name: [*]const u8, name_len: u32, func: [*]const u8, func_len: u32) i32;
+    pub extern "skein" fn off(name: [*]const u8, name_len: u32) i32;
 };
 
 /// A read of the event index (shruggr/skein 0.5.0): `query` {name | prefix, after?, limit?, latest?}
@@ -47,15 +48,17 @@ pub fn events(a: Allocator, query: Value) !Value {
     return cbor.decode(a, try result(a, raw.events, .{ q.ptr, n32(q.len) }));
 }
 
-/// Create a route under an allowance (shruggr/skein 0.5.1): {transport, address, prefix?}. Written to
-/// the dispatch table when the step ends without error.
-pub fn route(a: Allocator, transport: []const u8, address: []const u8, prefix: bool) !void {
-    var m = cbor.MapBuilder.init(a);
-    try m.put("transport", cbor.string(transport));
-    try m.put("address", cbor.string(address));
-    if (prefix) try m.put("prefix", .{ .bool = true });
-    const q = try cbor.encode(a, m.value());
-    if (raw.route(q.ptr, n32(q.len)) < 0) return failed();
+/// Subscribe (shruggr/skein 0.5.2): `func` — "<role>.<fn>", or "<fn>" for an app with one program —
+/// of the calling app is stepped on each fact named `name` exactly that lands after this step. Kept
+/// when the step ends without error; refused in a kernel call.
+pub fn on(name: []const u8, func: []const u8) !void {
+    if (raw.on(name.ptr, n32(name.len), func.ptr, n32(func.len)) < 0) return failed();
+}
+
+/// End the calling app's subscriptions to `name` (shruggr/skein 0.5.2), when the step ends without
+/// error; refused in a kernel call.
+pub fn off(name: []const u8) !void {
+    if (raw.off(name.ptr, n32(name.len)) < 0) return failed();
 }
 
 /// The edges into `to` (#42): dag-cbor [{from, seq, rel, locator}] from the
