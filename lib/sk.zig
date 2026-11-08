@@ -36,7 +36,27 @@ pub const raw = struct {
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn authfetch(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn events(q: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn route(req: [*]const u8, len: u32) i32;
 };
+
+/// A read of the event index (shruggr/skein 0.5.0): `query` {name | prefix, after?, limit?, latest?}
+/// → [{name, place: {n, seq, i, thread}, cid, record}], newest last.
+pub fn events(a: Allocator, query: Value) !Value {
+    const q = try cbor.encode(a, query);
+    return cbor.decode(a, try result(a, raw.events, .{ q.ptr, n32(q.len) }));
+}
+
+/// Create a route under an allowance (shruggr/skein 0.5.1): {transport, address, prefix?}. Written to
+/// the dispatch table when the step ends without error.
+pub fn route(a: Allocator, transport: []const u8, address: []const u8, prefix: bool) !void {
+    var m = cbor.MapBuilder.init(a);
+    try m.put("transport", cbor.string(transport));
+    try m.put("address", cbor.string(address));
+    if (prefix) try m.put("prefix", .{ .bool = true });
+    const q = try cbor.encode(a, m.value());
+    if (raw.route(q.ptr, n32(q.len)) < 0) return failed();
+}
 
 /// The edges into `to` (#42): dag-cbor [{from, seq, rel, locator}] from the
 /// kernel's index, `rel` only if given (who spent txid:vout: `spends` into

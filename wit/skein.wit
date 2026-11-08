@@ -104,6 +104,22 @@ interface skein {
   /// transaction, seq 0). A read, a pure function of the log plus the
   /// bitcoin blocks this step kept so far.
   edges: func(to: cid, rel: option<string>) -> result<list<u8>, string>;
+
+  /// The instance's event index (shruggr/skein 0.5.0): `query` is dag-cbor
+  /// {name: <a name> | prefix: <a name prefix>, after?: {n, seq, i, thread:
+  /// <cid>}, limit?: <n ≥ 1>, latest?: bool}; the result is dag-cbor [{name,
+  /// place: {n, seq, i, thread}, cid, record}], newest last. A read: the log
+  /// as it stands before this step's update.
+  events: func(query: list<u8>) -> result<list<u8>, string>;
+
+  /// Create a route (shruggr/skein 0.5.1): `request` is dag-cbor {transport,
+  /// address, prefix?: true}, under an allowance — a dispatch row of that
+  /// transport with `dynamic: true` whose address it falls under (the whole
+  /// address or a path-segment prefix). The route takes the allowance's
+  /// handler, filters and settings; it is written to the dispatch table when
+  /// the step ends without error. Refused outside an allowance, and in a
+  /// kernel call.
+  route: func(request: list<u8>) -> result<_, string>;
 }
 
 /// What a handler program imports beyond WASI's command world: skein's
