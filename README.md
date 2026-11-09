@@ -209,6 +209,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.17.2 | `sk.on(name, null)` (shruggr/skein 0.5.4): with no fn the calling thread rests on the name; every fact under it wakes the thread, which rests on it again; `func` is now `?[]const u8` (a string still subscribes); in `wit/skein.wit` an empty `fn` |
 | 0.17.1 | `sk.off(name, fn)` (shruggr/skein 0.5.3): the same two arguments as `sk.on`; ends only that one subscription, the app's others to the name stay; `wit/skein.wit` likewise |
 | 0.17.0 | subscriptions (shruggr/skein 0.5.2): `sk.on(name, fn)` and `sk.off(name)`, both in `wit/skein.wit`; `sk.route` removed (skein 0.5.1's `route` call is gone) |
 | 0.16.0 | the kernel's `events` read (shruggr/skein 0.5.0) and `route` call (0.5.1): `sk.events(a, query)`, `sk.route(a, transport, address, prefix)`, both in `wit/skein.wit` |

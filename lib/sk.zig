@@ -51,8 +51,14 @@ pub fn events(a: Allocator, query: Value) !Value {
 /// Subscribe (shruggr/skein 0.5.2): `func` — "<role>.<fn>", or "<fn>" for an app with one program —
 /// of the calling app is stepped on each fact named `name` exactly that lands after this step. Kept
 /// when the step ends without error; refused in a kernel call.
-pub fn on(name: []const u8, func: []const u8) !void {
-    if (raw.on(name.ptr, n32(name.len), func.ptr, n32(func.len)) < 0) return failed();
+///
+/// With no `func` (null; shruggr/skein 0.5.4) the calling THREAD rests on `name`: its step ends with
+/// the thread resting, and every fact emitted under `name` after it wakes the thread (a step with
+/// `event` {event, box: <the name>, place} in its input, its own context intact); it rests on the
+/// name again. Threads resting on one name wake in the order they began resting.
+pub fn on(name: []const u8, func: ?[]const u8) !void {
+    const f = func orelse "";
+    if (raw.on(name.ptr, n32(name.len), f.ptr, n32(f.len)) < 0) return failed();
 }
 
 /// End the calling app's one subscription of `func` to `name` (shruggr/skein 0.5.3) — the same two

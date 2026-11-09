@@ -117,6 +117,9 @@ interface skein {
   /// named `name` exactly (no prefix) that lands after this step, each a
   /// fresh step at the emitting entry with args {event, box: <the name>, fn,
   /// place}. Kept when the step ends without error; refused in a kernel call.
+  /// An empty `fn` (shruggr/skein 0.5.4): the calling thread rests on `name`
+  /// — its step ends resting, and every fact under `name` after it wakes the
+  /// thread with `event` {event, box, place} in its input; it rests again.
   on: func(name: string, fn: string) -> result<_, string>;
 
   /// End the calling app's one subscription of `fn` to `name` (shruggr/skein
