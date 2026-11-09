@@ -42,8 +42,9 @@
 //! broadcast again (`reverted`) with the same watchers, and the next proof
 //! — the same transaction in another block — tells them again.
 //!
-//! Status is computed from the records, never stored: rejected (a settlement
-//! record), proven (its proof's block is on our best chain), else unproven.
+//! Status is computed from the records, never stored: proven (its proof's block
+//! is on our best chain — also after a rejection: the latest fact wins, the
+//! settlement record stays), rejected (a settlement record), else unproven.
 //! A rejection walks what spends the transaction (the `spends` edges into it,
 //! held transactions only) and rejects that too ("input-rejected"). A proof
 //! rejects every other held transaction spending one of the same outputs
@@ -182,7 +183,7 @@ pub const State = struct {
     fn refreshSpent(self: *State, op: [36]u8) !void {
         var first: ?[32]u8 = null;
         for (try self.spendersOf(op)) |sp| {
-            if (try self.map("rejected").has(&sp)) continue;
+            if ((try self.status(sp)) == .rejected) continue;
             first = sp;
             break;
         }
@@ -228,9 +229,13 @@ pub const State = struct {
 
     // ------------------------------------------------------------ status
 
+    /// A transaction's status is its latest fact (0.18.0, David 2026-11-09): a proof on our best chain
+    /// makes it proven, also when it was rejected before (its settlement record stays: the reason is
+    /// read from state); else rejected (a settlement record); else unproven.
     pub fn status(self: *State, txid: [32]u8) !Status {
+        if ((try self.minedStatus(txid)) == .proven) return .proven;
         if (try self.map("rejected").has(&txid)) return .rejected;
-        return self.minedStatus(txid);
+        return .unproven;
     }
 
     pub fn minedStatus(self: *State, txid: [32]u8) !Status {
@@ -334,9 +339,10 @@ pub const State = struct {
         }
     };
 
-    /// A merkle path (BRC-74) for a transaction we hold: proven, unless it was rejected first (it stays
-    /// rejected). Every other held transaction spending one of the same outputs is rejected
-    /// ("double-spent"). error.UnknownHeader when the header at its height is not held yet.
+    /// A merkle path (BRC-74) for a transaction we hold: proven, also when it was rejected first (its
+    /// settlement record stays; the proof is the latest fact, and it is a change: `mined`). Every other
+    /// held transaction spending one of the same outputs is rejected ("double-spent").
+    /// error.UnknownHeader when the header at its height is not held yet.
     pub fn addProof(self: *State, txid: [32]u8, path: []const u8) !Status {
         if (!(try self.holds(txid))) return error.UnknownTransaction;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return error.BadProof;
@@ -347,8 +353,15 @@ pub const State = struct {
         const before = try self.status(txid);
         if (before == .proven) return .proven;
         try self.putProof(txid, p);
-        if (before == .rejected) return .rejected;
         try self.rejectConflicting(txid);
+        if (before == .rejected) {
+            // Its inputs' `spent` again (a rejected spender was left out), and the change itself: no
+            // broadcast record is left to settle (the rejection removed it), no watchers.
+            const raw = (try self.txRaw(txid)) orelse return error.UnknownTransaction;
+            const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+            for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
+            try self.changes.append(self.arena, .{ .txid = txid, .state = .proven, .watchers = &.{}, .detail = "" });
+        }
         try self.settled(txid, .proven, "");
         return .proven;
     }
@@ -615,8 +628,8 @@ pub const State = struct {
     pub fn applyStatus(self: *State, txid: [32]u8, tx_status: []const u8, merkle_path: ?[]const u8) !Outcome {
         if (!(try self.holds(txid))) return error.UnknownTransaction;
         if (merkle_path) |p| {
-            if (self.addProof(txid, p)) |st| {
-                return if (st == .rejected) .rejected else .proven;
+            if (self.addProof(txid, p)) |_| {
+                return .proven;
             } else |e| switch (e) {
                 error.UnknownHeader => if (try self.broadcastRecord(txid)) |r| try self.writeBroadcast(txid, r, .{ .path = p }),
                 else => return e,

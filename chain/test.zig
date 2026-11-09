@@ -463,6 +463,31 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     try std.testing.expectEqual(lib.state.Status.unproven, try st3.status(ta.txid));
 }
 
+test "a proof is the latest fact: a rejected transaction proven later is proven, the change `proven`, its settlement record kept" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const ta = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ta}));
+    try std.testing.expectEqual(State.Outcome.rejected, try w.st.applyStatus(ta.txid, "REJECTED", null));
+    try std.testing.expect((try w.st.spentBy(w.fund.txid, 0)) == null);
+    const rejected = try w.st.save();
+
+    var st2 = try State.load(a, ms.store(), rejected, .regtest);
+    _ = try st2.addHeaders(&.{&mine(hdr.hash(&w.h1), ta.txid, 1_700_001_200)});
+    try std.testing.expectEqual(State.Outcome.proven, try st2.applyStatus(ta.txid, "MINED", try soloPath(a, 2, ta.txid)));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(ta.txid));
+    try std.testing.expectEqual(@as(usize, 1), st2.changes.items.len);
+    try std.testing.expectEqual(.proven, st2.changes.items[0].state);
+    try std.testing.expect((try st2.settlementCid(ta.txid)) != null);
+    try std.testing.expectEqualSlices(u8, &ta.txid, &(try st2.spentBy(w.fund.txid, 0)).?);
+    try std.testing.expect(!(try st2.map("unproven").has(&ta.txid)));
+    _ = try st2.save();
+}
+
 test "a reorg turns a proven transaction back to unproven, its broadcast registered again; proven in another block, the same watchers told" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
