@@ -32,6 +32,8 @@ pub const raw = struct {
     pub extern "skein" fn emit(msg: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn deadline(until_ms: i64) i32;
     pub extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
+    /// 0.20.0 (shruggr/skein call permissions): a named in-VM call; the kernel checks the name.
+    pub extern "skein" fn callAs(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, name: [*]const u8, name_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
@@ -241,6 +243,25 @@ pub fn call(a: Allocator, prog: []const u8, func: []const u8, arg: []const u8) !
 /// An in-VM call with dag-cbor in and out.
 pub fn callValue(a: Allocator, prog: []const u8, func: []const u8, arg: Value) !Value {
     return cbor.decode(a, try call(a, prog, func, try cbor.encode(a, arg)));
+}
+
+/// A named in-VM call (0.20.0, shruggr/skein call permissions): the same call stating `name`. The
+/// kernel runs it only when the calling app is approved to call the callee's app under that exact
+/// name (the grants' `calls`); otherwise it fails (`lastError()` says why) and the callee does not
+/// run. The callee reads the name with `asName(input)`.
+pub fn callAs(a: Allocator, prog: []const u8, func: []const u8, name: []const u8, arg: []const u8) ![]u8 {
+    return result(a, raw.callAs, .{ prog.ptr, n32(prog.len), func.ptr, n32(func.len), name.ptr, n32(name.len), arg.ptr, n32(arg.len) });
+}
+
+/// A named in-VM call with dag-cbor in and out.
+pub fn callValueAs(a: Allocator, prog: []const u8, func: []const u8, name: []const u8, arg: Value) !Value {
+    return cbor.decode(a, try callAs(a, prog, func, name, try cbor.encode(a, arg)));
+}
+
+/// The name a named call was made under, as the kernel checked it (a call input's `as`); null for a
+/// call that stated none, and for every step.
+pub fn asName(in: Value) ?[]const u8 {
+    return Value.str(in.get("as"));
 }
 
 /// Write the answer of a call (stdout) as dag-cbor.
@@ -609,4 +630,17 @@ var field_error: [160]u8 = undefined;
 
 fn fieldError(key: []const u8, want: []const u8) error{Reported} {
     return report(std.fmt.bufPrint(&field_error, "{s}: not {s}", .{ key[0..@min(key.len, 100)], want }) catch "a field of the wrong type");
+}
+
+test "asName: a named call's input carries `as`; a nameless one, and a step, none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = cbor.MapBuilder.init(a);
+    try m.put("kind", cbor.string("call"));
+    try m.put("as", cbor.string("1/amm pool"));
+    try std.testing.expectEqualStrings("1/amm pool", asName(m.value()).?);
+    var n = cbor.MapBuilder.init(a);
+    try n.put("kind", cbor.string("step"));
+    try std.testing.expect(asName(n.value()) == null);
 }
