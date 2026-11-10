@@ -8,7 +8,12 @@
 //! the chain app's head `<app>/state`), apply operations, save (new map
 //! nodes, a new state record). The record:
 //!
-//!   {kind: "chain-state", network: "main" | "test" | "regtest", maps: {<name>: <MST root> | null}}
+//!   {kind: "chain-state", shape: 2, network: "main" | "test" | "regtest", maps: {<name>: <MST root> | null}}
+//!
+//! `shape` (0.21.0): 2 = linkages carry their block's height, one `proofHeights` row each. A state
+//! record without it was written before (skein-chain before 0.11.0) and is refused when opened
+//! (`error.ChainStateBeforeLinkages`): no compatibility read — such an instance is relaunched on a
+//! fresh home.
 //!
 //! The maps (keys bytes, ordered bytewise; the kernel's Merkle search trees):
 //!
@@ -85,6 +90,9 @@ pub const Network = chain_mod.Network;
 pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "proofHeights", "rejected", "unproven", "spent", "broadcasts", "parked" };
 
 pub const Status = enum { proven, unproven, rejected };
+
+/// The state record's `shape` this code writes and reads (0.21.0).
+pub const SHAPE: u64 = 2;
 
 /// A state change of a transaction with a registered broadcast: what its watchers are told.
 pub const Change = struct {
@@ -166,6 +174,9 @@ pub const State = struct {
         if (state) |c| {
             const v = try s.getValue(arena, c);
             if (!std.mem.eql(u8, v.getText("kind") orelse "", "chain-state")) return error.BadState;
+            // Written before linkages carried their height (skein-chain before 0.11.0): refused at once,
+            // by name — never read on and failed later (a reorg's BadIndex).
+            if ((v.getUint("shape") orelse 0) != SHAPE) return error.ChainStateBeforeLinkages;
             if (!std.mem.eql(u8, v.getText("network") orelse "", @tagName(network))) return error.NetworkMismatch;
             roots = v.get("maps") orelse return error.BadState;
         }
@@ -191,6 +202,7 @@ pub const State = struct {
         }
         return self.store.putValue(self.arena, .{ .map = &.{
             .{ .key = "kind", .value = .{ .text = "chain-state" } },
+            .{ .key = "shape", .value = .{ .uint = SHAPE } },
             .{ .key = "network", .value = .{ .text = @tagName(self.network) } },
             .{ .key = "maps", .value = .{ .map = es } },
         } });

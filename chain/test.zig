@@ -1576,3 +1576,24 @@ test "0.21.0 a parent rejected earlier whose child is proven later: the rejectio
     try std.testing.expectEqual(@as(usize, 1), w.st.revived.items.len);
     try std.testing.expect((try w.st.proofBlock(p.txid)) == null); // no linkage invented
 }
+
+test "0.21.0 a chain state written before linkages carried their height is refused when opened, by name — not a BadIndex at a reorg" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    // A 0.20.0-shape record: no `shape`.
+    const old = try ms.store().putValue(a, .{ .map = &.{
+        .{ .key = "kind", .value = .{ .text = "chain-state" } },
+        .{ .key = "network", .value = .{ .text = "regtest" } },
+        .{ .key = "maps", .value = .{ .map = &.{} } },
+    } });
+    try std.testing.expectError(error.ChainStateBeforeLinkages, State.load(a, ms.store(), old, .regtest));
+    try std.testing.expectError(error.ChainStateBeforeLinkages, lib.open(a, ms.store(), old, .main));
+    // What this code writes opens again.
+    var w = try world(a, ms.store(), 1);
+    const saved = try w.st.save();
+    try std.testing.expectEqual(@as(?u64, lib.state.SHAPE), (try ms.store().getValue(a, saved)).getUint("shape"));
+    _ = try State.load(a, ms.store(), saved, .regtest);
+}
