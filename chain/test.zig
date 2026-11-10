@@ -1448,3 +1448,131 @@ test "0.21.0 reorg out and back: the block leaves (listed inactive), comes back 
     try std.testing.expectEqual(lib.state.Status.proven, try st3.status(child.txid));
     try std.testing.expect((try st3.broadcastRecord(child.txid)) == null);
 }
+
+// ------------------------------------------------------------ 0.21.0 review fixes
+
+test "0.21.0 one height row per linkage: P, X in B2; reorg out; B4 = {P, C}; a second reorg from 2 lists B4 at height 4 — P and C both re-read; B2 not listed again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x }));
+    _ = try z.w.st.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, false));
+    try z.w.st.settleProven(z.p.txid);
+    try z.w.st.settleProven(z.x.txid);
+    // First reorg: B2 out.
+    const alt2 = mine(hdr.hash(&z.w.h1), .{3} ** 32, 1_700_001_201);
+    const alt3 = mine(hdr.hash(&alt2), .{4} ** 32, 1_700_001_202);
+    _ = try z.w.st.addHeaders(&.{ &alt2, &alt3 });
+    try std.testing.expectEqual(@as(usize, 1), z.w.st.blocks.items.len);
+    for (try z.w.st.blockChanged(z.w.st.blocks.items[0].hash, 2)) |_| {}
+    const s1 = try z.w.st.save();
+    // C (X's child) held; B4 = {P, C} at height 4 links P again (its row moves) and C.
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    _ = try st2.ingest(try beefWith(a, z.c.txid, &.{}, &.{ .{ .txid = z.x.txid, .format = .txid_only }, .{ .txid = z.c.txid, .format = .raw, .raw = z.c.raw, .tx = z.c.tx } }));
+    const b4 = mine(hdr.hash(&alt3), pairRoot(z.p.txid, z.c.txid), 1_700_001_203);
+    _ = try st2.addHeaders(&.{&b4});
+    _ = try st2.applyStatus(z.p.txid, "MINED", try pairBytes(a, 4, z.p.txid, z.c.txid, true, false));
+    try std.testing.expect(!(try st2.map("proofHeights").has(&(lib.store.be32(2) ++ z.p.txid)))); // the stale row gone
+    try std.testing.expect(try st2.map("proofHeights").has(&(lib.store.be32(4) ++ z.p.txid)));
+    try std.testing.expectEqual(@as(?u32, 4), try st2.proofHeight(z.p.txid));
+    try st2.settleProven(z.p.txid);
+    try st2.settleProven(z.c.txid);
+    const s2 = try st2.save();
+    // Second reorg from height 2: B4 leaves — listed at ITS height 4; B2, off our chain already, not listed.
+    var st3 = try State.load(a, ms.store(), s2, .regtest);
+    var run: [4][80]u8 = undefined;
+    var prev = hdr.hash(&z.w.h1);
+    for (&run, 0..) |*r, i| {
+        r.* = mine(prev, .{@as(u8, @intCast(0x50 + i))} ** 32, 1_700_002_000 + @as(u32, @intCast(i)));
+        prev = hdr.hash(r);
+    }
+    _ = try st3.addHeaders(&.{ &run[0], &run[1], &run[2], &run[3] });
+    try std.testing.expectEqual(@as(usize, 1), st3.blocks.items.len);
+    try std.testing.expectEqualSlices(u8, &hdr.hash(&b4), &st3.blocks.items[0].hash);
+    try std.testing.expectEqual(@as(u32, 4), st3.blocks.items[0].height);
+    try std.testing.expect(!st3.blocks.items[0].active);
+    const moved = try st3.blockChanged(st3.blocks.items[0].hash, st3.blocks.items[0].height);
+    try std.testing.expectEqual(@as(usize, 2), moved.len); // P and C
+    try std.testing.expect(try st3.map("unproven").has(&z.c.txid));
+    try std.testing.expect((try st3.broadcastRecord(z.c.txid)) != null);
+}
+
+test "0.21.0 parked: a path at a future height whose root is not the block's — dropped when the header comes, later headers fine; a malformed path is refused, never parked" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const t = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{t}));
+    // A path for t at height 3 (no header yet): parked.
+    try std.testing.expectEqual(State.Outcome.accepted, try w.st.applyStatus(t.txid, "MINED", try soloPath(a, 3, t.txid)));
+    try std.testing.expect(try w.st.map("parked").has(&t.txid));
+    // The chain reaches 3 with another block (an orphaned block's path, or a bogus root): dropped.
+    const h2 = mine(hdr.hash(&w.h1), .{7} ** 32, 1_700_001_200);
+    const h3 = mine(hdr.hash(&h2), .{8} ** 32, 1_700_001_201);
+    _ = try w.st.addHeaders(&.{ &h2, &h3 });
+    try std.testing.expect(!(try w.st.map("parked").has(&t.txid)));
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.status(t.txid));
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&h3), .{9} ** 32, 1_700_001_202)}); // not wedged
+    // A malformed path (its leaf not under its root: two leaves, the subject absent): BadProof at once.
+    try std.testing.expectError(error.BadProof, w.st.applyStatus(t.txid, "MINED", try (try pairPath(a, 9, .{1} ** 32, .{2} ** 32, true, false)).bytes(a)));
+    try std.testing.expect(!(try w.st.map("parked").has(&t.txid)));
+}
+
+test "0.21.0 a proof landing between a reorg and its block step: T re-linked in B, its watchers kept, mined once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const t = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{t}));
+    try w.st.watch(t.txid, &caller, "chain", &request);
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), t.txid, 1_700_001_200)});
+    _ = try w.st.applyStatus(t.txid, "MINED", try soloPath(a, 2, t.txid));
+    try w.st.settleProven(t.txid); // the watchers move onto the linkage
+    try std.testing.expectEqual(@as(usize, 1), (try w.st.settledWatchers(t.txid)).?.len);
+    const s1 = try w.st.save();
+    // Reorg: block A (2) leaves; the heavier branch's block 3 holds T; T's proof in it arrives
+    // before A's block step.
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    const alt2 = mine(hdr.hash(&w.h1), .{3} ** 32, 1_700_001_201);
+    const alt3 = mine(hdr.hash(&alt2), t.txid, 1_700_001_202);
+    _ = try st2.addHeaders(&.{ &alt2, &alt3 });
+    const a_block = st2.blocks.items[0];
+    _ = try st2.applyStatus(t.txid, "MINED", try soloPath(a, 3, t.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(t.txid));
+    try std.testing.expectEqual(@as(usize, 1), (try st2.settledWatchers(t.txid)).?.len); // kept
+    // A's block step: T is no longer linked to A: nothing to re-read.
+    try std.testing.expectEqual(@as(usize, 0), (try st2.blockChanged(a_block.hash, a_block.height)).len);
+    try st2.settleProven(t.txid); // T's proof step
+    try std.testing.expect((try st2.broadcastRecord(t.txid)) == null);
+}
+
+test "0.21.0 a parent rejected earlier whose child is proven later: the rejection is lifted (unproven, broadcast again), not made mined" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const p = try spend(a, &w.fund.tx, 0, 9_000);
+    const x = try spend(a, &p.tx, 0, 8_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ p, x }));
+    _ = try w.st.applyStatus(p.txid, "REJECTED", null);
+    try std.testing.expectEqual(lib.state.Status.rejected, try w.st.status(p.txid));
+    // X proven (alone in block 2): its parent is mined in fact; we hold no path for P.
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), x.txid, 1_700_001_200)});
+    _ = try w.st.applyStatus(x.txid, "MINED", try soloPath(a, 2, x.txid));
+    try std.testing.expectEqual(lib.state.Reexamined.revived, try w.st.reexamine(p.txid)); // X's fact steps P (`children`)
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.status(p.txid));
+    try std.testing.expect((try w.st.broadcastRecord(p.txid)) != null);
+    try std.testing.expectEqual(@as(usize, 1), w.st.revived.items.len);
+    try std.testing.expect((try w.st.proofBlock(p.txid)) == null); // no linkage invented
+}

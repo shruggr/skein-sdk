@@ -296,6 +296,9 @@ pub const State = struct {
     /// overrode since (its linkage keeps the record it overrode, `overrode`): read for its reason.
     pub fn settlementCid(self: *State, txid: [32]u8) !?[]const u8 {
         if (try self.map("rejected").link(&txid)) |c| return c;
+        // The record a proof overrode, only while that proof is on our best chain (unproven again
+        // after a reorg, the old rejection is not its state: no reason to read).
+        if ((try self.minedStatus(txid)) != .proven) return null;
         const v = (try self.map("proofs").get(&txid)) orelse return null;
         const o = v.get("overrode") orelse return null;
         return if (o == .cid) o.cid else error.BadIndex;
@@ -325,19 +328,20 @@ pub const State = struct {
     /// or not, and listed in `linked`. One already proven on our best chain is not linked again (the
     /// same path twice writes nothing and lists nothing).
     pub fn putProof(self: *State, txid: [32]u8, p: merkle.MerklePath) !void {
-        const at = (try self.chain().at(p.block_height)) orelse return error.UnknownHeader;
-        const want = (try hdr.Header.parse(&at.raw)).merkle_root;
         // The path verified once (`reveal`: every node the hash of its children, no conflicting
-        // node, one root) against the header's merkle root on our best chain.
+        // node, one root) — before its header is looked for: a structurally false path is refused
+        // (BadProof), never parked — then against the header's merkle root on our best chain.
         const rev = merkle.reveal(self.arena, p) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => return error.BadProof,
         };
-        if (!std.mem.eql(u8, &rev.root, &want)) return error.RootMismatch;
         const leaves = try merkle.covered(self.arena, rev, p.path.len);
         var has_subject = false;
         for (leaves) |lf| has_subject = has_subject or std.mem.eql(u8, &lf.txid, &txid);
         if (!has_subject) return error.BadProof;
+        const at = (try self.chain().at(p.block_height)) orelse return error.UnknownHeader;
+        const want = (try hdr.Header.parse(&at.raw)).merkle_root;
+        if (!std.mem.eql(u8, &rev.root, &want)) return error.RootMismatch;
         try merkle.putNodes(self.store, rev.nodes);
         const block = try self.arena.dupe(u8, &store_mod.hashCid(.block, at.hash));
         const depth: i64 = @intCast(p.path.len);
@@ -347,16 +351,32 @@ pub const State = struct {
             var es: std.ArrayList(ProofEntry) = .empty;
             try es.appendSlice(self.arena, &.{
                 .{ .key = "block", .value = .{ .cid = block } },
+                .{ .key = "height", .value = .{ .int = p.block_height } },
                 .{ .key = "depth", .value = .{ .int = depth } },
                 .{ .key = "position", .value = .{ .int = @intCast(lf.offset) } },
             });
+            // Re-linked (its old block off our best chain): ONE height row per linkage — the old one
+            // goes; what the old linkage carried for the transaction stays (the watchers its proof
+            // settled, `broadcast`; the rejection it overrode, `overrode`).
+            var overrode: ?[]const u8 = null;
+            if (try self.map("proofs").get(&h)) |old| {
+                const oh = old.get("height") orelse return error.BadIndex;
+                if (oh != .int) return error.BadIndex;
+                _ = try self.map("proofHeights").remove(&(store_mod.be32(@intCast(oh.int)) ++ h));
+                if (old.get("broadcast")) |b| try es.append(self.arena, .{ .key = "broadcast", .value = b });
+                if (old.get("overrode")) |o| if (o == .cid) {
+                    overrode = o.cid;
+                };
+            }
             // A proof always overrides a rejection (0.21.0): the settlement leaves `rejected` and the
-            // linkage keeps it (`overrode`, read for its reason) — a later reorg makes the transaction
-            // unproven, not rejected again; a later rejection is a new settlement.
+            // linkage keeps it (`overrode`, read for its reason while the proof is active) — a later
+            // reorg makes the transaction unproven, not rejected again; a later rejection is a new
+            // settlement.
             if (try self.map("rejected").link(&h)) |prior| {
-                try es.append(self.arena, .{ .key = "overrode", .value = .{ .cid = prior } });
+                overrode = prior;
                 _ = try self.map("rejected").remove(&h);
             }
+            if (overrode) |o| try es.append(self.arena, .{ .key = "overrode", .value = .{ .cid = o } });
             try self.map("proofs").put(&h, .{ .map = es.items });
             try self.map("proofHeights").add(&(store_mod.be32(p.block_height) ++ h));
             try self.resettle(h);
@@ -386,6 +406,13 @@ pub const State = struct {
         const depth = if (v.get("depth")) |d| (if (d == .int and d.int >= 0 and d.int <= 64) d.int else return error.BadIndex) else return error.BadIndex;
         const offset = if (v.get("position")) |o| (if (o == .int and o.int >= 0 and o.int <= std.math.maxInt(u64)) o.int else return error.BadIndex) else return error.BadIndex;
         return .{ .block = block, .pos = .{ .depth = @intCast(depth), .offset = @intCast(offset) } };
+    }
+
+    /// The height of the block a linkage names (0.21.0: kept on the linkage, the block's own height).
+    pub fn proofHeight(self: *State, txid: [32]u8) !?u32 {
+        const v = (try self.map("proofs").get(&txid)) orelse return null;
+        const h = v.get("height") orelse return error.BadIndex;
+        return if (h == .int and h.int >= 0 and h.int <= std.math.maxInt(u32)) @intCast(h.int) else error.BadIndex;
     }
 
     pub fn proofBlock(self: *State, txid: [32]u8) !?[32]u8 {
@@ -466,31 +493,58 @@ pub const State = struct {
     // ------------------------------------------------------------ headers
 
     /// A run of headers, parents first. A heavier branch that replaces ours reverts the proofs against
-    /// the replaced headers: those transactions are unproven again and register their broadcasts again
-    /// (`reverted`). Proofs that waited for a header (a broadcast's `path`) are tried again.
+    /// the replaced headers: those blocks are listed (`blocks`, what newly changed; what was mined in
+    /// them follows in each block's step, `blockChanged`). Proofs that waited for a header (`parked`)
+    /// are tried again.
     pub fn addHeaders(self: *State, raws: []const []const u8) !chain_mod.Chain.AddResult {
+        // The linked blocks the run can move (at or above the height it attaches at), as they stand.
+        var before: []const LinkedBlock = &.{};
+        if (raws.len > 0 and raws[0].len == hdr.size) {
+            const prev = (try hdr.Header.parse(raws[0][0..hdr.size])).prev_hash;
+            if (try self.chain().heightOf(prev)) |h| before = try self.linkedBlocksFrom(h + 1);
+        }
         const res = try self.chain().add(raws);
         if (res.added > 0) {
-            try self.blocksChangedFrom(res.tip + 1 - res.added);
+            try self.listChanged(before);
             try self.retryPendingProofs();
         }
         return res;
     }
 
-    /// 0.21.0: every block a linkage at `from` or above names whose place on our best chain is not
-    /// what it was — it left, or it came back — listed once in `blocks`. Nothing else is done here:
-    /// what was mined in it follows by subscription (`chain/block/<hash>` → `blockChanged`).
-    fn blocksChangedFrom(self: *State, from: u32) !void {
+    /// A block a linkage names: its hash, its own height (kept on the linkage), whether it is on our
+    /// best chain.
+    const LinkedBlock = struct { hash: [32]u8, height: u32, active: bool };
+
+    /// Every distinct block a linkage at `from` or above names, with its place on our best chain now.
+    /// One row per linkage (putProof removes a re-linked transaction's old row), so a row names its
+    /// linkage's block; a row with no linkage is a broken index.
+    fn linkedBlocksFrom(self: *State, from: u32) ![]const LinkedBlock {
+        var out: std.ArrayList(LinkedBlock) = .empty;
+        var seen = std.AutoHashMap([32]u8, void).init(self.arena);
         for (try self.map("proofHeights").from(&store_mod.be32(from))) |kv| {
             if (kv.key.len != 36) return error.BadIndex;
             const txid: [32]u8 = kv.key[4..36].*;
-            const block = (try self.proofBlock(txid)) orelse continue;
-            var seen = false;
-            for (self.blocks.items) |b| seen = seen or std.mem.eql(u8, &b.hash, &block);
-            if (seen) continue;
-            const height = std.mem.readInt(u32, kv.key[0..4], .big);
+            const block = (try self.proofBlock(txid)) orelse return error.BadIndex;
+            if ((try seen.getOrPut(block)).found_existing) continue;
+            const height = (try self.proofHeight(txid)) orelse return error.BadIndex;
             const active = if (try self.chain().heightOf(block)) |hh| hh == height else false;
-            try self.blocks.append(self.arena, .{ .hash = block, .height = height, .active = active });
+            try out.append(self.arena, .{ .hash = block, .height = height, .active = active });
+        }
+        return out.items;
+    }
+
+    /// 0.21.0: of the linked blocks as they stood (`before`), those whose place on our best chain is
+    /// now otherwise — it left, or it came back — listed once in `blocks` (only what newly changed:
+    /// a block already off our chain is not listed again). Nothing else is done here: what was
+    /// mined in it follows by subscription (`chain/block/<hash>` → `blockChanged`).
+    fn listChanged(self: *State, before: []const LinkedBlock) !void {
+        for (before) |b| {
+            const now = if (try self.chain().heightOf(b.hash)) |hh| hh == b.height else false;
+            if (now == b.active) continue;
+            var listed = false;
+            for (self.blocks.items) |x| listed = listed or std.mem.eql(u8, &x.hash, &b.hash);
+            if (listed) continue;
+            try self.blocks.append(self.arena, .{ .hash = b.hash, .height = b.height, .active = now });
         }
     }
 
@@ -503,8 +557,8 @@ pub const State = struct {
         for (try self.map("proofHeights").prefixed(&store_mod.be32(height))) |kv| {
             if (kv.key.len != 36) return error.BadIndex;
             const txid: [32]u8 = kv.key[4..36].*;
-            const block = (try self.proofBlock(txid)) orelse continue;
-            if (!std.mem.eql(u8, &block, &hash)) continue;
+            const block = (try self.proofBlock(txid)) orelse return error.BadIndex;
+            if (!std.mem.eql(u8, &block, &hash)) continue; // linked to another block at the same height
             try self.resettle(txid);
             if (!(try self.holds(txid))) continue;
             switch (try self.status(txid)) {
@@ -565,13 +619,14 @@ pub const State = struct {
         const same = !replaced and our_tip != null and our_tip.? == host_tip and
             optEq(self.map("headers").root, r.headers) and optEq(self.map("heights").root, r.heights);
         if (same) return .{ .height = host_tip, .fork = fork, .replaced = false };
+        const before = try self.linkedBlocksFrom(fork + 1);
         const headers = self.map("headers");
         const heights = self.map("heights");
         headers.root = r.headers;
         heights.root = r.heights;
         headers.dirty = true;
         heights.dirty = true;
-        try self.blocksChangedFrom(fork + 1);
+        try self.listChanged(before);
         try self.retryPendingProofs();
         return .{ .height = host_tip, .fork = fork, .replaced = replaced };
     }
@@ -584,7 +639,18 @@ pub const State = struct {
             const txid: [32]u8 = kv.key[0..32].*;
             const path = if (kv.value == .bytes) kv.value.bytes else return error.BadIndex;
             _ = self.addProof(txid, path) catch |e| switch (e) {
+                // Our best chain has no header at its height yet: it waits (it is checked when the
+                // chain reaches that height).
                 error.UnknownHeader => continue,
+                // Checked against the header our best chain has at its height and proven FALSE (the
+                // root is another block's, or the path is malformed): a decision on a verified-false
+                // proof, not a swallowed error — the entry goes and the step goes on. (A path for a
+                // block that is off our chain is false for our chain; a later reorg's proof comes
+                // again from the broadcaster.)
+                error.RootMismatch, error.BadProof => {
+                    _ = try self.map("parked").remove(&txid);
+                    continue;
+                },
                 else => return e,
             };
             _ = try self.map("parked").remove(&txid);
@@ -637,14 +703,16 @@ pub const State = struct {
     /// no rejection of it stands.
     fn hasProvenDescendant(self: *State, txid: [32]u8) !bool {
         const a = self.arena;
+        // Each held descendant visited once (a visited set): linear in the held descendants and the
+        // `spends` edges among them; bounded by what the instance holds.
         var queue: std.ArrayList([32]u8) = .empty;
+        var seen = std.AutoHashMap([32]u8, void).init(a);
         try queue.append(a, txid);
+        try seen.put(txid, {});
         var i: usize = 0;
         while (i < queue.items.len) : (i += 1) {
             for (try self.spendersOfTx(queue.items[i])) |s| {
-                var seen = false;
-                for (queue.items) |q| seen = seen or std.mem.eql(u8, &q, &s);
-                if (seen) continue;
+                if ((try seen.getOrPut(s)).found_existing) continue;
                 if ((try self.minedStatus(s)) == .proven) return true;
                 try queue.append(a, s);
             }
@@ -680,12 +748,23 @@ pub const State = struct {
         if (!(try self.holds(txid))) return .unchanged;
         if ((try self.status(txid)) == .proven) return .unchanged;
         const rej = try self.map("rejected").link(&txid);
+        // A proven descendant proves it mined (it is spent in a mined transaction): no rejection of it
+        // stands, whatever its reason. We hold no path for it, so it is unproven, not mined: its
+        // rejection is lifted and it is looked at again as any revived one.
+        if (rej != null and (try self.hasProvenDescendant(txid))) return self.revive(txid);
         if (try self.rejectedRoot(txid)) |root| {
             if (rej != null) return .unchanged;
             return if ((try self.rejectBy(txid, "input-rejected", root)).len > 0) .rejected else .unchanged;
         }
         const cid = rej orelse return .unchanged;
         if (!std.mem.eql(u8, (try self.record(cid)).getText("reason") orelse "", "input-rejected")) return .unchanged;
+        return self.revive(txid);
+    }
+
+    /// A rejection that no longer holds lifted: the settlement leaves `rejected`, the transaction is
+    /// looked at again (a proven spend of the same output rejects it `double-spent`), else unproven
+    /// with its broadcast registered again (`revived`, the change `revived`).
+    fn revive(self: *State, txid: [32]u8) !Reexamined {
         _ = try self.map("rejected").remove(&txid);
         try self.resettle(txid);
         const raw = (try self.txRaw(txid)) orelse return error.UnknownTransaction;
@@ -722,8 +801,8 @@ pub const State = struct {
             for (try self.spendersOf(op)) |other| {
                 if (std.mem.eql(u8, &other, &txid)) continue;
                 if ((try self.status(other)) == .proven) {
-                    _ = try self.rejectBy(txid, "double-spent", other);
-                    return true;
+                    // Rejected unless that is refused (a proven descendant of it).
+                    return (try self.rejectBy(txid, "double-spent", other)).len > 0;
                 }
             }
         }
@@ -813,7 +892,7 @@ pub const State = struct {
     }
 
     /// The watchers of the broadcast record a proven transaction's proof settled (none: none).
-    fn settledWatchers(self: *State, txid: [32]u8) !?[]const Value {
+    pub fn settledWatchers(self: *State, txid: [32]u8) !?[]const Value {
         const v = (try self.map("proofs").get(&txid)) orelse return null;
         const b = v.get("broadcast") orelse return null;
         if (b != .cid) return error.BadIndex;
@@ -894,12 +973,19 @@ pub const State = struct {
         var ctx = SpvCtx{ .st = self };
         const checked = try spv.verify(a, b, .{ .ptr = &ctx, .rootAtFn = SpvCtx.rootAt, .knownRawFn = SpvCtx.knownRaw });
         var registered: std.ArrayList([32]u8) = .empty;
+        // Each BUMP is saved once (it links every transaction it covers), at the first proven entry it
+        // holds: not once per entry.
+        const saved = try a.alloc(bool, b.bumps.len);
+        @memset(saved, false);
         for (b.entries, checked.proven) |e, proven| {
             const raw = e.raw orelse continue;
             _ = try self.putTx(e.txid, raw);
             if (proven) {
-                for (b.bumps) |p| if (beef_mod.bumpHas(p, e.txid)) {
-                    _ = try self.addPath(e.txid, p);
+                for (b.bumps, 0..) |p, i| if (beef_mod.bumpHas(p, e.txid)) {
+                    if (!saved[i]) {
+                        _ = try self.addPath(e.txid, p);
+                        saved[i] = true;
+                    }
                     break;
                 };
             }
