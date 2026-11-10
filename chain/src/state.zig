@@ -52,6 +52,11 @@
 //!
 //! Every state change of a transaction with a registered broadcast is listed
 //! in `changes`, with the watchers to answer — the program answers them.
+//! 0.19.0 (David 2026-11-09): every transaction newly held in a step is listed
+//! in `added` (in the order recorded), so the chain app gives each one its
+//! status at intake; a rejection names its cause (`by`): the winner of a
+//! double spend, the cascade's root for "input-rejected" — on the settlement
+//! record (`cause`) and on the change.
 const std = @import("std");
 const bsvz = @import("bsvz");
 const cbor = @import("cbor.zig");
@@ -81,6 +86,10 @@ pub const Change = struct {
     watchers: []const Value,
     /// The status that accepted it, or the rejection's reason.
     detail: []const u8 = "",
+    /// A rejection's cause (0.19.0): the proven transaction that spends the same output
+    /// ("double-spent"), or the rejected transaction it spends from ("input-rejected": the
+    /// cascade's root). Null for a rejection by the network.
+    by: ?[32]u8 = null,
 };
 
 /// The status texts (Arcade's txStatus) that reject a transaction.
@@ -113,6 +122,9 @@ pub const State = struct {
     reverted: std.ArrayList([32]u8) = .empty,
     /// State changes this step of transactions with a registered broadcast.
     changes: std.ArrayList(Change) = .empty,
+    /// Transactions this step newly held (`putTx` recorded them), in the order recorded (an ingest:
+    /// parents first). 0.19.0: each gets its status at intake.
+    added: std.ArrayList([32]u8) = .empty,
 
     /// The state the record names (null: a new one) on `network`; a state made for another network is refused.
     pub fn load(arena: std.mem.Allocator, s: Store, state: ?[]const u8, network: Network) !State {
@@ -173,6 +185,7 @@ pub const State = struct {
         if (try self.map("txs").link(&txid)) |c| return c;
         const cid = try self.store.putBitcoin(self.arena, .tx, raw);
         try self.map("txs").putLink(&txid, cid);
+        try self.added.append(self.arena, txid);
         const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
         for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
         try self.resettle(txid);
@@ -246,6 +259,15 @@ pub const State = struct {
     /// The settlement record's CID of a rejected transaction, or null.
     pub fn settlementCid(self: *State, txid: [32]u8) !?[]const u8 {
         return self.map("rejected").link(&txid);
+    }
+
+    /// A rejected transaction's reason and cause (0.19.0), from its settlement record; null when it
+    /// has none. `by`: the winner of a double spend, or the root of an "input-rejected" cascade.
+    pub fn rejectionOf(self: *State, txid: [32]u8) !?struct { reason: []const u8, by: ?[32]u8 } {
+        const c = (try self.settlementCid(txid)) orelse return null;
+        const r = try self.record(c);
+        const by: ?[32]u8 = if (r.getText("cause")) |h| (hdr.fromHex(h) catch return error.BadRecord) else null;
+        return .{ .reason = r.getText("reason") orelse "", .by = by };
     }
 
     // ------------------------------------------------------------ proofs
@@ -470,6 +492,13 @@ pub const State = struct {
     /// order): a settlement record each, `unproven` and `spent` kept up to date. A proven transaction
     /// is never rejected. → the transactions rejected, the given one first.
     pub fn reject(self: *State, root: [32]u8, reason: []const u8) ![][32]u8 {
+        return self.rejectBy(root, reason, null);
+    }
+
+    /// `reject` with the root's cause (0.19.0): `by` the proven transaction that spends the same
+    /// output ("double-spent"), recorded as the root's `cause`; what spends it is "input-rejected"
+    /// with the root as its cause, as before.
+    pub fn rejectBy(self: *State, root: [32]u8, reason: []const u8, root_by: ?[32]u8) ![][32]u8 {
         const a = self.arena;
         var queue: std.ArrayList([32]u8) = .empty;
         try queue.append(a, root);
@@ -488,11 +517,12 @@ pub const State = struct {
                 .{ .key = "reason", .value = .{ .text = if (by) "input-rejected" else reason } },
                 .{ .key = "at", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
             });
-            if (by) try fields.append(a, .{ .key = "cause", .value = .{ .text = try a.dupe(u8, &hdr.toHex(root)) } });
+            const cause: ?[32]u8 = if (by) root else root_by;
+            if (cause) |cz| try fields.append(a, .{ .key = "cause", .value = .{ .text = try a.dupe(u8, &hdr.toHex(cz)) } });
             const rec = try self.store.putValue(a, .{ .map = fields.items });
             try self.map("rejected").putLink(&t, rec);
             try self.resettle(t);
-            try self.settled(t, .rejected, if (by) "input-rejected" else reason);
+            try self.settledBy(t, .rejected, if (by) "input-rejected" else reason, cause);
             try out.append(a, t);
             for (try self.spendersOfTx(t)) |s| try queue.append(a, s);
         }
@@ -512,7 +542,7 @@ pub const State = struct {
             const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
             for (try self.spendersOf(op)) |other| {
                 if (std.mem.eql(u8, &other, &txid)) continue;
-                _ = try self.reject(other, "double-spent");
+                _ = try self.rejectBy(other, "double-spent", txid);
             }
         }
     }
@@ -526,7 +556,7 @@ pub const State = struct {
             for (try self.spendersOf(op)) |other| {
                 if (std.mem.eql(u8, &other, &txid)) continue;
                 if ((try self.status(other)) == .proven) {
-                    _ = try self.reject(txid, "double-spent");
+                    _ = try self.rejectBy(txid, "double-spent", other);
                     return true;
                 }
             }
@@ -598,8 +628,12 @@ pub const State = struct {
     /// Proven or rejected: the watchers are told (`changes`) and the broadcast record goes. Proven, the
     /// watchers move onto the `proofs` entry: a reorg registers the broadcast again with them.
     fn settled(self: *State, txid: [32]u8, to: @FieldType(Change, "state"), detail: []const u8) !void {
+        return self.settledBy(txid, to, detail, null);
+    }
+
+    fn settledBy(self: *State, txid: [32]u8, to: @FieldType(Change, "state"), detail: []const u8, by: ?[32]u8) !void {
         const r = (try self.broadcastRecord(txid)) orelse return;
-        try self.changes.append(self.arena, .{ .txid = txid, .state = to, .watchers = r.getArray("watchers") orelse &.{}, .detail = detail });
+        try self.changes.append(self.arena, .{ .txid = txid, .state = to, .watchers = r.getArray("watchers") orelse &.{}, .detail = detail, .by = by });
         if (to == .proven) {
             const c = (try self.broadcastCid(txid)).?;
             const v = (try self.map("proofs").get(&txid)) orelse return error.BadIndex;

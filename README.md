@@ -209,6 +209,7 @@ fetched dependency with `../skein-sdk` (Zig's `--fork`), with no edit to any
 
 | version | change |
 |---|---|
+| 0.19.0 | chain state (shruggr/skein-chain 0.10.0, David 2026-11-09): `added` lists every transaction a step newly held (`putTx`, in order: an ingest's parents first), so the chain app gives each one a status at intake; a rejection names its cause — `rejectBy(root, reason, by)`: "double-spent" by the proven winner (`rejectConflicting`, `rejectIfConflicted`), "input-rejected" by the cascade's root as before — on the settlement record (`cause`) and the change (`Change.by`); `rejectionOf(txid)` reads `{reason, by}` |
 | 0.18.0 | chain state: a transaction's status is its latest fact (David 2026-11-09) — a valid proof makes it proven also after a rejection (`status` reads the proof first; `addPath` no longer returns `rejected`; the change `proven` is listed with no watchers, the inputs' `spent` recomputed); the settlement record stays, read for its reason; `spent` skips a spender whose status is rejected |
 | 0.17.2 | `sk.on(name, null)` (shruggr/skein 0.5.4): with no fn the calling thread rests on the name; every fact under it wakes the thread, which rests on it again; `func` is now `?[]const u8` (a string still subscribes); in `wit/skein.wit` an empty `fn` |
 | 0.17.1 | `sk.off(name, fn)` (shruggr/skein 0.5.3): the same two arguments as `sk.on`; ends only that one subscription, the app's others to the name stay; `wit/skein.wit` likewise |

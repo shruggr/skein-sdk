@@ -463,6 +463,68 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     try std.testing.expectEqual(lib.state.Status.unproven, try st3.status(ta.txid));
 }
 
+test "added (0.19.0): every transaction newly held, parents first, once; a txid-only subject, a proof, a re-ingest add none" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    const ta = try spend(a, &w.fund.tx, 0, 9_000);
+    const tb = try spend(a, &ta.tx, 0, 8_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ ta, tb }));
+    try std.testing.expectEqual(@as(usize, 3), w.st.added.items.len);
+    try std.testing.expectEqualSlices(u8, &w.fund.txid, &w.st.added.items[0]);
+    try std.testing.expectEqualSlices(u8, &ta.txid, &w.st.added.items[1]);
+    try std.testing.expectEqualSlices(u8, &tb.txid, &w.st.added.items[2]);
+    const saved = try w.st.save();
+
+    var st2 = try State.load(a, ms.store(), saved, .regtest);
+    _ = try st2.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ ta, tb }));
+    try std.testing.expectEqual(@as(usize, 0), st2.added.items.len);
+    _ = try st2.applyStatus(ta.txid, "SEEN_ON_NETWORK", null);
+    try std.testing.expectEqual(@as(usize, 0), st2.added.items.len);
+}
+
+test "a rejection's cause (0.19.0): double-spent names the proven winner, input-rejected the root; a network rejection none" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    const ta = try spend(a, &w.fund.tx, 0, 9_000);
+    const tb = try spend(a, &ta.tx, 0, 8_000);
+    const tc = try spend(a, &tb.tx, 0, 7_500);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ ta, tb, tc }));
+    const base = try w.st.save();
+
+    // A proven competitor of A: A double-spent by it, B and C input-rejected with A as the cause.
+    var st2 = try State.load(a, ms.store(), base, .regtest);
+    const other = try spend(a, &w.fund.tx, 0, 7_000);
+    _ = try st2.addHeaders(&.{&mine(hdr.hash(&w.h1), other.txid, 1_700_001_200)});
+    _ = try st2.ingest(try beefOf(a, &.{ .{ w.fund, 1 }, .{ other, 2 } }, &.{}));
+    const ra = (try st2.rejectionOf(ta.txid)).?;
+    try std.testing.expectEqualStrings("double-spent", ra.reason);
+    try std.testing.expectEqualSlices(u8, &other.txid, &ra.by.?);
+    const rc = (try st2.rejectionOf(tc.txid)).?;
+    try std.testing.expectEqualStrings("input-rejected", rc.reason);
+    try std.testing.expectEqualSlices(u8, &ta.txid, &rc.by.?);
+    try std.testing.expectEqual(@as(usize, 3), st2.changes.items.len);
+    try std.testing.expectEqualSlices(u8, &ta.txid, &st2.changes.items[0].txid);
+    try std.testing.expectEqualSlices(u8, &other.txid, &st2.changes.items[0].by.?);
+    try std.testing.expectEqualSlices(u8, &ta.txid, &st2.changes.items[2].by.?);
+    try std.testing.expect((try st2.rejectionOf(other.txid)) == null);
+
+    // A network rejection: its reason, no cause.
+    var st3 = try State.load(a, ms.store(), base, .regtest);
+    _ = try st3.applyStatus(ta.txid, "REJECTED", null);
+    const r3 = (try st3.rejectionOf(ta.txid)).?;
+    try std.testing.expectEqualStrings("REJECTED", r3.reason);
+    try std.testing.expect(r3.by == null);
+    try std.testing.expect(st3.changes.items[0].by == null);
+}
+
 test "a proof is the latest fact: a rejected transaction proven later is proven, the change `proven`, its settlement record kept" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
