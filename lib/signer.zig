@@ -479,23 +479,13 @@ pub fn answerOf(a: Allocator, out: []const u8) !Answer {
     return error.BadAnswer;
 }
 
-/// The contract's name-carrying in-VM call (shruggr/skein `call-permissions`;
-/// plans/research/kernel-permissions-contract-2026-11-09.md §1). The ONE place
-/// this module reaches it: `sk.callAs` replaces it when lib/sk.zig has it.
-const named = struct {
-    extern "skein" fn callAs(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, name: [*]const u8, name_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
-};
-fn namedCall(a: Allocator, prog: []const u8, func: []const u8, name: []const u8, arg: []const u8) ![]u8 {
-    return sk.result(a, named.callAs, .{ prog.ptr, @as(u32, @intCast(prog.len)), func.ptr, @as(u32, @intCast(func.len)), name.ptr, @as(u32, @intCast(name.len)), arg.ptr, @as(u32, @intCast(arg.len)) });
-}
-
 /// A request frame to the signer app under `name` (null: an unnamed call) →
 /// the result frame, as the raw `wallet` import answers it (a wallet error is
 /// its error frame). A refusal fails with the signer app's message.
 pub fn requestAs(a: Allocator, name: ?[]const u8, frame: []const u8) ![]u8 {
     const prog = try program(a);
     const arg = try callArg(a, frame);
-    const out = if (name) |n| try namedCall(a, prog, FN, n, arg) else try sk.call(a, prog, FN, arg);
+    const out = if (name) |n| try sk.callAs(a, prog, FN, n, arg) else try sk.call(a, prog, FN, arg);
     return switch (try answerOf(a, out)) {
         .frame => |f| try a.dupe(u8, f),
         .refused => |e| sk.report(try a.dupe(u8, e)),
