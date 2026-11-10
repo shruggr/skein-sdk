@@ -98,6 +98,10 @@ pub fn isRejection(tx_status: []const u8) bool {
     return false;
 }
 
+/// A transaction linked to where its proof is (0.21.0): its block (hash and height on our best chain
+/// when linked) and its leaf's offset in the block.
+pub const Link = struct { txid: [32]u8, block: [32]u8, height: u32, position: u64 };
+
 /// What an ingest came to.
 pub const Ingested = struct {
     txid: [32]u8,
@@ -125,6 +129,10 @@ pub const State = struct {
     /// Transactions this step newly held (`putTx` recorded them), in the order recorded (an ingest:
     /// parents first). 0.19.0: each gets its status at intake.
     added: std.ArrayList([32]u8) = .empty,
+    /// 0.21.0 (David 2026-11-10): every transaction a merkle path saved this step newly linked to its
+    /// block (held or not), in the order linked — the chain app raises `chain/proof/<txid>` for each.
+    /// The one writer of the linkage rows is `putProof`; this list is exactly what it wrote.
+    linked: std.ArrayList(Link) = .empty,
 
     /// The state the record names (null: a new one) on `network`; a state made for another network is refused.
     pub fn load(arena: std.mem.Allocator, s: Store, state: ?[]const u8, network: Network) !State {
@@ -189,6 +197,9 @@ pub const State = struct {
         const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
         for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
         try self.resettle(txid);
+        // 0.21.0: linked already by a path we saved (it covered this transaction before it arrived):
+        // a proven spend, so every other held spender of its inputs is a double spend, as at a proof.
+        if ((try self.status(txid)) == .proven) try self.rejectConflicting(txid);
         return cid;
     }
 
@@ -275,7 +286,15 @@ pub const State = struct {
     const ProofEntry = std.meta.Elem(@FieldType(store_mod.MValue, "map"));
 
     /// A merkle path proving `txid`: its root must be our best-chain header's at its height. The nodes
-    /// it reveals are put as 64-byte bitcoin-tx blocks; `proofs` names the header and the leaf.
+    /// it reveals are put as 64-byte bitcoin-tx blocks.
+    ///
+    /// 0.21.0 (David 2026-11-10: "The proof got saved. The sibling's proof got saved. Therefore the
+    /// sibling is proven"): the ONE writer of the linkage between a transaction and where its proof
+    /// is. Every transaction the path covers — each level-0 hash whose root, computed through the
+    /// path, is the header's merkle root (not a duplicate slot, its first slot only), `txid` among
+    /// them — is linked: `proofs` {block, depth, position (its own offset)} and `proofHeights`, held
+    /// or not, and listed in `linked`. One already proven on our best chain is not linked again (the
+    /// same path twice writes nothing and lists nothing).
     pub fn putProof(self: *State, txid: [32]u8, p: merkle.MerklePath) !void {
         const got = beef_mod.rootFor(self.arena, p, txid) orelse return error.BadProof;
         const at = (try self.chain().at(p.block_height)) orelse return error.UnknownHeader;
@@ -286,14 +305,48 @@ pub const State = struct {
         try merkle.putNodes(self.store, rev.nodes);
         const pos = merkle.positionIn(p, txid) orelse return error.BadProof;
         const block = try self.arena.dupe(u8, &store_mod.hashCid(.block, at.hash));
-        const es = try self.arena.dupe(ProofEntry, &.{
-            .{ .key = "block", .value = .{ .cid = block } },
-            .{ .key = "depth", .value = .{ .int = pos.depth } },
-            .{ .key = "position", .value = .{ .int = pos.offset } },
-        });
-        try self.map("proofs").put(&txid, .{ .map = es });
-        try self.map("proofHeights").add(&(store_mod.be32(p.block_height) ++ txid));
-        try self.resettle(txid);
+        for (p.path[0]) |leaf| {
+            const h = (leaf.hash orelse continue).bytes; // a duplicate slot names no transaction
+            if (isDuplicateSlot(p, leaf.offset, h)) continue;
+            const first = merkle.positionIn(p, h) orelse continue;
+            if (first.offset != leaf.offset) continue; // a hash named twice: its first slot only
+            // Computed, not assumed: this leaf's own path gives the header's root.
+            const r = beef_mod.rootFor(self.arena, p, h) orelse continue;
+            if (!std.mem.eql(u8, &r, &want)) continue;
+            if ((try self.minedStatus(h)) == .proven) continue; // linked already, on our best chain
+            const es = try self.arena.dupe(ProofEntry, &.{
+                .{ .key = "block", .value = .{ .cid = block } },
+                .{ .key = "depth", .value = .{ .int = pos.depth } },
+                .{ .key = "position", .value = .{ .int = @intCast(leaf.offset) } },
+            });
+            try self.map("proofs").put(&h, .{ .map = es });
+            try self.map("proofHeights").add(&(store_mod.be32(p.block_height) ++ h));
+            try self.resettle(h);
+            try self.linked.append(self.arena, .{ .txid = h, .block = at.hash, .height = p.block_height, .position = leaf.offset });
+        }
+    }
+
+    /// Whether the level-0 slot at `offset` holding `h` is a duplicate: a right slot (odd offset)
+    /// whose left sibling holds the same hash (BRC-74's duplicate written out as a hash).
+    fn isDuplicateSlot(p: merkle.MerklePath, offset: u64, h: [32]u8) bool {
+        if (offset & 1 == 0) return false;
+        for (p.path[0]) |other| if (other.offset == offset ^ 1) if (other.hash) |oh| if (std.mem.eql(u8, &oh.bytes, &h)) return true;
+        return false;
+    }
+
+    /// 0.21.0: a held transaction proven by a linkage (`chain/proof/<txid>`'s subscription step, the
+    /// chain app's): what its proof settles in the state — every other held transaction spending one
+    /// of the same outputs is a double spend; its inputs' `spent` again (a rejection before left it
+    /// out); a registered broadcast settled (the change `proven`). Nothing when it is not proven on
+    /// our best chain (the block left it since) or not held. Idempotent.
+    pub fn settleProven(self: *State, txid: [32]u8) !void {
+        if (!(try self.holds(txid))) return;
+        if ((try self.status(txid)) != .proven) return;
+        try self.rejectConflicting(txid);
+        const raw = (try self.txRaw(txid)) orelse return error.UnknownTransaction;
+        const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+        for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
+        try self.settled(txid, .proven, "");
     }
 
     /// The proof record for a txid: its block's header CID and the leaf's position; null when none.
@@ -401,7 +454,7 @@ pub const State = struct {
                 if (kv.key.len != 36) return error.BadIndex;
                 const txid: [32]u8 = kv.key[4..36].*;
                 try self.resettle(txid);
-                if (res.replaced > 0 and (try self.status(txid)) == .unproven and (try self.broadcastRecord(txid)) == null) {
+                if (res.replaced > 0 and (try self.holds(txid)) and (try self.status(txid)) == .unproven and (try self.broadcastRecord(txid)) == null) {
                     try self.writeBroadcast(txid, null, .{ .tx_status = "", .watchers = try self.settledWatchers(txid) });
                     if (!contains(self.reverted.items, txid)) try self.reverted.append(self.arena, txid);
                 }
@@ -464,7 +517,7 @@ pub const State = struct {
             if (kv.key.len != 36) return error.BadIndex;
             const txid: [32]u8 = kv.key[4..36].*;
             try self.resettle(txid);
-            if (replaced and (try self.status(txid)) == .unproven and (try self.broadcastRecord(txid)) == null) {
+            if (replaced and (try self.holds(txid)) and (try self.status(txid)) == .unproven and (try self.broadcastRecord(txid)) == null) {
                 try self.writeBroadcast(txid, null, .{ .tx_status = "", .watchers = try self.settledWatchers(txid) });
                 if (!contains(self.reverted.items, txid)) try self.reverted.append(self.arena, txid);
             }

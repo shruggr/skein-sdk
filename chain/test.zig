@@ -925,3 +925,229 @@ test "pointAt: a state names the host chain's roots — the same state as adding
     var main_st = try State.load(a, s, null, .main);
     try std.testing.expectError(error.NetworkMismatch, main_st.pointAt(host3));
 }
+
+// ------------------------------------------------------------ 0.21.0: a saved path links every transaction it covers
+
+/// A BUMP for a block of two transactions: level 0 = {0: left, 1: right}; `flag` the BRC-74 txid flag per leaf.
+fn pairPath(a: std.mem.Allocator, height: u32, left: [32]u8, right: [32]u8, flag_left: bool, flag_right: bool) !bsvz.spv.MerklePath {
+    return bsvz.spv.MerklePath.parse(a, try pairBytes(a, height, left, right, flag_left, flag_right));
+}
+
+fn pairBytes(a: std.mem.Allocator, height: u32, left: [32]u8, right: [32]u8, flag_left: bool, flag_right: bool) ![]const u8 {
+    var path: std.ArrayList(u8) = .empty;
+    try path.appendSlice(a, &.{ 0xfd, 0, 0, 0x01, 0x02, 0x00, if (flag_left) 0x02 else 0x00 });
+    std.mem.writeInt(u16, path.items[1..3], @intCast(height), .little);
+    try path.appendSlice(a, &left);
+    try path.appendSlice(a, &.{ 0x01, if (flag_right) 0x02 else 0x00 });
+    try path.appendSlice(a, &right);
+    return path.items;
+}
+
+fn pairRoot(left: [32]u8, right: [32]u8) [32]u8 {
+    return lib.store.dblSha256(&(left ++ right));
+}
+
+/// A BEEF V2 (Atomic for `atomic`) of `bumps` and `entries` as given.
+fn beefWith(a: std.mem.Allocator, atomic: [32]u8, bumps: []const bsvz.spv.MerklePath, entries: []const beef.Entry) ![]const u8 {
+    return beef.serialize(a, .{ .version = beef.V2, .atomic = atomic, .bumps = try a.dupe(bsvz.spv.MerklePath, bumps), .entries = try a.dupe(beef.Entry, entries) });
+}
+
+const Pair = struct { w: World, p: Tx, x: Tx, c: Tx, h2: [80]u8 };
+
+/// The funding at 1; P spends it, X spends P, both mined in block 2 (P at 0, X at 1); C spends X, unmined.
+fn pairWorld(a: std.mem.Allocator, s: lib.store.Store) !Pair {
+    var w = try world(a, s, 1);
+    const p = try spend(a, &w.fund.tx, 0, 9_000);
+    const x = try spend(a, &p.tx, 0, 8_000);
+    const c = try spend(a, &x.tx, 0, 7_000);
+    const h2 = mine(hdr.hash(&w.h1), pairRoot(p.txid, x.txid), 1_700_001_200);
+    _ = try w.st.addHeaders(&.{&h2});
+    return .{ .w = w, .p = p, .x = x, .c = c, .h2 = h2 };
+}
+
+fn linkedHas(st: *State, txid: [32]u8) bool {
+    for (st.linked.items) |l| if (std.mem.eql(u8, &l.txid, &txid)) return true;
+    return false;
+}
+
+test "0.21.0 the live sequence: P's path saved (X's leaf unflagged); X arrives bare with an unproven child C — X proven on arrival, never registered; C's bundle carries X proven" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    const path2 = try pairPath(a, 2, z.p.txid, z.x.txid, true, false);
+
+    // P with its path (and the funding proven at 1): P and X linked, both, at their own offsets.
+    _ = try z.w.st.ingest(try beefWith(a, z.p.txid, &.{ try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, z.w.fund.txid)), path2 }, &.{
+        .{ .txid = z.w.fund.txid, .format = .raw_with_bump, .bump = 0, .raw = z.w.fund.raw, .tx = z.w.fund.tx },
+        .{ .txid = z.p.txid, .format = .raw_with_bump, .bump = 1, .raw = z.p.raw, .tx = z.p.tx },
+    }));
+    try std.testing.expect(linkedHas(&z.w.st, z.p.txid) and linkedHas(&z.w.st, z.x.txid));
+    try std.testing.expectEqual(@as(usize, 3), z.w.st.linked.items.len); // the funding, P, X
+    for (z.w.st.linked.items) |l| if (std.mem.eql(u8, &l.txid, &z.x.txid)) {
+        try std.testing.expectEqual(@as(u64, 1), l.position);
+        try std.testing.expectEqual(@as(u32, 2), l.height);
+        try std.testing.expectEqualSlices(u8, &hdr.hash(&z.h2), &l.block);
+    };
+    try std.testing.expect(!(try z.w.st.holds(z.x.txid)));
+    try std.testing.expectEqual(lib.state.Status.proven, try z.w.st.minedStatus(z.x.txid));
+    const s1 = try z.w.st.save();
+
+    // The same path again: nothing written, nothing linked.
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    _ = try st2.addProof(z.p.txid, try pairBytes(a, 2, z.p.txid, z.x.txid, true, false));
+    try std.testing.expectEqual(@as(usize, 0), st2.linked.items.len);
+    try std.testing.expectEqualStrings(s1, try st2.save());
+
+    // X bare (P txid-only: held) with its unproven child C.
+    var st3 = try State.load(a, ms.store(), s1, .regtest);
+    const g = try st3.ingest(try beefWith(a, z.c.txid, &.{}, &.{
+        .{ .txid = z.p.txid, .format = .txid_only },
+        .{ .txid = z.x.txid, .format = .raw, .raw = z.x.raw, .tx = z.x.tx },
+        .{ .txid = z.c.txid, .format = .raw, .raw = z.c.raw, .tx = z.c.tx },
+    }));
+    try std.testing.expectEqual(lib.state.Status.proven, try st3.status(z.x.txid));
+    try std.testing.expectEqual(@as(usize, 1), g.registered.len);
+    try std.testing.expectEqualSlices(u8, &z.c.txid, &g.registered[0]);
+    try std.testing.expect((try st3.broadcastRecord(z.x.txid)) == null);
+    try std.testing.expectEqual(@as(usize, 0), st3.linked.items.len);
+
+    // Our own outgoing bundle for C: X goes proven (raw with its BUMP, its leaf flagged), and no entry
+    // is bare while a BUMP in the bundle covers its hash.
+    const out = try beef.parse(a, (try st3.beefOf(z.c.txid)).?);
+    var saw_x = false;
+    for (out.entries) |e| {
+        if (std.mem.eql(u8, &e.txid, &z.x.txid)) {
+            saw_x = true;
+            try std.testing.expectEqual(beef.Format.raw_with_bump, e.format);
+            var flagged = false;
+            for (out.bumps[e.bump.?].path[0]) |leaf| if (leaf.hash) |h| if (std.mem.eql(u8, &h.bytes, &z.x.txid)) {
+                flagged = leaf.txid orelse false;
+            };
+            try std.testing.expect(flagged);
+        }
+        if (e.format == .raw) for (out.bumps) |bp| try std.testing.expect(!beef.bumpHas(bp, e.txid));
+        try std.testing.expect(!std.mem.eql(u8, &e.txid, &z.p.txid)); // X proven: its parent is not needed
+    }
+    try std.testing.expect(saw_x);
+}
+
+test "0.21.0 a proof after the transaction: X held pending, then P's path (X unflagged) — X linked in that step; settleProven settles its broadcast" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    const g = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x }));
+    try std.testing.expectEqual(@as(usize, 2), g.registered.len);
+    const s1 = try z.w.st.save();
+
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    try std.testing.expectEqual(State.Outcome.proven, try st2.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, false)));
+    try std.testing.expect(linkedHas(&st2, z.p.txid) and linkedHas(&st2, z.x.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.x.txid));
+    // X's broadcast record waits for its own subscription step: settleProven.
+    try std.testing.expect((try st2.broadcastRecord(z.x.txid)) != null);
+    const n = st2.changes.items.len;
+    try st2.settleProven(z.x.txid);
+    try std.testing.expect((try st2.broadcastRecord(z.x.txid)) == null);
+    try std.testing.expectEqual(n + 1, st2.changes.items.len);
+    try std.testing.expectEqual(.proven, st2.changes.items[n].state);
+    try st2.settleProven(z.x.txid); // idempotent
+    try std.testing.expectEqual(n + 1, st2.changes.items.len);
+    try std.testing.expect(!(try st2.map("unproven").has(&z.x.txid)));
+}
+
+test "0.21.0 held rejected, then a path covering it: proven (the latest fact), the settlement kept, its inputs' spent again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x }));
+    _ = try z.w.st.applyStatus(z.x.txid, "REJECTED", null);
+    try std.testing.expectEqual(lib.state.Status.rejected, try z.w.st.status(z.x.txid));
+    try std.testing.expect((try z.w.st.spentBy(z.p.txid, 0)) == null);
+    const s1 = try z.w.st.save();
+
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    _ = try st2.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, false));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.x.txid));
+    try st2.settleProven(z.x.txid);
+    try std.testing.expect((try st2.rejectionOf(z.x.txid)) != null);
+    try std.testing.expectEqualSlices(u8, &z.x.txid, &(try st2.spentBy(z.p.txid, 0)).?);
+}
+
+test "0.21.0 reorg: the block leaves — P and X both unproven, both reverted; proven in another block, linked again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x }));
+    _ = try z.w.st.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, false));
+    try z.w.st.settleProven(z.x.txid);
+    const s1 = try z.w.st.save();
+
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    const alt2 = mine(hdr.hash(&z.w.h1), .{3} ** 32, 1_700_001_201);
+    const alt3 = mine(hdr.hash(&alt2), .{4} ** 32, 1_700_001_202);
+    _ = try st2.addHeaders(&.{ &alt2, &alt3 });
+    try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(z.p.txid));
+    try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(z.x.txid));
+    try std.testing.expectEqual(@as(usize, 2), st2.reverted.items.len);
+    try std.testing.expect((try st2.broadcastRecord(z.x.txid)) != null);
+    const s2 = try st2.save();
+
+    // Both mined again at 4: one path, both linked again, at the new block.
+    var st3 = try State.load(a, ms.store(), s2, .regtest);
+    const alt4 = mine(hdr.hash(&alt3), pairRoot(z.p.txid, z.x.txid), 1_700_001_203);
+    _ = try st3.addHeaders(&.{&alt4});
+    _ = try st3.applyStatus(z.p.txid, "MINED", try pairBytes(a, 4, z.p.txid, z.x.txid, true, false));
+    try std.testing.expect(linkedHas(&st3, z.p.txid) and linkedHas(&st3, z.x.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st3.status(z.x.txid));
+}
+
+test "0.21.0 negatives: a path whose root is not the header's links nothing; a duplicate slot is no transaction; nothing above level 0" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x }));
+    const s1 = try z.w.st.save();
+
+    // Wrong root: refused, nothing linked.
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    try std.testing.expectError(error.RootMismatch, st2.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, .{9} ** 32, true, false)));
+    try std.testing.expectEqual(@as(usize, 0), st2.linked.items.len);
+
+    // A block of three: A, B, C; C's path names C at 2 and again at 3 (the duplicate written out),
+    // and H(A,B) above. Only C is linked, at offset 2.
+    var w = try world(a, ms.store(), 1);
+    const ta: [32]u8 = .{0xa1} ** 32;
+    const tb: [32]u8 = .{0xb2} ** 32;
+    const tc = z.p.txid;
+    const ab = pairRoot(ta, tb);
+    const root = pairRoot(ab, pairRoot(tc, tc));
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), root, 1_700_001_300)});
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendSlice(a, &.{ 0xfd, 2, 0, 0x02, 0x02, 0x02, 0x02 });
+    try bytes.appendSlice(a, &tc);
+    try bytes.appendSlice(a, &.{ 0x03, 0x00 });
+    try bytes.appendSlice(a, &tc);
+    try bytes.appendSlice(a, &.{ 0x01, 0x00, 0x00 });
+    try bytes.appendSlice(a, &ab);
+    const p3 = try bsvz.spv.MerklePath.parse(a, bytes.items);
+    try w.st.putProof(tc, p3);
+    try std.testing.expectEqual(@as(usize, 1), w.st.linked.items.len);
+    try std.testing.expectEqualSlices(u8, &tc, &w.st.linked.items[0].txid);
+    try std.testing.expectEqual(@as(u64, 2), w.st.linked.items[0].position);
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.minedStatus(ab));
+}
