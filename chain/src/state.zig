@@ -31,24 +31,32 @@
 //! it. The record:
 //!
 //!   {kind: "broadcast", txid (hex), subject: <tx CID>, since: ms, txStatus: text,
-//!    accepted?: true, path?: bytes (a BUMP whose header is not held yet),
-//!    watchers: [{to: bytes(33), box, request: <message CID>}]}
+//!    accepted?: true, watchers: [...]}   (0.21.0: a proof before its header is kept in `parked`)
 //!
-//! `watchers` are the callers to answer on each state change of the
+//! `watchers` ({to: bytes(33), box, request: <message CID>}) are the callers to answer on each state change of the
 //! transaction (accepted, proven, rejected); `accepted` is set by the first
 //! status that is not a rejection. Proven or rejected, the record goes: the
 //! transaction no longer awaits anything. Proven, its `proofs` entry links
 //! the record it settled, for the watchers: a reorg that turns it back to unproven registers its
-//! broadcast again (`reverted`) with the same watchers, and the next proof
+//! broadcast again (`blockChanged`) with the same watchers, and the next proof
 //! — the same transaction in another block — tells them again.
 //!
-//! Status is computed from the records, never stored: proven (its proof's block
-//! is on our best chain — also after a rejection: the latest fact wins, the
-//! settlement record stays), rejected (a settlement record), else unproven.
-//! A rejection walks what spends the transaction (the `spends` edges into it,
-//! held transactions only) and rejects that too ("input-rejected"). A proof
-//! rejects every other held transaction spending one of the same outputs
-//! ("double-spent").
+//! Status is computed from the records, never stored: proven (its linkage's block
+//! is on our best chain), rejected (a settlement record in `rejected`), else
+//! unproven. 0.21.0 (David 2026-11-10, "the chain state drives everything"):
+//! - a saved path links every transaction it covers (`putProof`, the one writer;
+//!   `linked`), and a linkage moves a settlement out of `rejected` (the linkage
+//!   keeps it, `overrode`): a proof always overrides a rejection, also after a
+//!   reorg; a later rejection is a new settlement;
+//! - a rejection rejects only its transaction (`reject`), never one with a proven
+//!   descendant; what spends it is re-derived on its parents' facts (`reexamine`:
+//!   "input-rejected" by the root, or no longer, `revived`);
+//! - what a linkage settles (the broadcast record, double spends: "double-spent",
+//!   the inputs' `spent`) is the linked transaction's own step (`settleProven`);
+//! - a block a linkage names that leaves or comes back to our best chain is
+//!   listed (`blocks`); what was mined in it follows in that block's step
+//!   (`blockChanged`).
+//! The chain app wires each of these by subscription.
 //!
 //! Every state change of a transaction with a registered broadcast is listed
 //! in `changes`, with the watchers to answer — the program answers them.
@@ -74,14 +82,16 @@ const Value = cbor.Value;
 
 pub const Network = chain_mod.Network;
 
-pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "proofHeights", "rejected", "unproven", "spent", "broadcasts" };
+pub const map_names = [_][]const u8{ "headers", "heights", "txs", "proofs", "proofHeights", "rejected", "unproven", "spent", "broadcasts", "parked" };
 
 pub const Status = enum { proven, unproven, rejected };
 
 /// A state change of a transaction with a registered broadcast: what its watchers are told.
 pub const Change = struct {
     txid: [32]u8,
-    state: enum { accepted, proven, rejected },
+    /// 0.21.0: `revived` — an `input-rejected` that no longer holds (its parent is not rejected any
+    /// more): back to unproven, its broadcast registered again.
+    state: enum { accepted, proven, rejected, revived },
     /// The watchers registered when it changed (`{to, box, request}`).
     watchers: []const Value,
     /// The status that accepted it, or the rejection's reason.
@@ -102,6 +112,16 @@ pub fn isRejection(tx_status: []const u8) bool {
 /// when linked) and its leaf's offset in the block.
 pub const Link = struct { txid: [32]u8, block: [32]u8, height: u32, position: u64 };
 
+/// A block a linkage names whose place on our best chain changed this step (0.21.0): it left
+/// (`active` false) or came back (`active` true). The chain app raises `chain/block/<hash>` for each.
+pub const BlockChange = struct { hash: [32]u8, height: u32, active: bool };
+
+/// A held transaction linked to a block whose place changed, as `blockChanged` left it.
+pub const BlockTx = struct { txid: [32]u8, proven: bool };
+
+/// What `reexamine` came to.
+pub const Reexamined = enum { unchanged, rejected, revived };
+
 /// What an ingest came to.
 pub const Ingested = struct {
     txid: [32]u8,
@@ -121,9 +141,13 @@ pub const State = struct {
     m: [map_names.len]Map,
     /// The step's time (ms): settlement records and broadcasts are stamped with it.
     now: i64 = 0,
-    /// Transactions a reorg this step turned back to unproven (their broadcasts registered again):
-    /// the caller broadcasts each again and awaits it.
-    reverted: std.ArrayList([32]u8) = .empty,
+    /// 0.21.0: the blocks a linkage names whose place on our best chain changed this step (a reorg;
+    /// `pointAt`, `addHeaders`): the chain app raises `chain/block/<hash>` for each, and what was
+    /// mined in them follows by subscription (`blockChanged`). The reorg walk at the source goes.
+    blocks: std.ArrayList(BlockChange) = .empty,
+    /// 0.21.0: transactions whose `input-rejected` no longer held this step (`reexamine`) and that
+    /// registered their broadcast again: the caller broadcasts each.
+    revived: std.ArrayList([32]u8) = .empty,
     /// State changes this step of transactions with a registered broadcast.
     changes: std.ArrayList(Change) = .empty,
     /// Transactions this step newly held (`putTx` recorded them), in the order recorded (an ingest:
@@ -197,9 +221,10 @@ pub const State = struct {
         const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
         for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
         try self.resettle(txid);
-        // 0.21.0: linked already by a path we saved (it covered this transaction before it arrived):
-        // a proven spend, so every other held spender of its inputs is a double spend, as at a proof.
-        if ((try self.status(txid)) == .proven) try self.rejectConflicting(txid);
+        // 0.21.0: linked already by a path we saved before it arrived: its linkage fact is in the past,
+        // never delivered to the subscription its intake makes, so the intake settles it — the same
+        // function the subscription step runs (`settleProven`).
+        if ((try self.status(txid)) == .proven) try self.settleProven(txid);
         return cid;
     }
 
@@ -267,9 +292,13 @@ pub const State = struct {
         return if ((try self.chain().heightOf(block)) != null) .proven else .unproven;
     }
 
-    /// The settlement record's CID of a rejected transaction, or null.
+    /// The settlement record's CID of a rejected transaction, or null. 0.21.0: also of one a proof
+    /// overrode since (its linkage keeps the record it overrode, `overrode`): read for its reason.
     pub fn settlementCid(self: *State, txid: [32]u8) !?[]const u8 {
-        return self.map("rejected").link(&txid);
+        if (try self.map("rejected").link(&txid)) |c| return c;
+        const v = (try self.map("proofs").get(&txid)) orelse return null;
+        const o = v.get("overrode") orelse return null;
+        return if (o == .cid) o.cid else error.BadIndex;
     }
 
     /// A rejected transaction's reason and cause (0.19.0), from its settlement record; null when it
@@ -296,42 +325,43 @@ pub const State = struct {
     /// or not, and listed in `linked`. One already proven on our best chain is not linked again (the
     /// same path twice writes nothing and lists nothing).
     pub fn putProof(self: *State, txid: [32]u8, p: merkle.MerklePath) !void {
-        const got = beef_mod.rootFor(self.arena, p, txid) orelse return error.BadProof;
         const at = (try self.chain().at(p.block_height)) orelse return error.UnknownHeader;
         const want = (try hdr.Header.parse(&at.raw)).merkle_root;
-        if (!std.mem.eql(u8, &got, &want)) return error.RootMismatch;
-        const rev = try merkle.reveal(self.arena, p);
+        // The path verified once (`reveal`: every node the hash of its children, no conflicting
+        // node, one root) against the header's merkle root on our best chain.
+        const rev = merkle.reveal(self.arena, p) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return error.BadProof,
+        };
         if (!std.mem.eql(u8, &rev.root, &want)) return error.RootMismatch;
+        const leaves = try merkle.covered(self.arena, rev, p.path.len);
+        var has_subject = false;
+        for (leaves) |lf| has_subject = has_subject or std.mem.eql(u8, &lf.txid, &txid);
+        if (!has_subject) return error.BadProof;
         try merkle.putNodes(self.store, rev.nodes);
-        const pos = merkle.positionIn(p, txid) orelse return error.BadProof;
         const block = try self.arena.dupe(u8, &store_mod.hashCid(.block, at.hash));
-        for (p.path[0]) |leaf| {
-            const h = (leaf.hash orelse continue).bytes; // a duplicate slot names no transaction
-            if (isDuplicateSlot(p, leaf.offset, h)) continue;
-            const first = merkle.positionIn(p, h) orelse continue;
-            if (first.offset != leaf.offset) continue; // a hash named twice: its first slot only
-            // Computed, not assumed: this leaf's own path gives the header's root.
-            const r = beef_mod.rootFor(self.arena, p, h) orelse continue;
-            if (!std.mem.eql(u8, &r, &want)) continue;
+        const depth: i64 = @intCast(p.path.len);
+        for (leaves) |lf| {
+            const h = lf.txid;
             if ((try self.minedStatus(h)) == .proven) continue; // linked already, on our best chain
-            const es = try self.arena.dupe(ProofEntry, &.{
+            var es: std.ArrayList(ProofEntry) = .empty;
+            try es.appendSlice(self.arena, &.{
                 .{ .key = "block", .value = .{ .cid = block } },
-                .{ .key = "depth", .value = .{ .int = pos.depth } },
-                .{ .key = "position", .value = .{ .int = @intCast(leaf.offset) } },
+                .{ .key = "depth", .value = .{ .int = depth } },
+                .{ .key = "position", .value = .{ .int = @intCast(lf.offset) } },
             });
-            try self.map("proofs").put(&h, .{ .map = es });
+            // A proof always overrides a rejection (0.21.0): the settlement leaves `rejected` and the
+            // linkage keeps it (`overrode`, read for its reason) — a later reorg makes the transaction
+            // unproven, not rejected again; a later rejection is a new settlement.
+            if (try self.map("rejected").link(&h)) |prior| {
+                try es.append(self.arena, .{ .key = "overrode", .value = .{ .cid = prior } });
+                _ = try self.map("rejected").remove(&h);
+            }
+            try self.map("proofs").put(&h, .{ .map = es.items });
             try self.map("proofHeights").add(&(store_mod.be32(p.block_height) ++ h));
             try self.resettle(h);
-            try self.linked.append(self.arena, .{ .txid = h, .block = at.hash, .height = p.block_height, .position = leaf.offset });
+            try self.linked.append(self.arena, .{ .txid = h, .block = at.hash, .height = p.block_height, .position = lf.offset });
         }
-    }
-
-    /// Whether the level-0 slot at `offset` holding `h` is a duplicate: a right slot (odd offset)
-    /// whose left sibling holds the same hash (BRC-74's duplicate written out as a hash).
-    fn isDuplicateSlot(p: merkle.MerklePath, offset: u64, h: [32]u8) bool {
-        if (offset & 1 == 0) return false;
-        for (p.path[0]) |other| if (other.offset == offset ^ 1) if (other.hash) |oh| if (std.mem.eql(u8, &oh.bytes, &h)) return true;
-        return false;
     }
 
     /// 0.21.0: a held transaction proven by a linkage (`chain/proof/<txid>`'s subscription step, the
@@ -424,20 +454,12 @@ pub const State = struct {
         return self.addPath(txid, p);
     }
 
+    /// 0.21.0: the path is saved (`putProof`: every transaction it newly covers linked, also when
+    /// `txid` was proven already) and nothing else here — what a linkage settles (its broadcast
+    /// record, double spends, its inputs' `spent`) is the linked transaction's own subscription step
+    /// (`settleProven`), woken by its `chain/proof` fact.
     fn addPath(self: *State, txid: [32]u8, p: merkle.MerklePath) !Status {
-        const before = try self.status(txid);
-        if (before == .proven) return .proven;
         try self.putProof(txid, p);
-        try self.rejectConflicting(txid);
-        if (before == .rejected) {
-            // Its inputs' `spent` again (a rejected spender was left out), and the change itself: no
-            // broadcast record is left to settle (the rejection removed it), no watchers.
-            const raw = (try self.txRaw(txid)) orelse return error.UnknownTransaction;
-            const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
-            for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
-            try self.changes.append(self.arena, .{ .txid = txid, .state = .proven, .watchers = &.{}, .detail = "" });
-        }
-        try self.settled(txid, .proven, "");
         return .proven;
     }
 
@@ -449,19 +471,55 @@ pub const State = struct {
     pub fn addHeaders(self: *State, raws: []const []const u8) !chain_mod.Chain.AddResult {
         const res = try self.chain().add(raws);
         if (res.added > 0) {
-            const start = res.tip + 1 - res.added;
-            for (try self.map("proofHeights").from(&store_mod.be32(start))) |kv| {
-                if (kv.key.len != 36) return error.BadIndex;
-                const txid: [32]u8 = kv.key[4..36].*;
-                try self.resettle(txid);
-                if (res.replaced > 0 and (try self.holds(txid)) and (try self.status(txid)) == .unproven and (try self.broadcastRecord(txid)) == null) {
-                    try self.writeBroadcast(txid, null, .{ .tx_status = "", .watchers = try self.settledWatchers(txid) });
-                    if (!contains(self.reverted.items, txid)) try self.reverted.append(self.arena, txid);
-                }
-            }
+            try self.blocksChangedFrom(res.tip + 1 - res.added);
             try self.retryPendingProofs();
         }
         return res;
+    }
+
+    /// 0.21.0: every block a linkage at `from` or above names whose place on our best chain is not
+    /// what it was — it left, or it came back — listed once in `blocks`. Nothing else is done here:
+    /// what was mined in it follows by subscription (`chain/block/<hash>` → `blockChanged`).
+    fn blocksChangedFrom(self: *State, from: u32) !void {
+        for (try self.map("proofHeights").from(&store_mod.be32(from))) |kv| {
+            if (kv.key.len != 36) return error.BadIndex;
+            const txid: [32]u8 = kv.key[4..36].*;
+            const block = (try self.proofBlock(txid)) orelse continue;
+            var seen = false;
+            for (self.blocks.items) |b| seen = seen or std.mem.eql(u8, &b.hash, &block);
+            if (seen) continue;
+            const height = std.mem.readInt(u32, kv.key[0..4], .big);
+            const active = if (try self.chain().heightOf(block)) |hh| hh == height else false;
+            try self.blocks.append(self.arena, .{ .hash = block, .height = height, .active = active });
+        }
+    }
+
+    /// 0.21.0: a block's place changed (`chain/block/<hash>`'s subscription step, the chain app's):
+    /// every held transaction linked to it, read from the state — still proven (it came back: its
+    /// broadcast settled, its double spends), or unproven again (it left: its broadcast registered
+    /// again, as a reorg always did; nothing is broadcast). Idempotent.
+    pub fn blockChanged(self: *State, hash: [32]u8, height: u32) ![]BlockTx {
+        var out: std.ArrayList(BlockTx) = .empty;
+        for (try self.map("proofHeights").prefixed(&store_mod.be32(height))) |kv| {
+            if (kv.key.len != 36) return error.BadIndex;
+            const txid: [32]u8 = kv.key[4..36].*;
+            const block = (try self.proofBlock(txid)) orelse continue;
+            if (!std.mem.eql(u8, &block, &hash)) continue;
+            try self.resettle(txid);
+            if (!(try self.holds(txid))) continue;
+            switch (try self.status(txid)) {
+                .proven => {
+                    try self.settleProven(txid);
+                    try out.append(self.arena, .{ .txid = txid, .proven = true });
+                },
+                .unproven => {
+                    if ((try self.broadcastRecord(txid)) == null) try self.writeBroadcast(txid, null, .{ .tx_status = "", .watchers = try self.settledWatchers(txid) });
+                    try out.append(self.arena, .{ .txid = txid, .proven = false });
+                },
+                .rejected => {},
+            }
+        }
+        return out.items;
     }
 
     pub const Pointed = struct {
@@ -513,78 +571,133 @@ pub const State = struct {
         heights.root = r.heights;
         headers.dirty = true;
         heights.dirty = true;
-        for (try self.map("proofHeights").from(&store_mod.be32(fork + 1))) |kv| {
-            if (kv.key.len != 36) return error.BadIndex;
-            const txid: [32]u8 = kv.key[4..36].*;
-            try self.resettle(txid);
-            if (replaced and (try self.holds(txid)) and (try self.status(txid)) == .unproven and (try self.broadcastRecord(txid)) == null) {
-                try self.writeBroadcast(txid, null, .{ .tx_status = "", .watchers = try self.settledWatchers(txid) });
-                if (!contains(self.reverted.items, txid)) try self.reverted.append(self.arena, txid);
-            }
-        }
+        try self.blocksChangedFrom(fork + 1);
         try self.retryPendingProofs();
         return .{ .height = host_tip, .fork = fork, .replaced = replaced };
     }
 
+    /// Proofs that arrived before their header (`parked`, 0.21.0: whatever the transaction's status,
+    /// a rejected one's too) are tried again once headers came: put, and unparked.
     fn retryPendingProofs(self: *State) !void {
-        for (try self.map("broadcasts").prefixed("")) |kv| {
+        for (try self.map("parked").prefixed("")) |kv| {
             if (kv.key.len != 32) return error.BadIndex;
             const txid: [32]u8 = kv.key[0..32].*;
-            const r = try self.record(if (kv.value == .cid) kv.value.cid else return error.BadIndex);
-            const path = r.getBytes("path") orelse continue;
+            const path = if (kv.value == .bytes) kv.value.bytes else return error.BadIndex;
             _ = self.addProof(txid, path) catch |e| switch (e) {
                 error.UnknownHeader => continue,
                 else => return e,
             };
+            _ = try self.map("parked").remove(&txid);
         }
     }
 
     // ------------------------------------------------------------ rejection
 
-    /// Reject a transaction and what spends it (held, transitively, breadth first; spenders in txid
-    /// order): a settlement record each, `unproven` and `spent` kept up to date. A proven transaction
-    /// is never rejected. → the transactions rejected, the given one first.
+    /// Reject a transaction: a settlement record, `unproven` and its inputs' `spent` kept up to date.
+    /// 0.21.0 (David 2026-11-10): ONLY the transaction itself — what spends it follows by
+    /// subscription (`reexamine`, on its parents' facts). A proven transaction is never rejected, nor
+    /// one with a proven descendant (a proven child proves its parents mined). → the transactions
+    /// rejected: the given one, or none.
     pub fn reject(self: *State, root: [32]u8, reason: []const u8) ![][32]u8 {
         return self.rejectBy(root, reason, null);
     }
 
-    /// `reject` with the root's cause (0.19.0): `by` the proven transaction that spends the same
-    /// output ("double-spent"), recorded as the root's `cause`; what spends it is "input-rejected"
-    /// with the root as its cause, as before.
+    /// `reject` with its cause (0.19.0): `by` the proven transaction that spends the same output
+    /// ("double-spent"), or the root of an "input-rejected" (`reexamine`), recorded as `cause`.
     pub fn rejectBy(self: *State, root: [32]u8, reason: []const u8, root_by: ?[32]u8) ![][32]u8 {
         const a = self.arena;
-        var queue: std.ArrayList([32]u8) = .empty;
-        try queue.append(a, root);
-        var out: std.ArrayList([32]u8) = .empty;
-        var i: usize = 0;
-        while (i < queue.items.len) : (i += 1) {
-            const t = queue.items[i];
-            if (try self.map("rejected").has(&t)) continue;
-            if ((try self.minedStatus(t)) == .proven) continue;
-            const by = i > 0;
-            var fields: std.ArrayList(cbor.Entry) = .empty;
-            try fields.appendSlice(a, &.{
-                .{ .key = "kind", .value = .{ .text = "settlement" } },
-                .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(t)) } },
-                .{ .key = "status", .value = .{ .text = "rejected" } },
-                .{ .key = "reason", .value = .{ .text = if (by) "input-rejected" else reason } },
-                .{ .key = "at", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
-            });
-            const cause: ?[32]u8 = if (by) root else root_by;
-            if (cause) |cz| try fields.append(a, .{ .key = "cause", .value = .{ .text = try a.dupe(u8, &hdr.toHex(cz)) } });
-            const rec = try self.store.putValue(a, .{ .map = fields.items });
-            try self.map("rejected").putLink(&t, rec);
-            try self.resettle(t);
-            try self.settledBy(t, .rejected, if (by) "input-rejected" else reason, cause);
-            try out.append(a, t);
-            for (try self.spendersOfTx(t)) |s| try queue.append(a, s);
-        }
-        for (out.items) |t| {
-            const raw = (try self.txRaw(t)) orelse continue;
+        if (try self.map("rejected").has(&root)) return &.{};
+        if ((try self.minedStatus(root)) == .proven) return &.{};
+        if (try self.hasProvenDescendant(root)) return &.{};
+        var fields: std.ArrayList(cbor.Entry) = .empty;
+        try fields.appendSlice(a, &.{
+            .{ .key = "kind", .value = .{ .text = "settlement" } },
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(root)) } },
+            .{ .key = "status", .value = .{ .text = "rejected" } },
+            .{ .key = "reason", .value = .{ .text = reason } },
+            .{ .key = "at", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
+        });
+        if (root_by) |cz| try fields.append(a, .{ .key = "cause", .value = .{ .text = try a.dupe(u8, &hdr.toHex(cz)) } });
+        const rec = try self.store.putValue(a, .{ .map = fields.items });
+        try self.map("rejected").putLink(&root, rec);
+        try self.resettle(root);
+        const had = (try self.broadcastRecord(root)) != null;
+        try self.settledBy(root, .rejected, reason, root_by);
+        if (!had) try self.changes.append(a, .{ .txid = root, .state = .rejected, .watchers = &.{}, .detail = reason, .by = root_by });
+        if (try self.txRaw(root)) |raw| {
             const tx = try bsvz.transaction.Transaction.parse(a, raw);
             for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
         }
-        return out.items;
+        const out = try a.alloc([32]u8, 1);
+        out[0] = root;
+        return out;
+    }
+
+    /// Whether a held transaction spending `txid` (transitively) is proven: then `txid` is mined, and
+    /// no rejection of it stands.
+    fn hasProvenDescendant(self: *State, txid: [32]u8) !bool {
+        const a = self.arena;
+        var queue: std.ArrayList([32]u8) = .empty;
+        try queue.append(a, txid);
+        var i: usize = 0;
+        while (i < queue.items.len) : (i += 1) {
+            for (try self.spendersOfTx(queue.items[i])) |s| {
+                var seen = false;
+                for (queue.items) |q| seen = seen or std.mem.eql(u8, &q, &s);
+                if (seen) continue;
+                if ((try self.minedStatus(s)) == .proven) return true;
+                try queue.append(a, s);
+            }
+        }
+        return false;
+    }
+
+    /// The rejected parent a held transaction's `input-rejected` would name (the root: a parent
+    /// rejected for its own reason, or the root a parent's own `input-rejected` names), or null when
+    /// no input's transaction is rejected.
+    pub fn rejectedRoot(self: *State, txid: [32]u8) !?[32]u8 {
+        const raw = (try self.txRaw(txid)) orelse return null;
+        const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+        for (tx.inputs) |in| {
+            const parent = in.previous_outpoint.txid.bytes;
+            if (!(try self.holds(parent))) continue;
+            if ((try self.status(parent)) != .rejected) continue;
+            const r = (try self.rejectionOf(parent)) orelse return parent;
+            if (std.mem.eql(u8, r.reason, "input-rejected")) if (r.by) |root| return root;
+            return parent;
+        }
+        return null;
+    }
+
+    /// 0.21.0 (David 2026-11-10: "everything that depends on a changed fact is fired"): a held
+    /// transaction re-derived from the state, on a fact of one of its parents (the chain app's
+    /// subscription step) or at intake. A proven one is left as it is. A parent rejected: rejected
+    /// `input-rejected` by the root (unless a descendant is proven). No parent rejected and its
+    /// rejection was `input-rejected`: that no longer holds — the settlement goes, it is looked at
+    /// again (a proven spend of the same output rejects it `double-spent`), else unproven with its
+    /// broadcast registered again (`revived`, the change `revived`). Idempotent.
+    pub fn reexamine(self: *State, txid: [32]u8) !Reexamined {
+        if (!(try self.holds(txid))) return .unchanged;
+        if ((try self.status(txid)) == .proven) return .unchanged;
+        const rej = try self.map("rejected").link(&txid);
+        if (try self.rejectedRoot(txid)) |root| {
+            if (rej != null) return .unchanged;
+            return if ((try self.rejectBy(txid, "input-rejected", root)).len > 0) .rejected else .unchanged;
+        }
+        const cid = rej orelse return .unchanged;
+        if (!std.mem.eql(u8, (try self.record(cid)).getText("reason") orelse "", "input-rejected")) return .unchanged;
+        _ = try self.map("rejected").remove(&txid);
+        try self.resettle(txid);
+        const raw = (try self.txRaw(txid)) orelse return error.UnknownTransaction;
+        const tx = try bsvz.transaction.Transaction.parse(self.arena, raw);
+        for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
+        if (try self.rejectIfConflicted(txid)) return .rejected;
+        if ((try self.broadcastRecord(txid)) == null) {
+            try self.register(txid, "");
+            try self.revived.append(self.arena, txid);
+        }
+        try self.changes.append(self.arena, .{ .txid = txid, .state = .revived, .watchers = &.{}, .detail = "" });
+        return .revived;
     }
 
     /// A transaction just proven: every other held transaction spending one of the same outputs is a double spend.
@@ -718,7 +831,9 @@ pub const State = struct {
             if (self.addProof(txid, p)) |_| {
                 return .proven;
             } else |e| switch (e) {
-                error.UnknownHeader => if (try self.broadcastRecord(txid)) |r| try self.writeBroadcast(txid, r, .{ .path = p }),
+                // 0.21.0: a proof before its header is kept whatever the transaction's status (a rejected
+                // one has no broadcast record to keep it in): `parked`, tried again when headers come.
+                error.UnknownHeader => try self.map("parked").put(&txid, .{ .bytes = try self.arena.dupe(u8, p) }),
                 else => return e,
             }
         } else if (isRejection(tx_status)) {
@@ -793,6 +908,9 @@ pub const State = struct {
             if (e.raw == null) continue;
             if ((try self.status(e.txid)) != .unproven) continue;
             if (try self.rejectIfConflicted(e.txid)) continue;
+            // 0.21.0: read at intake — a parent rejected already: `input-rejected` (later parents' facts
+            // reach it by subscription, `reexamine`).
+            if (try self.rejectedRoot(e.txid)) |root| if ((try self.rejectBy(e.txid, "input-rejected", root)).len > 0) continue;
             if ((try self.broadcastRecord(e.txid)) != null) continue;
             try self.register(e.txid, "");
             try registered.append(a, e.txid);

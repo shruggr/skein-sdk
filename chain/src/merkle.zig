@@ -99,6 +99,42 @@ fn take(a: std.mem.Allocator, m: *std.AutoArrayHashMapUnmanaged(u64, [32]u8), du
     try m.put(a, e.offset, h.bytes);
 }
 
+/// A transaction a revealed path covers: its txid and its offset (leaf index) in the block.
+pub const Covered = struct { txid: [32]u8, offset: u64 };
+
+/// The transactions a path covers (0.21.0), from the structure `reveal` verified: one descent from
+/// the root through the revealed nodes, each the double hash of its two children, down `height`
+/// levels — every hash reached at the bottom is a level-0 leaf whose path to the root is those nodes,
+/// so it computes to the root. A right child equal to its left is the duplicate (BRC-74), at any
+/// level: not descended, not a transaction. A subtree whose node was not revealed (a leaf given with
+/// no sibling, a part of the tree the path does not give) is not reached. Linear in the nodes.
+pub fn covered(a: std.mem.Allocator, rev: Revealed, height: usize) ![]Covered {
+    var out: std.ArrayList(Covered) = .empty;
+    if (rev.nodes.len == 0) {
+        if (height == 1) try out.append(a, .{ .txid = rev.root, .offset = 0 });
+        return out.items;
+    }
+    var by_hash = std.AutoHashMap([32]u8, [64]u8).init(a);
+    for (rev.nodes) |n| try by_hash.put(n.hash, n.bytes);
+    const Item = struct { hash: [32]u8, depth: usize, offset: u64 };
+    var stack: std.ArrayList(Item) = .empty;
+    try stack.append(a, .{ .hash = rev.root, .depth = 0, .offset = 0 });
+    while (stack.pop()) |it| {
+        const bytes = by_hash.get(it.hash) orelse continue;
+        const left: [32]u8 = bytes[0..32].*;
+        const right: [32]u8 = bytes[32..64].*;
+        const dup = std.mem.eql(u8, &left, &right);
+        if (it.depth + 1 == height) {
+            try out.append(a, .{ .txid = left, .offset = it.offset << 1 });
+            if (!dup) try out.append(a, .{ .txid = right, .offset = (it.offset << 1) | 1 });
+        } else {
+            if (!dup) try stack.append(a, .{ .hash = right, .depth = it.depth + 1, .offset = (it.offset << 1) | 1 });
+            try stack.append(a, .{ .hash = left, .depth = it.depth + 1, .offset = it.offset << 1 });
+        }
+    }
+    return out.items;
+}
+
 /// Put the nodes (hash-checked by the store; one already held is the same
 /// block) and keep them. They contribute no edges (#42, decided 2026-09-30):
 /// a proof is read downward from the root, never up from a leaf.

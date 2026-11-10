@@ -161,9 +161,13 @@ test "ingest: unproven in is registered; accepted by the first status, proven by
     // Its proof, before its header: kept, pending; the header: proven, the watcher told, the broadcast gone.
     const path = try soloPath(a, 2, child.txid);
     try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(child.txid, "MINED", path));
-    try std.testing.expect((try w.st.broadcastRecord(child.txid)).?.getBytes("path") != null);
+    try std.testing.expect(try w.st.map("parked").has(&child.txid)); // 0.21.0: parked, whatever its status
     _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), child.txid, 1_700_001_200)});
     try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(child.txid));
+    try std.testing.expect(!(try w.st.map("parked").has(&child.txid)));
+    // 0.21.0: the linkage is listed; what it settles is the transaction's subscription step.
+    try std.testing.expect(linkedHas(&w.st, child.txid));
+    try w.st.settleProven(child.txid);
     try std.testing.expectEqual(@as(usize, 2), w.st.changes.items.len);
     try std.testing.expectEqual(.proven, w.st.changes.items[1].state);
     try std.testing.expectEqual(@as(usize, 1), w.st.changes.items[1].watchers.len);
@@ -433,9 +437,13 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     try w.st.watch(tb.txid, &caller, "chain", &request);
     const base = try w.st.save();
 
-    // A rejected: B with it (input-rejected); the funding's output free again.
+    // A rejected: only A at the source (0.21.0); B by its parents' subscription (`reexamine`):
+    // input-rejected; the funding's output free again.
     w.st.now = 5000;
     try std.testing.expectEqual(State.Outcome.rejected, try w.st.applyStatus(ta.txid, "REJECTED", null));
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.status(tb.txid));
+    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items.len);
+    try std.testing.expectEqual(lib.state.Reexamined.rejected, try w.st.reexamine(tb.txid));
     try std.testing.expectEqual(lib.state.Status.rejected, try w.st.status(tb.txid));
     try std.testing.expectEqual(@as(usize, 2), w.st.changes.items.len);
     try std.testing.expectEqual(@as(usize, 1), w.st.changes.items[1].watchers.len);
@@ -450,6 +458,7 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     _ = try st2.addHeaders(&.{&mine(hdr.hash(&w.h1), other.txid, 1_700_001_200)});
     const g2 = try st2.ingest(try beefOf(a, &.{ .{ w.fund, 1 }, .{ other, 2 } }, &.{}));
     try std.testing.expectEqual(lib.state.Status.proven, g2.status);
+    try st2.settleProven(other.txid); // its subscription step
     try std.testing.expectEqual(lib.state.Status.rejected, try st2.status(ta.txid));
     try std.testing.expectEqualStrings("double-spent", (try st2.record((try st2.settlementCid(ta.txid)).?)).getText("reason").?);
     try std.testing.expectEqualSlices(u8, &other.txid, &(try st2.spentBy(w.fund.txid, 0)).?);
@@ -504,6 +513,9 @@ test "a rejection's cause (0.19.0): double-spent names the proven winner, input-
     const other = try spend(a, &w.fund.tx, 0, 7_000);
     _ = try st2.addHeaders(&.{&mine(hdr.hash(&w.h1), other.txid, 1_700_001_200)});
     _ = try st2.ingest(try beefOf(a, &.{ .{ w.fund, 1 }, .{ other, 2 } }, &.{}));
+    try st2.settleProven(other.txid); // the winner's subscription step
+    try std.testing.expectEqual(lib.state.Reexamined.rejected, try st2.reexamine(tb.txid)); // B: A's fact
+    try std.testing.expectEqual(lib.state.Reexamined.rejected, try st2.reexamine(tc.txid)); // C: B's fact
     const ra = (try st2.rejectionOf(ta.txid)).?;
     try std.testing.expectEqualStrings("double-spent", ra.reason);
     try std.testing.expectEqualSlices(u8, &other.txid, &ra.by.?);
@@ -542,8 +554,7 @@ test "a proof is the latest fact: a rejected transaction proven later is proven,
     _ = try st2.addHeaders(&.{&mine(hdr.hash(&w.h1), ta.txid, 1_700_001_200)});
     try std.testing.expectEqual(State.Outcome.proven, try st2.applyStatus(ta.txid, "MINED", try soloPath(a, 2, ta.txid)));
     try std.testing.expectEqual(lib.state.Status.proven, try st2.status(ta.txid));
-    try std.testing.expectEqual(@as(usize, 1), st2.changes.items.len);
-    try std.testing.expectEqual(.proven, st2.changes.items[0].state);
+    try st2.settleProven(ta.txid); // its subscription step: its inputs' spent again
     try std.testing.expect((try st2.settlementCid(ta.txid)) != null);
     try std.testing.expectEqualSlices(u8, &ta.txid, &(try st2.spentBy(w.fund.txid, 0)).?);
     try std.testing.expect(!(try st2.map("unproven").has(&ta.txid)));
@@ -562,6 +573,7 @@ test "a reorg turns a proven transaction back to unproven, its broadcast registe
     try w.st.watch(child.txid, &caller, "chain", &request);
     _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), child.txid, 1_700_001_200)});
     try std.testing.expectEqual(State.Outcome.proven, try w.st.applyStatus(child.txid, "MINED", try soloPath(a, 2, child.txid)));
+    try w.st.settleProven(child.txid); // its `chain/proof` subscription step
     try std.testing.expectEqual(@as(usize, 1), w.st.changes.items.len);
     const first = w.st.changes.items[0];
     try std.testing.expectEqual(.proven, first.state);
@@ -576,7 +588,12 @@ test "a reorg turns a proven transaction back to unproven, its broadcast registe
     const alt2 = mine(hdr.hash(&alt1), .{4} ** 32, 1_700_001_202);
     try std.testing.expectEqual(@as(u32, 1), (try st2.addHeaders(&.{ &alt1, &alt2 })).replaced);
     try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(child.txid));
-    try std.testing.expectEqual(@as(usize, 1), st2.reverted.items.len);
+    // 0.21.0: the block that left is listed; what was mined in it follows by its subscription step.
+    try std.testing.expectEqual(@as(usize, 1), st2.blocks.items.len);
+    try std.testing.expect(!st2.blocks.items[0].active);
+    const moved = try st2.blockChanged(st2.blocks.items[0].hash, st2.blocks.items[0].height);
+    try std.testing.expectEqual(@as(usize, 1), moved.len);
+    try std.testing.expect(!moved[0].proven);
     const again = (try st2.broadcastRecord(child.txid)).?;
     try std.testing.expectEqual(@as(usize, 1), again.getArray("watchers").?.len);
     try std.testing.expect(try st2.map("unproven").has(&child.txid));
@@ -588,6 +605,7 @@ test "a reorg turns a proven transaction back to unproven, its broadcast registe
     _ = try st3.addHeaders(&.{&alt3});
     try std.testing.expectEqual(State.Outcome.proven, try st3.applyStatus(child.txid, "MINED", try soloPath(a, 4, child.txid)));
     try std.testing.expectEqual(lib.state.Status.proven, try st3.status(child.txid));
+    try st3.settleProven(child.txid);
     try std.testing.expectEqual(@as(usize, 1), st3.changes.items.len);
     const second = st3.changes.items[0];
     try std.testing.expectEqual(.proven, second.state);
@@ -889,6 +907,7 @@ test "pointAt: a state names the host chain's roots — the same state as adding
     try std.testing.expectEqual(@as(u32, 2), p2.height);
     try std.testing.expectEqual(@as(u32, 1), p2.fork);
     try std.testing.expectEqual(State.Outcome.proven, try st.applyStatus(child.txid, "MINED", try soloPath(a, 2, child.txid)));
+    try st.settleProven(child.txid);
     const proven = try st.save();
 
     // The same host record again: nothing changes.
@@ -907,7 +926,9 @@ test "pointAt: a state names the host chain's roots — the same state as adding
     try std.testing.expectEqual(@as(u32, 1), p3.fork);
     try std.testing.expect(p3.replaced);
     try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(child.txid));
-    try std.testing.expectEqual(@as(usize, 1), st2.reverted.items.len);
+    try std.testing.expectEqual(@as(usize, 1), st2.blocks.items.len);
+    try std.testing.expect(!st2.blocks.items[0].active);
+    _ = try st2.blockChanged(st2.blocks.items[0].hash, st2.blocks.items[0].height);
     try std.testing.expectEqual(@as(usize, 1), (try st2.broadcastRecord(child.txid)).?.getArray("watchers").?.len);
     try std.testing.expect(try st2.map("unproven").has(&child.txid));
     try std.testing.expectEqual(@as(?u32, 3), try st2.chain().tip());
@@ -1100,7 +1121,9 @@ test "0.21.0 reorg: the block leaves — P and X both unproven, both reverted; p
     _ = try st2.addHeaders(&.{ &alt2, &alt3 });
     try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(z.p.txid));
     try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(z.x.txid));
-    try std.testing.expectEqual(@as(usize, 2), st2.reverted.items.len);
+    try std.testing.expectEqual(@as(usize, 1), st2.blocks.items.len); // the one block both were mined in
+    const moved = try st2.blockChanged(st2.blocks.items[0].hash, st2.blocks.items[0].height);
+    try std.testing.expectEqual(@as(usize, 2), moved.len);
     try std.testing.expect((try st2.broadcastRecord(z.x.txid)) != null);
     const s2 = try st2.save();
 
@@ -1150,4 +1173,278 @@ test "0.21.0 negatives: a path whose root is not the header's links nothing; a d
     try std.testing.expectEqualSlices(u8, &tc, &w.st.linked.items[0].txid);
     try std.testing.expectEqual(@as(u64, 2), w.st.linked.items[0].position);
     try std.testing.expectEqual(lib.state.Status.unproven, try w.st.minedStatus(ab));
+}
+
+// ------------------------------------------------------------ 0.21.0 phase 2: dependencies re-examined from the state
+
+test "0.21.0 parents: P rejected — only P at the source; X and C (X's child) rejected input-rejected by reexamine; P proven later — X revived, then C" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x, z.c }));
+    const s0 = try z.w.st.save();
+
+    var st = try State.load(a, ms.store(), s0, .regtest);
+    _ = try st.applyStatus(z.p.txid, "REJECTED", null);
+    try std.testing.expectEqual(lib.state.Status.rejected, try st.status(z.p.txid));
+    try std.testing.expectEqual(lib.state.Status.unproven, try st.status(z.x.txid)); // no walk at the source
+    try std.testing.expectEqual(lib.state.Reexamined.unchanged, try st.reexamine(z.c.txid)); // its parent X is not rejected yet
+    try std.testing.expectEqual(lib.state.Reexamined.rejected, try st.reexamine(z.x.txid)); // P's fact
+    try std.testing.expectEqual(lib.state.Reexamined.rejected, try st.reexamine(z.c.txid)); // X's fact
+    const rc = (try st.rejectionOf(z.c.txid)).?;
+    try std.testing.expectEqualStrings("input-rejected", rc.reason);
+    try std.testing.expectEqualSlices(u8, &z.p.txid, &rc.by.?); // the root
+    try std.testing.expectEqual(lib.state.Reexamined.unchanged, try st.reexamine(z.x.txid)); // idempotent
+    const s1 = try st.save();
+
+    // P proven (block 2 holds P and X): X is linked too — proven, its input-rejected overridden; C revived.
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    _ = try st2.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, false));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.p.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.x.txid));
+    try std.testing.expectEqual(lib.state.Status.rejected, try st2.status(z.c.txid));
+    try std.testing.expectEqual(lib.state.Reexamined.revived, try st2.reexamine(z.c.txid)); // X's fact
+    try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(z.c.txid));
+    try std.testing.expect((try st2.broadcastRecord(z.c.txid)) != null);
+    try std.testing.expectEqual(@as(usize, 1), st2.revived.items.len);
+    try std.testing.expectEqualSlices(u8, &z.c.txid, &st2.revived.items[0]);
+    try std.testing.expectEqual(lib.state.Reexamined.unchanged, try st2.reexamine(z.c.txid));
+}
+
+test "0.21.0 parents: P rejected, its child X unmined — revived when P's rejection is overturned by P's own proof (P alone in its block)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const p = try spend(a, &w.fund.tx, 0, 9_000);
+    const x = try spend(a, &p.tx, 0, 8_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ p, x }));
+    _ = try w.st.applyStatus(p.txid, "REJECTED", null);
+    _ = try w.st.reexamine(x.txid);
+    try std.testing.expectEqual(lib.state.Status.rejected, try w.st.status(x.txid));
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), p.txid, 1_700_001_200)});
+    _ = try w.st.applyStatus(p.txid, "MINED", try soloPath(a, 2, p.txid));
+    try std.testing.expectEqual(lib.state.Reexamined.revived, try w.st.reexamine(x.txid));
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.status(x.txid));
+}
+
+test "0.21.0 a rejection is refused while a descendant is proven (a proven child proves its parents mined)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const p = try spend(a, &w.fund.tx, 0, 9_000);
+    const x = try spend(a, &p.tx, 0, 8_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ p, x }));
+    // X proven in a block of its own; P (its parent) has no proof here.
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), x.txid, 1_700_001_200)});
+    _ = try w.st.applyStatus(x.txid, "MINED", try soloPath(a, 2, x.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(x.txid));
+    try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(p.txid, "REJECTED", null));
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.status(p.txid));
+    try std.testing.expect((try w.st.rejectionOf(p.txid)) == null);
+    try std.testing.expectEqual(@as(usize, 0), (try w.st.reject(p.txid, "REJECTED")).len);
+}
+
+test "0.21.0 a proof always overrides rejected: proven after a rejection, then reorged out — unproven, not rejected; a later rejection is rejected again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const t = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{t}));
+    _ = try w.st.applyStatus(t.txid, "REJECTED", null);
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), t.txid, 1_700_001_200)});
+    _ = try w.st.applyStatus(t.txid, "MINED", try soloPath(a, 2, t.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(t.txid));
+    try std.testing.expect(!(try w.st.map("rejected").has(&t.txid)));
+    try std.testing.expectEqualStrings("REJECTED", (try w.st.rejectionOf(t.txid)).?.reason); // the record kept, read for its reason
+    const alt2 = mine(hdr.hash(&w.h1), .{3} ** 32, 1_700_001_201);
+    const alt3 = mine(hdr.hash(&alt2), .{4} ** 32, 1_700_001_202);
+    _ = try w.st.addHeaders(&.{ &alt2, &alt3 });
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.status(t.txid));
+    _ = try w.st.applyStatus(t.txid, "REJECTED", null);
+    try std.testing.expectEqual(lib.state.Status.rejected, try w.st.status(t.txid));
+}
+
+test "0.21.0 a proof before its header for a rejected transaction (no broadcast record) is parked, not thrown away" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const t = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{t}));
+    _ = try w.st.applyStatus(t.txid, "REJECTED", null);
+    try std.testing.expect((try w.st.broadcastRecord(t.txid)) == null);
+    try std.testing.expectEqual(State.Outcome.rejected, try w.st.applyStatus(t.txid, "MINED", try soloPath(a, 2, t.txid)));
+    try std.testing.expect(try w.st.map("parked").has(&t.txid));
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), t.txid, 1_700_001_200)});
+    try std.testing.expectEqual(lib.state.Status.proven, try w.st.status(t.txid));
+    try std.testing.expect(!(try w.st.map("parked").has(&t.txid)));
+}
+
+test "0.21.0 a path whose subject is proven already still links what it newly covers; covering nothing new, nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{z.p}));
+    // P's path (X its sibling); then the same path again, flagged differently: nothing new.
+    const n0 = z.w.st.linked.items.len; // the funding, linked at its ingest
+    _ = try z.w.st.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, false));
+    try std.testing.expectEqual(n0 + 2, z.w.st.linked.items.len);
+    const s1 = try z.w.st.save();
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    _ = try st2.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, true));
+    try std.testing.expectEqual(@as(usize, 0), st2.linked.items.len);
+    try std.testing.expectEqualStrings(s1, try st2.save());
+}
+
+test "0.21.0 a compound path for a proven subject links its other leaves (a four-leaf block, P proven by its own path, then a path naming all four)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const p = try spend(a, &w.fund.tx, 0, 9_000);
+    const l: [4][32]u8 = .{ p.txid, .{0x21} ** 32, .{0x22} ** 32, .{0x23} ** 32 };
+    const n0 = lib.store.dblSha256(&(l[0] ++ l[1]));
+    const n1 = lib.store.dblSha256(&(l[2] ++ l[3]));
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), lib.store.dblSha256(&(n0 ++ n1)), 1_700_001_200)});
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{p}));
+    const k0 = w.st.linked.items.len; // the funding
+    _ = try w.st.applyStatus(p.txid, "MINED", try path4(a, 2, l, 0)); // P and its sibling 1
+    try std.testing.expectEqual(k0 + 2, w.st.linked.items.len);
+    const s1 = try w.st.save();
+    // The same block's path for leaf 2 names 2 and 3: P is proven already; 2 and 3 are new.
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    try st2.putProof(l[2], try bsvz.spv.MerklePath.parse(a, try path4(a, 2, l, 2)));
+    try std.testing.expectEqual(@as(usize, 2), st2.linked.items.len);
+    // Through addPath (a proof event for P carrying a compound path): still links what is new.
+    var st3 = try State.load(a, ms.store(), s1, .regtest);
+    const PE = std.meta.Elem(std.meta.Elem(@FieldType(bsvz.spv.MerklePath, "path")));
+    const levels = try a.alloc([]PE, 2);
+    levels[0] = try a.dupe(PE, &.{ .{ .offset = 0, .hash = .{ .bytes = l[0] }, .txid = true }, .{ .offset = 1, .hash = .{ .bytes = l[1] } }, .{ .offset = 2, .hash = .{ .bytes = l[2] } }, .{ .offset = 3, .hash = .{ .bytes = l[3] } } });
+    levels[1] = try a.dupe(PE, &.{});
+    const compound: bsvz.spv.MerklePath = .{ .block_height = 2, .path = levels };
+    _ = try st3.applyStatus(p.txid, "MINED", try compound.bytes(a));
+    try std.testing.expectEqual(@as(usize, 2), st3.linked.items.len);
+    try std.testing.expect(linkedHas(&st3, l[2]) and linkedHas(&st3, l[3]));
+}
+
+test "0.21.0 a leaf with no sibling path is not linked; an inconsistent node refuses the path, nothing linked" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const l: [4][32]u8 = .{ .{0x31} ** 32, .{0x32} ** 32, .{0x33} ** 32, .{0x34} ** 32 };
+    const n0 = lib.store.dblSha256(&(l[0] ++ l[1]));
+    const n1 = lib.store.dblSha256(&(l[2] ++ l[3]));
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), lib.store.dblSha256(&(n0 ++ n1)), 1_700_001_200)});
+    const PE = std.meta.Elem(std.meta.Elem(@FieldType(bsvz.spv.MerklePath, "path")));
+    // Leaf 2 with its sibling 3 and n0 above; leaf 0 given alone (no sibling 1): 0 is not reached.
+    var levels = try a.alloc([]PE, 2);
+    levels[0] = try a.dupe(PE, &.{ .{ .offset = 0, .hash = .{ .bytes = l[0] } }, .{ .offset = 2, .hash = .{ .bytes = l[2] }, .txid = true }, .{ .offset = 3, .hash = .{ .bytes = l[3] } } });
+    levels[1] = try a.dupe(PE, &.{.{ .offset = 0, .hash = .{ .bytes = n0 } }});
+    try w.st.putProof(l[2], .{ .block_height = 2, .path = levels });
+    try std.testing.expectEqual(@as(usize, 2), w.st.linked.items.len);
+    try std.testing.expect(!linkedHas(&w.st, l[0]));
+    // A node given that conflicts with the one its children make: refused, nothing linked.
+    var st2 = try State.load(a, ms.store(), null, .regtest);
+    _ = try st2.addHeaders(&.{ &w.h1, &mine(hdr.hash(&w.h1), lib.store.dblSha256(&(n0 ++ n1)), 1_700_001_200) });
+    levels = try a.alloc([]PE, 2);
+    levels[0] = try a.dupe(PE, &.{ .{ .offset = 0, .hash = .{ .bytes = l[0] }, .txid = true }, .{ .offset = 1, .hash = .{ .bytes = l[1] } }, .{ .offset = 2, .hash = .{ .bytes = l[2] } }, .{ .offset = 3, .hash = .{ .bytes = l[3] } } });
+    levels[1] = try a.dupe(PE, &.{.{ .offset = 1, .hash = .{ .bytes = .{9} ** 32 } }});
+    try std.testing.expectError(error.BadProof, st2.putProof(l[0], .{ .block_height = 2, .path = levels }));
+    try std.testing.expectEqual(@as(usize, 0), st2.linked.items.len);
+}
+
+test "0.21.0 an unheld X linked in block A; A reorged out; X arrives — pending, registered; relinked in block B — listed again, mined" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{z.p}));
+    _ = try z.w.st.applyStatus(z.p.txid, "MINED", try pairBytes(a, 2, z.p.txid, z.x.txid, true, false));
+    try std.testing.expect(linkedHas(&z.w.st, z.x.txid));
+    // A heavier branch without block 2: the block listed; X unheld is skipped by its step.
+    const alt2 = mine(hdr.hash(&z.w.h1), .{3} ** 32, 1_700_001_201);
+    const alt3 = mine(hdr.hash(&alt2), .{4} ** 32, 1_700_001_202);
+    _ = try z.w.st.addHeaders(&.{ &alt2, &alt3 });
+    try std.testing.expectEqual(@as(usize, 1), z.w.st.blocks.items.len);
+    const moved = try z.w.st.blockChanged(z.w.st.blocks.items[0].hash, 2);
+    try std.testing.expectEqual(@as(usize, 1), moved.len); // P only
+    const s1 = try z.w.st.save();
+    // X arrives: its linkage's block is off our chain — pending, registered.
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    const g = try st2.ingest(try beefWith(a, z.x.txid, &.{}, &.{ .{ .txid = z.p.txid, .format = .txid_only }, .{ .txid = z.x.txid, .format = .raw, .raw = z.x.raw, .tx = z.x.tx } }));
+    try std.testing.expectEqual(lib.state.Status.unproven, try st2.status(z.x.txid));
+    try std.testing.expectEqual(@as(usize, 1), g.registered.len);
+    // Mined again in block 4 (P and X): X linked again, at the new block.
+    const alt4 = mine(hdr.hash(&alt3), pairRoot(z.p.txid, z.x.txid), 1_700_001_203);
+    _ = try st2.addHeaders(&.{&alt4});
+    _ = try st2.applyStatus(z.p.txid, "MINED", try pairBytes(a, 4, z.p.txid, z.x.txid, true, false));
+    try std.testing.expect(linkedHas(&st2, z.x.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.x.txid));
+}
+
+test "0.21.0 reorg out and back: the block leaves (listed inactive), comes back (listed active) — its transaction proven again by its step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const fund = try funding(a, 1);
+    const h1 = mine(hdr.hash(&lib.chain.Network.regtest.genesis()), fund.txid, 1_700_000_600);
+    const child = try spend(a, &fund.tx, 0, 9_000);
+    const h2 = mine(hdr.hash(&h1), child.txid, 1_700_001_200);
+    const host2 = try hostAdd(a, s, null, &.{ &h1, &h2 });
+    var st = try State.load(a, s, null, .regtest);
+    _ = try st.pointAt(host2);
+    try std.testing.expectEqual(@as(usize, 0), st.blocks.items.len); // the first pointing changes nothing linked
+    _ = try st.ingest(try beefOf(a, &.{ .{ fund, 1 }, .{ child, 2 } }, &.{}));
+    const s1 = try st.save();
+    // Out: a heavier branch from 1.
+    const alt2 = mine(hdr.hash(&h1), .{3} ** 32, 1_700_001_201);
+    const alt3 = mine(hdr.hash(&alt2), .{4} ** 32, 1_700_001_202);
+    const hostB = try hostAdd(a, s, null, &.{ &h1, &alt2, &alt3 });
+    var st2 = try State.load(a, s, s1, .regtest);
+    _ = try st2.pointAt(hostB);
+    try std.testing.expectEqual(@as(usize, 1), st2.blocks.items.len);
+    try std.testing.expect(!st2.blocks.items[0].active);
+    const out = try st2.blockChanged(st2.blocks.items[0].hash, st2.blocks.items[0].height);
+    try std.testing.expect(!out[0].proven);
+    try std.testing.expect((try st2.broadcastRecord(child.txid)) != null);
+    const s2 = try st2.save();
+    // Back: the first branch, heavier again.
+    const h3 = mine(hdr.hash(&h2), .{5} ** 32, 1_700_001_203);
+    const h4 = mine(hdr.hash(&h3), .{6} ** 32, 1_700_001_204);
+    const hostA = try hostAdd(a, s, null, &.{ &h1, &h2, &h3, &h4 });
+    var st3 = try State.load(a, s, s2, .regtest);
+    _ = try st3.pointAt(hostA);
+    try std.testing.expectEqual(@as(usize, 1), st3.blocks.items.len);
+    try std.testing.expect(st3.blocks.items[0].active);
+    const back = try st3.blockChanged(st3.blocks.items[0].hash, st3.blocks.items[0].height);
+    try std.testing.expect(back[0].proven);
+    try std.testing.expectEqual(lib.state.Status.proven, try st3.status(child.txid));
+    try std.testing.expect((try st3.broadcastRecord(child.txid)) == null);
 }
