@@ -264,10 +264,11 @@ pub const Forest = struct {
         }
     }
 
-    /// Every entry whose key starts with `prefix`.
+    /// Every entry whose key starts with `prefix` (any length: the scan's upper bound is allocated
+    /// from `a`, as long as the prefix; 0.21.1 — a fixed 256-byte buffer overran on a longer one).
     pub fn prefixed(f: *Forest, a: std.mem.Allocator, root: ?[]const u8, prefix: []const u8, out: *std.array_list.Managed(KV)) !void {
-        var hi_buf: [256]u8 = undefined;
-        return f.range(a, root, prefix, successor(&hi_buf, prefix), out);
+        const hi_buf = try a.alloc(u8, prefix.len);
+        return f.range(a, root, prefix, successor(hi_buf, prefix), out);
     }
 
     pub fn count(f: *Forest, root: ?[]const u8) !usize {
@@ -472,8 +473,10 @@ fn eqLink(x: ?[]const u8, y: ?[]const u8) bool {
     return std.mem.eql(u8, x.?, y.?);
 }
 
-/// The least byte string above every string with this prefix; null if none.
+/// The least byte string above every string with this prefix; null if none (an empty prefix, or
+/// one of 0xff bytes only: no string is above them all). `buf` is at least as long as the prefix.
 pub fn successor(buf: []u8, prefix: []const u8) ?[]const u8 {
+    std.debug.assert(buf.len >= prefix.len);
     var n = prefix.len;
     while (n > 0) {
         if (prefix[n - 1] != 0xff) {
@@ -715,6 +718,61 @@ test "mst: prefix scans over composite keys" {
     try f.prefixed(a, root, "", &out);
     try std.testing.expectEqual(@as(usize, 7), out.items.len);
     try std.testing.expectEqualStrings("", out.items[0].key);
+}
+
+test "mst: prefix scans of any length (0.21.1) — 255, 256, 257, 9000 bytes, all 0xff, empty: exactly the keys under the prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem = Mem{ .map = std.StringHashMap([]u8).init(a) };
+    var f = Forest.init(std.testing.allocator, mem.blocks());
+    defer f.deinit();
+    var root: ?[]const u8 = null;
+    const lens = [_]usize{ 255, 256, 257, 9000 };
+    for (lens) |n| {
+        for ([_]u8{ 0x61, 0xff }) |fill| {
+            const p = try a.alloc(u8, n);
+            @memset(p, fill);
+            // under the prefix: the prefix itself and two longer keys; beside it: one byte off at the end, a shorter one
+            root = try f.put(root, p, .{ .int = 1 });
+            root = try f.put(root, try std.mem.concat(a, u8, &.{ p, &.{0x00} }), .{ .int = 2 });
+            root = try f.put(root, try std.mem.concat(a, u8, &.{ p, &.{ 0xff, 0x01 } }), .{ .int = 3 });
+            const off = try a.dupe(u8, p);
+            off[n - 1] = if (fill == 0xff) 0xfe else fill + 1;
+            root = try f.put(root, off, .{ .int = 4 });
+            root = try f.put(root, p[0 .. n - 1], .{ .int = 5 });
+        }
+    }
+    for (lens) |n| {
+        for ([_]u8{ 0x61, 0xff }) |fill| {
+            const p = try a.alloc(u8, n);
+            @memset(p, fill);
+            var out = std.array_list.Managed(KV).init(a);
+            try f.prefixed(a, root, p, &out);
+            var want: usize = 0;
+            var all = std.array_list.Managed(KV).init(a);
+            try f.range(a, root, null, null, &all);
+            for (all.items) |kv| if (std.mem.startsWith(u8, kv.key, p)) {
+                want += 1;
+            };
+            try std.testing.expectEqual(want, out.items.len);
+            for (out.items) |kv| try std.testing.expect(std.mem.startsWith(u8, kv.key, p));
+            // the prefix's own keys are there; the shorter one (its prefix) and the one off are not
+            try std.testing.expect(out.items.len >= 3);
+        }
+    }
+    // An empty prefix: every key.
+    var everything = std.array_list.Managed(KV).init(a);
+    try f.prefixed(a, root, "", &everything);
+    var all = std.array_list.Managed(KV).init(a);
+    try f.range(a, root, null, null, &all);
+    try std.testing.expectEqual(all.items.len, everything.items.len);
+    // successor's edges.
+    var b: [3]u8 = undefined;
+    try std.testing.expect(successor(&b, "") == null);
+    try std.testing.expect(successor(&b, &.{ 0xff, 0xff, 0xff }) == null);
+    try std.testing.expectEqualSlices(u8, &.{0x01}, successor(&b, &.{ 0x00, 0xff, 0xff }).?); // trailing 0xff dropped
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x02 }, successor(&b, &.{ 0x00, 0x01 }).?);
 }
 
 test "mst: rangeBack — greatest first, stops at the limit" {
