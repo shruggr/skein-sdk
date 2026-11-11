@@ -42,7 +42,8 @@
 //   zig build test-wasm     the wallet's tests built for wasm32-wasi, run under Node's WASI
 //
 // bsvz is a lazy URL dependency (build.zig.zon): fetched only when the chain
-// or wallet module is asked for. `-Dwallet=false` leaves the wallet out (the
+// or wallet module is asked for (0.21.2: a dependent's `module("chain")` works on
+// a clean cache too — placeholders hold the names in the pass that asks for bsvz). `-Dwallet=false` leaves the wallet out (the
 // skein kernel builds that way: it needs the codecs and, for the host chain,
 // shruggr/skein#156, the chain module); `-Dwallet=false -Dchain=false` leaves
 // both out (the codecs only: bsvz never fetched).
@@ -82,13 +83,29 @@ pub fn build(b: *std.Build) void {
     }
 
     if (!with_chain) return;
-    const chain = chainModule(b, "chain/src/lib.zig", target, optimize, c.mst) orelse return;
+    const chain = chainModule(b, "chain/src/lib.zig", target, optimize, c.mst) orelse {
+        // bsvz not fetched yet (the first configure on a clean cache). `lazyDependency` has marked
+        // it needed; when this configure pass returns, the build runner writes the needed list and
+        // exits 3 BEFORE making any step (zig 0.16 lib/compiler/build_runner.zig ~467-485: "if
+        // (graph.needed_lazy_dependencies.entries.len != 0) { ... process.exit(3); // Indicate
+        // configure phase failed with meaningful stdout. }"), and `zig build` fetches it and runs
+        // configure again. A dependent's build runs in this same pass and asks for our modules;
+        // `Dependency.module` panics on a missing one (lib/std/Build.zig ~1961-1964: "unable to find
+        // module"), which would kill the pass before the fetch. So the modules are named here as
+        // placeholders: never compiled (no step is made in this pass), replaced by the real ones in
+        // the next.
+        placeholders(b, target, optimize, with_wallet);
+        return;
+    };
     b.modules.put(b.graph.arena, "chain", chain) catch @panic("OOM");
     const ctests = b.addTest(.{ .root_module = chainModule(b, "chain/test.zig", target, optimize, c.mst).? });
     test_step.dependOn(&b.addRunArtifact(ctests).step);
 
     if (!with_wallet) return;
-    const wallet = walletModule(b, "wallet/src/lib.zig", target, optimize, c.mst, chain) orelse return;
+    const wallet = walletModule(b, "wallet/src/lib.zig", target, optimize, c.mst, chain) orelse {
+        placeholders(b, target, optimize, true); // as above
+        return;
+    };
     b.modules.put(b.graph.arena, "wallet", wallet) catch @panic("OOM");
     const wtests = b.addTest(.{ .root_module = walletModule(b, "wallet/test.zig", target, optimize, c.mst, chain).? });
     test_step.dependOn(&b.addRunArtifact(wtests).step);
@@ -101,6 +118,13 @@ pub fn build(b: *std.Build) void {
     run_wasm.addFileArg(b.path("wallet/scripts/run-wasi.mjs"));
     run_wasm.addArtifactArg(wasm_tests);
     b.step("test-wasm", "the wallet's tests built for wasm32-wasi, under Node's WASI").dependOn(&run_wasm.step);
+}
+
+/// The `chain` (and `wallet`) module names, held by placeholders in a configure pass that has only
+/// asked for bsvz (see `build`): no imports, never compiled.
+fn placeholders(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, with_wallet: bool) void {
+    if (!b.modules.contains("chain")) _ = b.addModule("chain", .{ .root_source_file = b.path("chain/src/lib.zig"), .target = target, .optimize = optimize });
+    if (with_wallet and !b.modules.contains("wallet")) _ = b.addModule("wallet", .{ .root_source_file = b.path("wallet/src/lib.zig"), .target = target, .optimize = optimize });
 }
 
 const Codecs = struct { cid: *std.Build.Module, cbor: *std.Build.Module, mst: *std.Build.Module };
