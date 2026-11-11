@@ -128,7 +128,7 @@ test "ingest: proven in is recorded proven, nothing registered" {
     try std.testing.expectError(error.NetworkMismatch, State.load(a, ms.store(), saved, .main));
 }
 
-test "ingest: unproven in is registered; accepted by the first status, proven by its proof; watchers told each" {
+test "ingest: unproven in is registered; an intermediate status changes nothing (0.22.0), proven by its proof; watchers told" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -152,12 +152,15 @@ test "ingest: unproven in is registered; accepted by the first status, proven by
     try std.testing.expectEqual(@as(usize, 2), out.entries.len);
     try std.testing.expectEqual(beef.Format.raw_with_bump, out.entries[0].format);
 
-    // RECEIVED: accepted (once); SEEN_ON_NETWORK: noted, no change.
-    try std.testing.expectEqual(State.Outcome.accepted, try w.st.applyStatus(child.txid, "RECEIVED", null));
+    // 0.22.0: a status that is neither a rejection nor a proof changes nothing — no change listed, the
+    // record as it was (no `accepted`, no `txStatus`); DOUBLE_SPEND_ATTEMPTED is no rejection word.
+    const before = (try w.st.broadcastCid(child.txid)).?;
+    try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(child.txid, "RECEIVED", null));
     try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(child.txid, "SEEN_ON_NETWORK", null));
-    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items.len);
-    try std.testing.expectEqual(.accepted, w.st.changes.items[0].state);
-    try std.testing.expectEqualStrings("SEEN_ON_NETWORK", (try w.st.broadcastRecord(child.txid)).?.getText("txStatus").?);
+    try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(child.txid, "DOUBLE_SPEND_ATTEMPTED", null));
+    try std.testing.expectEqual(@as(usize, 0), w.st.changes.items.len);
+    try std.testing.expectEqualStrings(before, (try w.st.broadcastCid(child.txid)).?);
+    try std.testing.expect(r.get("accepted") == null and r.get("txStatus") == null);
     // Its proof, before its header: kept, pending; the header: proven, the watcher told, the broadcast gone.
     const path = try soloPath(a, 2, child.txid);
     try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(child.txid, "MINED", path));
@@ -168,9 +171,9 @@ test "ingest: unproven in is registered; accepted by the first status, proven by
     // 0.21.0: the linkage is listed; what it settles is the transaction's subscription step.
     try std.testing.expect(linkedHas(&w.st, child.txid));
     try w.st.settleProven(child.txid);
-    try std.testing.expectEqual(@as(usize, 2), w.st.changes.items.len);
-    try std.testing.expectEqual(.proven, w.st.changes.items[1].state);
-    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items[1].watchers.len);
+    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items.len);
+    try std.testing.expectEqual(.proven, w.st.changes.items[0].state);
+    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items[0].watchers.len);
     try std.testing.expect((try w.st.broadcastRecord(child.txid)) == null);
     try std.testing.expect(!(try w.st.map("unproven").has(&child.txid)));
     _ = try w.st.save();
@@ -1510,7 +1513,7 @@ test "0.21.0 parked: a path at a future height whose root is not the block's —
     const t = try spend(a, &w.fund.tx, 0, 9_000);
     _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{t}));
     // A path for t at height 3 (no header yet): parked.
-    try std.testing.expectEqual(State.Outcome.accepted, try w.st.applyStatus(t.txid, "MINED", try soloPath(a, 3, t.txid)));
+    try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(t.txid, "MINED", try soloPath(a, 3, t.txid)));
     try std.testing.expect(try w.st.map("parked").has(&t.txid));
     // The chain reaches 3 with another block (an orphaned block's path, or a bogus root): dropped.
     const h2 = mine(hdr.hash(&w.h1), .{7} ** 32, 1_700_001_200);

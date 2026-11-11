@@ -35,12 +35,14 @@
 //! transaction is in `unproven` only while `broadcasts` holds a record for
 //! it. The record:
 //!
-//!   {kind: "broadcast", txid (hex), subject: <tx CID>, since: ms, txStatus: text,
-//!    accepted?: true, watchers: [...]}   (0.21.0: a proof before its header is kept in `parked`)
+//!   {kind: "broadcast", txid (hex), subject: <tx CID>, since: ms, watchers: [...]}
+//!   (0.21.0: a proof before its header is kept in `parked`)
 //!
 //! `watchers` ({to: bytes(33), box, request: <message CID>}) are the callers to answer on each state change of the
-//! transaction (accepted, proven, rejected); `accepted` is set by the first
-//! status that is not a rejection. Proven or rejected, the record goes: the
+//! transaction (proven, rejected). 0.22.0 (David 2026-11-11): a status into the state means only
+//! REJECTED (the transaction is invalid) or a proof; the broadcaster's intermediate statuses stay in
+//! the host. No `accepted` flag and no `txStatus` on the record: a record written before 0.22.0 keeps
+//! them, ignored, and drops them when rewritten. Proven or rejected, the record goes: the
 //! transaction no longer awaits anything. Proven, its `proofs` entry links
 //! the record it settled, for the watchers: a reorg that turns it back to unproven registers its
 //! broadcast again (`blockChanged`) with the same watchers, and the next proof
@@ -98,11 +100,12 @@ pub const SHAPE: u64 = 2;
 pub const Change = struct {
     txid: [32]u8,
     /// 0.21.0: `revived` — an `input-rejected` that no longer holds (its parent is not rejected any
-    /// more): back to unproven, its broadcast registered again.
-    state: enum { accepted, proven, rejected, revived },
+    /// more): back to unproven, its broadcast registered again. 0.22.0: no `accepted` (a status other
+    /// than a rejection or a proof changes nothing).
+    state: enum { proven, rejected, revived },
     /// The watchers registered when it changed (`{to, box, request}`).
     watchers: []const Value,
-    /// The status that accepted it, or the rejection's reason.
+    /// The rejection's reason.
     detail: []const u8 = "",
     /// A rejection's cause (0.19.0): the proven transaction that spends the same output
     /// ("double-spent"), or the rejected transaction it spends from ("input-rejected": the
@@ -110,9 +113,10 @@ pub const Change = struct {
     by: ?[32]u8 = null,
 };
 
-/// The status texts (Arcade's txStatus) that reject a transaction.
+/// The status texts (Arcade's txStatus) that reject a transaction. 0.22.0: no `DOUBLE_SPEND_ATTEMPTED`
+/// (the broadcaster never produces it; a double spend arrives as a plain REJECTED).
 pub fn isRejection(tx_status: []const u8) bool {
-    for ([_][]const u8{ "REJECTED", "DOUBLE_SPEND_ATTEMPTED", "INVALID", "MALFORMED" }) |s| if (std.mem.eql(u8, s, tx_status)) return true;
+    for ([_][]const u8{ "REJECTED", "INVALID", "MALFORMED" }) |s| if (std.mem.eql(u8, s, tx_status)) return true;
     return false;
 }
 
@@ -579,7 +583,7 @@ pub const State = struct {
                     try out.append(self.arena, .{ .txid = txid, .proven = true });
                 },
                 .unproven => {
-                    if ((try self.broadcastRecord(txid)) == null) try self.writeBroadcast(txid, null, .{ .tx_status = "", .watchers = try self.settledWatchers(txid) });
+                    if ((try self.broadcastRecord(txid)) == null) try self.writeBroadcast(txid, null, .{ .watchers = try self.settledWatchers(txid) });
                     try out.append(self.arena, .{ .txid = txid, .proven = false });
                 },
                 .rejected => {},
@@ -784,7 +788,7 @@ pub const State = struct {
         for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
         if (try self.rejectIfConflicted(txid)) return .rejected;
         if ((try self.broadcastRecord(txid)) == null) {
-            try self.register(txid, "");
+            try self.register(txid);
             try self.revived.append(self.arena, txid);
         }
         try self.changes.append(self.arena, .{ .txid = txid, .state = .revived, .watchers = &.{}, .detail = "" });
@@ -841,11 +845,11 @@ pub const State = struct {
     }
 
     /// Register the broadcast of an unproven transaction we hold (since now, no watchers).
-    pub fn register(self: *State, txid: [32]u8, tx_status: []const u8) !void {
-        try self.writeBroadcast(txid, null, .{ .tx_status = tx_status });
+    pub fn register(self: *State, txid: [32]u8) !void {
+        try self.writeBroadcast(txid, null, .{});
     }
 
-    const Fields = struct { tx_status: ?[]const u8 = null, accepted: ?bool = null, path: ?[]const u8 = null, add_watcher: ?Value = null, watchers: ?[]const Value = null };
+    const Fields = struct { path: ?[]const u8 = null, add_watcher: ?Value = null, watchers: ?[]const Value = null };
 
     /// The broadcast record of `txid` with some fields changed (`prior`: the record as it stands;
     /// `watchers`: the list to start from instead of the prior record's).
@@ -863,10 +867,8 @@ pub const State = struct {
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
             .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &store_mod.bitcoinCid(.tx, raw)) } },
             .{ .key = "since", .value = .{ .uint = if (prior) |p| p.getUint("since") orelse @intCast(@max(self.now, 0)) else @intCast(@max(self.now, 0)) } },
-            .{ .key = "txStatus", .value = .{ .text = f.tx_status orelse if (prior) |p| p.getText("txStatus") orelse "" else "" } },
             .{ .key = "watchers", .value = .{ .array = watchers.items } },
         });
-        if (f.accepted orelse if (prior) |p| p.getBool("accepted") orelse false else false) try fields.append(a, .{ .key = "accepted", .value = .{ .boolean = true } });
         if (f.path orelse if (prior) |p| p.getBytes("path") else null) |path| try fields.append(a, .{ .key = "path", .value = .{ .bytes = path } });
         try self.map("broadcasts").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
     }
@@ -911,11 +913,12 @@ pub const State = struct {
         return (try self.record(b.cid)).getArray("watchers");
     }
 
-    pub const Outcome = enum { pending, accepted, proven, rejected };
+    pub const Outcome = enum { pending, proven, rejected };
 
     /// A status for a transaction we hold (a status provider's message, or a proof event as `MINED`
     /// with its path): a path proves it (a header not held yet keeps the path for later), a rejection
-    /// rejects it (and what spends it), any other status — the first — accepts it.
+    /// rejects it (and what spends it). 0.22.0: nothing else — any other status changes nothing
+    /// (`pending`: the transaction stays as it was).
     pub fn applyStatus(self: *State, txid: [32]u8, tx_status: []const u8, merkle_path: ?[]const u8) !Outcome {
         if (!(try self.holds(txid))) return error.UnknownTransaction;
         if (merkle_path) |p| {
@@ -930,20 +933,11 @@ pub const State = struct {
         } else if (isRejection(tx_status)) {
             _ = try self.reject(txid, tx_status);
         }
-        switch (try self.status(txid)) {
-            .proven => return .proven,
-            .rejected => return .rejected,
-            .unproven => {},
-        }
-        const r = (try self.broadcastRecord(txid)) orelse return .pending;
-        if (r.getBool("accepted") orelse false) {
-            if (tx_status.len > 0 and !std.mem.eql(u8, r.getText("txStatus") orelse "", tx_status)) try self.writeBroadcast(txid, r, .{ .tx_status = tx_status });
-            return .pending;
-        }
-        if (tx_status.len == 0 or isRejection(tx_status)) return .pending;
-        try self.writeBroadcast(txid, r, .{ .tx_status = tx_status, .accepted = true });
-        try self.changes.append(self.arena, .{ .txid = txid, .state = .accepted, .watchers = r.getArray("watchers") orelse &.{}, .detail = tx_status });
-        return .accepted;
+        return switch (try self.status(txid)) {
+            .proven => .proven,
+            .rejected => .rejected,
+            .unproven => .pending,
+        };
     }
 
     // ------------------------------------------------------------ ingest
@@ -1010,7 +1004,7 @@ pub const State = struct {
             // reach it by subscription, `reexamine`).
             if (try self.rejectedRoot(e.txid)) |root| if ((try self.rejectBy(e.txid, "input-rejected", root)).len > 0) continue;
             if ((try self.broadcastRecord(e.txid)) != null) continue;
-            try self.register(e.txid, "");
+            try self.register(e.txid);
             try registered.append(a, e.txid);
         }
         return .{
