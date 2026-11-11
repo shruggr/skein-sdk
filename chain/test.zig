@@ -1660,3 +1660,186 @@ test "0.21.3 ingest: held means in the chain state's `txs` — bytes in the stor
     _ = try w.st.putTx(bad.txid, bad.raw);
     _ = try w.st.ingest(wire);
 }
+
+/// A store counting the bitcoin blocks put and kept through it (transactions, merkle nodes, headers).
+const Counting = struct {
+    inner: lib.store.Store,
+    puts: usize = 0,
+    keeps: usize = 0,
+    fn store(self: *Counting) lib.store.Store {
+        return .{ .ptr = self, .getFn = get, .putFn = put, .putBlockFn = putBlock, .keepFn = keep, .edgesFn = edges };
+    }
+    fn get(ptr: *anyopaque, a: std.mem.Allocator, cid: []const u8) anyerror![]const u8 {
+        const self: *Counting = @ptrCast(@alignCast(ptr));
+        return self.inner.get(a, cid);
+    }
+    fn put(ptr: *anyopaque, a: std.mem.Allocator, bytes: []const u8) anyerror![]const u8 {
+        const self: *Counting = @ptrCast(@alignCast(ptr));
+        return self.inner.put(a, bytes);
+    }
+    fn putBlock(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
+        const self: *Counting = @ptrCast(@alignCast(ptr));
+        if (lib.store.bitcoinHash(cid) != null) self.puts += 1;
+        return self.inner.putBlock(cid, bytes);
+    }
+    fn keep(ptr: *anyopaque, cid: []const u8) anyerror!void {
+        const self: *Counting = @ptrCast(@alignCast(ptr));
+        if (lib.store.bitcoinHash(cid) != null) self.keeps += 1;
+        return self.inner.keep(cid);
+    }
+    fn edges(ptr: *anyopaque, a: std.mem.Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const lib.store.Edge {
+        const self: *Counting = @ptrCast(@alignCast(ptr));
+        return self.inner.edges(a, to, rel);
+    }
+};
+
+/// The pair world's funding, P and X proven (P and X under one path, both flagged), then `rest` raw, then `subject`.
+fn pairBeef(a: std.mem.Allocator, z: Pair, rest: []const Tx, subject: Tx) ![]const u8 {
+    var es: std.ArrayList(beef.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .txid = z.w.fund.txid, .format = .raw_with_bump, .bump = 0, .raw = z.w.fund.raw, .tx = z.w.fund.tx },
+        .{ .txid = z.p.txid, .format = .raw_with_bump, .bump = 1, .raw = z.p.raw, .tx = z.p.tx },
+        .{ .txid = z.x.txid, .format = .raw_with_bump, .bump = 1, .raw = z.x.raw, .tx = z.x.tx },
+    });
+    for (rest) |t| try es.append(a, .{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx });
+    try es.append(a, .{ .txid = subject.txid, .format = .raw, .raw = subject.raw, .tx = subject.tx });
+    return beefWith(a, subject.txid, &.{ try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, z.w.fund.txid)), try pairPath(a, 2, z.p.txid, z.x.txid, true, true) }, es.items);
+}
+
+/// N held raw unmined ancestors (each with a failing script: held, never run again) over X, and a new
+/// subject spending the last: the blocks put and kept by its ingest, and what it registered.
+fn heldRun(n: usize) !struct { puts: usize, keeps: usize, registered: usize, added: usize, linked: usize } {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try pairBeef(a, z, &.{}, z.c)); // the funding, P, X proven and held
+    var held: std.ArrayList(Tx) = .empty;
+    var prev = z.x;
+    for (0..n) |k| {
+        const t = try broken(a, try spend(a, &prev.tx, 0, 8_000 - 10 * (k + 1)));
+        _ = try z.w.st.putTx(t.txid, t.raw);
+        try held.append(a, t);
+        prev = t;
+    }
+    const s1 = try z.w.st.save();
+    const subject = try spend(a, &prev.tx, 0, 1_000);
+    // The subject's own script runs: broken, refused.
+    {
+        var st = try State.load(a, ms.store(), s1, .regtest);
+        try std.testing.expectError(error.ScriptFailed, st.ingest(try pairBeef(a, z, held.items, try broken(a, subject))));
+    }
+    var cs = Counting{ .inner = ms.store() };
+    var st = try State.load(a, cs.store(), s1, .regtest);
+    const g = try st.ingest(try pairBeef(a, z, held.items, subject));
+    try std.testing.expectEqual(lib.state.Status.unproven, g.status);
+    for (held.items) |t| try std.testing.expectEqual(lib.state.Status.unproven, try st.status(t.txid));
+    return .{ .puts = cs.puts, .keeps = cs.keeps, .registered = g.registered.len, .added = st.added.items.len, .linked = st.linked.items.len };
+}
+
+test "0.22.1 ingest: N held raw unmined ancestors + a new subject — scripts for the subject alone; only the subject put, kept, added, registered; the same for any N" {
+    const one = try heldRun(1);
+    const many = try heldRun(6);
+    inline for (.{ one, many }) |r| {
+        try std.testing.expectEqual(@as(usize, 1), r.puts); // the subject's block; no merkle node again
+        try std.testing.expectEqual(@as(usize, 1), r.keeps);
+        try std.testing.expectEqual(@as(usize, 1), r.registered);
+        try std.testing.expectEqual(@as(usize, 1), r.added);
+        try std.testing.expectEqual(@as(usize, 0), r.linked);
+    }
+}
+
+test "0.22.1 ingest: held unmined P and X, their BUMP arriving beside a new subject — linked (the proof fact), proven, the subject registered alone; the same BUMP again stores nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    // P and X held, unproven (registered for broadcast).
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x }));
+    try std.testing.expectEqual(lib.state.Status.unproven, try z.w.st.status(z.x.txid));
+    const s1 = try z.w.st.save();
+
+    // The same P and X raw with their BUMP, and C new: P and X are txid-only entries, but the BUMP
+    // proves what we lack — checked against our header, saved, both linked.
+    var cs = Counting{ .inner = ms.store() };
+    var st2 = try State.load(a, cs.store(), s1, .regtest);
+    const g = try st2.ingest(try pairBeef(a, z, &.{}, z.c));
+    try std.testing.expect(linkedHas(&st2, z.p.txid) and linkedHas(&st2, z.x.txid));
+    try std.testing.expectEqual(@as(usize, 2), st2.linked.items.len); // not the funding: proven already
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.p.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.x.txid));
+    try std.testing.expectEqual(@as(usize, 1), g.registered.len);
+    try std.testing.expectEqualSlices(u8, &z.c.txid, &g.registered[0]);
+    try std.testing.expectEqual(@as(usize, 1), st2.added.items.len); // C alone
+    try std.testing.expectEqual(@as(usize, 2), cs.keeps); // C and the path's node (the block's root)
+    const s2 = try st2.save();
+
+    // A bogus root for a held unmined entry's BUMP is still refused (the proof is checked).
+    {
+        var st = try State.load(a, ms.store(), s1, .regtest);
+        const bad = try beefWith(a, z.c.txid, &.{ try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, z.w.fund.txid)), try pairPath(a, 2, z.x.txid, z.p.txid, true, true) }, &.{
+            .{ .txid = z.w.fund.txid, .format = .raw_with_bump, .bump = 0, .raw = z.w.fund.raw, .tx = z.w.fund.tx },
+            .{ .txid = z.p.txid, .format = .raw_with_bump, .bump = 1, .raw = z.p.raw, .tx = z.p.tx },
+            .{ .txid = z.x.txid, .format = .raw_with_bump, .bump = 1, .raw = z.x.raw, .tx = z.x.tx },
+            .{ .txid = z.c.txid, .format = .raw, .raw = z.c.raw, .tx = z.c.tx },
+        });
+        try std.testing.expectError(error.RootMismatch, st.ingest(bad));
+    }
+
+    // The same BEEF again: everything in it held and proven (C the subject, held): nothing put, kept
+    // or linked; the BUMPs dropped.
+    var cs3 = Counting{ .inner = ms.store() };
+    var st3 = try State.load(a, cs3.store(), s2, .regtest);
+    const g3 = try st3.ingest(try pairBeef(a, z, &.{}, z.c));
+    try std.testing.expectEqual(@as(usize, 0), cs3.puts);
+    try std.testing.expectEqual(@as(usize, 0), cs3.keeps);
+    try std.testing.expectEqual(@as(usize, 0), st3.linked.items.len);
+    try std.testing.expectEqual(@as(usize, 0), g3.registered.len);
+    try std.testing.expectEqualStrings(s2, try st3.save());
+}
+
+test "0.22.1 ingest: held rejected X with its BUMP beside a new subject — the proof overrides the rejection (its settlement kept)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{ z.p, z.x }));
+    _ = try z.w.st.applyStatus(z.x.txid, "REJECTED", null);
+    try std.testing.expectEqual(lib.state.Status.rejected, try z.w.st.status(z.x.txid));
+    const s1 = try z.w.st.save();
+    var st2 = try State.load(a, ms.store(), s1, .regtest);
+    _ = try st2.ingest(try pairBeef(a, z, &.{}, z.c));
+    try std.testing.expect(linkedHas(&st2, z.x.txid));
+    try std.testing.expectEqual(lib.state.Status.proven, try st2.status(z.x.txid));
+    try std.testing.expect((try st2.settlementCid(z.x.txid)) != null);
+}
+
+test "0.22.1 heldAsTxidOnly: the subject is never made txid-only; a BUMP proving only held proven entries is dropped, the others' indices remapped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var z = try pairWorld(a, ms.store());
+    _ = try z.w.st.ingest(try beefOf(a, &.{.{ z.w.fund, 1 }}, &.{}));
+    // The funding held and proven; P new (proven by the pair path); the subject P.
+    const b = try beef.parse(a, try beefWith(a, z.p.txid, &.{ try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, z.w.fund.txid)), try pairPath(a, 2, z.p.txid, z.x.txid, true, false) }, &.{
+        .{ .txid = z.w.fund.txid, .format = .raw_with_bump, .bump = 0, .raw = z.w.fund.raw, .tx = z.w.fund.tx },
+        .{ .txid = z.p.txid, .format = .raw_with_bump, .bump = 1, .raw = z.p.raw, .tx = z.p.tx },
+    }));
+    const v = try z.w.st.heldAsTxidOnly(b, z.p.txid);
+    try std.testing.expectEqual(beef.Format.txid_only, v.beef.entries[0].format);
+    try std.testing.expectEqual(@as(usize, 1), v.beef.bumps.len);
+    try std.testing.expectEqual(@as(?usize, 0), v.beef.entries[1].bump);
+    try std.testing.expect(v.proof[0] == null and v.proof[1] == null);
+    // The funding as the subject: kept raw.
+    const v2 = try z.w.st.heldAsTxidOnly(b, z.w.fund.txid);
+    try std.testing.expectEqual(beef.Format.raw_with_bump, v2.beef.entries[0].format);
+    try std.testing.expectEqual(@as(usize, 2), v2.beef.bumps.len);
+}

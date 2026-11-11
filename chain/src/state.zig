@@ -972,10 +972,12 @@ pub const State = struct {
             if (!(try self.holds(subject))) return error.UnknownTxidOnly;
         }
         // Parents first (a writer's order sorted, not refused): recorded and registered in it.
-        const b = beef_mod.sorted(a, parsed) catch |e| switch (e) {
+        const ordered = beef_mod.sorted(a, parsed) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidBeef => return error.NotParentsFirst,
         };
+        const held = try self.heldAsTxidOnly(ordered, subject);
+        const b = held.beef;
         var ctx = SpvCtx{ .st = self };
         const checked = try spv.verify(a, b, .{ .ptr = &ctx, .rootAtFn = SpvCtx.rootAt, .knownRawFn = SpvCtx.knownRaw });
         var registered: std.ArrayList([32]u8) = .empty;
@@ -983,9 +985,8 @@ pub const State = struct {
         // holds: not once per entry.
         const saved = try a.alloc(bool, b.bumps.len);
         @memset(saved, false);
-        for (b.entries, checked.proven) |e, proven| {
-            const raw = e.raw orelse continue;
-            _ = try self.putTx(e.txid, raw);
+        for (b.entries, checked.proven, held.proof) |e, proven, new_proof| {
+            if (e.raw) |raw| _ = try self.putTx(e.txid, raw);
             if (proven) {
                 for (b.bumps, 0..) |p, i| if (beef_mod.bumpHas(p, e.txid)) {
                     if (!saved[i]) {
@@ -994,7 +995,12 @@ pub const State = struct {
                     }
                     break;
                 };
-            }
+            } else if (new_proof) |i| if (!saved[i]) {
+                // A held entry (txid-only now) the BEEF proves while we hold no proof of it: its BUMP,
+                // checked against our header above, saved as any other.
+                _ = try self.addPath(e.txid, b.bumps[i]);
+                saved[i] = true;
+            };
         }
         for (b.entries) |e| {
             if (e.raw == null) continue;
@@ -1013,6 +1019,69 @@ pub const State = struct {
             .status = try self.status(subject),
             .registered = registered.items,
         };
+    }
+
+    /// A BEEF read with every transaction we hold as its txid-only entry, and the BUMPs to save for them.
+    pub const HeldView = struct {
+        beef: beef_mod.Beef,
+        /// Per entry: for one made txid-only that the BEEF proves while we hold no proof of it (not
+        /// proven on our best chain: a rejected one too — a proof overrides a rejection), the index
+        /// of the BUMP proving it, in `beef.bumps`.
+        proof: []?usize,
+    };
+
+    /// 0.22.1 (David 2026-11-11: "if it's not just a TXID, we calculate what the TXID is and we look it
+    /// up the same way"): every raw entry but the subject whose transaction we hold (`txs`, the lookup
+    /// a txid-only entry gets) becomes its txid-only entry — its scripts not run, nothing recorded or
+    /// registered again for it. A BUMP stays when it proves an entry that stays raw, or a held entry
+    /// we hold no proof of (new information: saved by `addPath` as any BUMP); a BUMP that proves only
+    /// held entries already proven is dropped (not checked, nothing put again), the other entries'
+    /// BUMP indices remapped. A BUMP proving no entry stays as it was.
+    pub fn heldAsTxidOnly(self: *State, b: beef_mod.Beef, subject: [32]u8) !HeldView {
+        const a = self.arena;
+        const proof = try a.alloc(?usize, b.entries.len);
+        @memset(proof, null);
+        const Need = enum { none, held_only, keep };
+        const need = try a.alloc(Need, b.bumps.len);
+        @memset(need, .none);
+        var entries: ?[]beef_mod.Entry = null;
+        for (b.entries, 0..) |e, i| {
+            if (e.raw == null) continue;
+            const conv = !std.mem.eql(u8, &e.txid, &subject) and try self.holds(e.txid);
+            const fresh = conv and (try self.minedStatus(e.txid)) != .proven;
+            for (b.bumps, 0..) |p, k| {
+                const proves = (e.format == .raw_with_bump and e.bump == k) or (beef_mod.bumpHas(p, e.txid) and leafFlagged(p, e.txid));
+                if (!proves) continue;
+                if (!conv or fresh) need[k] = .keep else if (need[k] == .none) need[k] = .held_only;
+                if (fresh and proof[i] == null) proof[i] = k;
+            }
+            if (conv) {
+                const es = entries orelse try a.dupe(beef_mod.Entry, b.entries);
+                entries = es;
+                es[i] = .{ .txid = e.txid, .format = .txid_only };
+            }
+        }
+        const es = entries orelse return .{ .beef = b, .proof = proof };
+        const remap = try a.alloc(?usize, b.bumps.len);
+        var kept: std.ArrayList(merkle.MerklePath) = .empty;
+        for (b.bumps, need, remap) |p, n, *r| {
+            if (n == .held_only) {
+                r.* = null;
+                continue;
+            }
+            r.* = kept.items.len;
+            try kept.append(a, p);
+        }
+        for (es) |*e| if (e.bump) |k| {
+            e.bump = remap[k] orelse return error.InvalidBeef; // a raw entry's BUMP is kept
+        };
+        for (proof) |*p| if (p.*) |k| {
+            p.* = remap[k] orelse return error.InvalidBeef;
+        };
+        var out = b;
+        out.entries = es;
+        out.bumps = kept.items;
+        return .{ .beef = out, .proof = proof };
     }
 
     // ------------------------------------------------------------ BEEF out
@@ -1060,6 +1129,12 @@ pub fn flagLeaves(entries: []const beef_mod.Entry, paths: []merkle.MerklePath) v
             l.txid = true;
         };
     }
+}
+
+/// Whether the BUMP flags this txid as a transaction (BRC-74; spv's own test of a raw entry proven).
+fn leafFlagged(p: merkle.MerklePath, txid: [32]u8) bool {
+    for (p.path[0]) |leaf| if (leaf.hash) |h| if (std.mem.eql(u8, &h.bytes, &txid)) return leaf.txid orelse false;
+    return false;
 }
 
 fn optEq(x: ?[]const u8, y: ?[]const u8) bool {
