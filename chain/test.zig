@@ -1597,3 +1597,63 @@ test "0.21.0 a chain state written before linkages carried their height is refus
     try std.testing.expectEqual(@as(?u64, lib.state.SHAPE), (try ms.store().getValue(a, saved)).getUint("shape"));
     _ = try State.load(a, ms.store(), saved, .regtest);
 }
+
+/// `t` with its input 0's unlocking script replaced by OP_1: a P2PKH spend whose script fails.
+fn broken(a: std.mem.Allocator, t: Tx) !Tx {
+    var tx = t.tx;
+    const ins = try a.dupe(bsvz.transaction.Input, tx.inputs);
+    ins[0].unlocking_script = bsvz.script.Script.init(try a.dupe(u8, &.{0x51}));
+    tx.inputs = ins;
+    const raw = try tx.serialize(a);
+    return .{ .tx = try bsvz.transaction.Transaction.parse(a, raw), .raw = raw, .txid = beef.txidOf(raw) };
+}
+
+/// A context holding exactly `held` (txid → raw); no headers.
+const Held = struct {
+    held: []const Tx,
+    fn rootAt(_: *anyopaque, _: u32) anyerror!?[32]u8 {
+        return null;
+    }
+    fn knownRaw(ptr: *anyopaque, _: std.mem.Allocator, txid: [32]u8) anyerror!?[]const u8 {
+        const self: *Held = @ptrCast(@alignCast(ptr));
+        for (self.held) |t| if (std.mem.eql(u8, &t.txid, &txid)) return t.raw;
+        return null;
+    }
+    fn ctx(self: *Held) lib.spv.Context {
+        return .{ .ptr = self, .rootAtFn = rootAt, .knownRawFn = knownRaw };
+    }
+};
+
+test "0.21.3 spv: a raw entry with no proof for a held transaction is not script-checked again; not held, ScriptFailed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const fund = try funding(a, 1);
+    const bad = try broken(a, try spend(a, &fund.tx, 0, 9_000));
+    const b = try beef.parse(a, try beefOf(a, &.{}, &.{bad}));
+    // Held: treated as its txid-only entry; its (failing) script is not run.
+    var held = Held{ .held = &.{ fund, bad } };
+    const r = try lib.spv.verify(a, b, held.ctx());
+    try std.testing.expect(!r.proven[0]);
+    // The same transaction not held: its script runs and fails.
+    var not_held = Held{ .held = &.{fund} };
+    try std.testing.expectError(error.ScriptFailed, lib.spv.verify(a, b, not_held.ctx()));
+}
+
+test "0.21.3 ingest: held means in the chain state's `txs` — bytes in the store for the hash are not held, still fully checked" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    const bad = try broken(a, try spend(a, &w.fund.tx, 0, 9_000));
+    const wire = try beefOf(a, &.{.{ w.fund, 1 }}, &.{bad});
+    // Its bytes stored (the block a txs row would link), but no `txs` row: not held — ScriptFailed.
+    _ = try ms.store().putBitcoin(a, .tx, bad.raw);
+    try std.testing.expect(!(try w.st.holds(bad.txid)));
+    try std.testing.expectError(error.ScriptFailed, w.st.ingest(wire));
+    // In `txs`: held, so the raw copy is not script-checked again.
+    _ = try w.st.putTx(bad.txid, bad.raw);
+    _ = try w.st.ingest(wire);
+}

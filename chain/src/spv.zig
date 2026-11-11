@@ -1,15 +1,18 @@
 //! SPV over a BEEF against our own chain tracker: every BUMP's root must be
 //! the merkle root of our best-chain header at its height; every transaction
-//! must be in a BUMP (proven) or have all its inputs' sources proven or valid
-//! before it, with every input's script verified (bsvz's interpreter). A
-//! txid-only entry is accepted only for a transaction we already hold.
+//! must be in a BUMP (proven), or be a transaction we already hold, or have all
+//! its inputs' sources proven or valid before it, with every input's script
+//! verified (bsvz's interpreter). A txid-only entry is accepted only for a
+//! transaction we already hold; a raw copy of one we hold is treated the same
+//! (its scripts are not run again: it was checked when it entered).
 const std = @import("std");
 const bsvz = @import("bsvz");
 const beef_mod = @import("beef.zig");
 
 pub const Error = error{ UnknownHeader, RootMismatch, NotInBump, MissingInput, UnknownTxidOnly, ScriptFailed, NotParentsFirst, OutOfMemory };
 
-/// What SPV asks of the wallet: a header's merkle root, and a transaction we hold.
+/// What SPV asks of the wallet: a header's merkle root, and a transaction we hold (one that entered
+/// through this verifier — never merely bytes the store has for the hash).
 pub const Context = struct {
     ptr: *anyopaque,
     rootAtFn: *const fn (ptr: *anyopaque, height: u32) anyerror!?[32]u8,
@@ -71,9 +74,11 @@ pub fn verify(arena: std.mem.Allocator, given: beef_mod.Beef, ctx: Context) !Res
                     proven[i] = true;
                 };
                 if (proven[i]) continue;
+                // A transaction we hold: as its txid-only entry, its scripts not run again.
+                if ((try ctx.knownRawFn(ctx.ptr, arena, e.txid)) != null) continue;
             },
         }
-        // Unproven: every input's source is earlier in the BEEF or ours, and its script verifies.
+        // Unproven and not held: every input's source is earlier in the BEEF or ours, and its script verifies.
         const tx = e.tx.?;
         for (tx.inputs, 0..) |in, k| {
             const src_txid = in.previous_outpoint.txid.bytes;
