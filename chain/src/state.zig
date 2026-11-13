@@ -21,9 +21,8 @@
 //!   heights       block hash → height                                 the best chain, backwards
 //!   txs           txid → transaction (bitcoin-tx)                     every transaction ingested (kept: its
 //!                                                                     inputs are the kernel's `spends` edges)
-//!   proofs        txid → {block, depth, position, broadcast?}         its block's header (a bitcoin-block link)
-//!                                                                     and its leaf (merkle.zig `Position`);
-//!                                                                     the broadcast record it settled (a link)
+//!   proofs        txid → {block, height, depth, position, overrode?}  its block's header (a bitcoin-block link)
+//!                                                                     and its leaf (merkle.zig `Position`)
 //!   proofHeights  height (u32 BE) ‖ txid → null                       proofs by height: what a reorg reverts
 //!   rejected      txid → settlement record                            will never be mined (reason, at, cause?)
 //!   unproven      txid → null                                         derived: held, neither proven nor rejected
@@ -35,18 +34,14 @@
 //! transaction is in `unproven` only while `broadcasts` holds a record for
 //! it. The record:
 //!
-//!   {kind: "broadcast", txid (hex), subject: <tx CID>, since: ms, watchers: [...]}
+//!   {kind: "broadcast", txid (hex), subject: <tx CID>, since: ms}
 //!   (0.21.0: a proof before its header is kept in `parked`)
 //!
-//! `watchers` ({to: bytes(33), box, request: <message CID>}) are the callers to answer on each state change of the
-//! transaction (proven, rejected). 0.22.0 (David 2026-11-11): a status into the state means only
-//! REJECTED (the transaction is invalid) or a proof; the broadcaster's intermediate statuses stay in
-//! the host. No `accepted` flag and no `txStatus` on the record: a record written before 0.22.0 keeps
-//! them, ignored, and drops them when rewritten. Proven or rejected, the record goes: the
-//! transaction no longer awaits anything. Proven, its `proofs` entry links
-//! the record it settled, for the watchers: a reorg that turns it back to unproven registers its
-//! broadcast again (`blockChanged`) with the same watchers, and the next proof
-//! — the same transaction in another block — tells them again.
+//! 0.22.0 (David 2026-11-11): a status into the state means only REJECTED (the transaction is
+//! invalid) or a proof; the broadcaster's intermediate statuses stay in the host. Proven or
+//! rejected, the record goes: the transaction no longer awaits anything; a reorg that turns it back
+//! to unproven registers its broadcast again (`blockChanged`). skein next (SPEC 6): no watchers —
+//! nobody is answered from the chain state; every state change is a fact the chain app emits.
 //!
 //! Status is computed from the records, never stored: proven (its linkage's block
 //! is on our best chain), rejected (a settlement record in `rejected`), else
@@ -66,7 +61,7 @@
 //! The chain app wires each of these by subscription.
 //!
 //! Every state change of a transaction with a registered broadcast is listed
-//! in `changes`, with the watchers to answer — the program answers them.
+//! in `changes`.
 //! 0.19.0 (David 2026-11-09): every transaction newly held in a step is listed
 //! in `added` (in the order recorded), so the chain app gives each one its
 //! status at intake; a rejection names its cause (`by`): the winner of a
@@ -96,15 +91,13 @@ pub const Status = enum { proven, unproven, rejected };
 /// The state record's `shape` this code writes and reads (0.21.0).
 pub const SHAPE: u64 = 2;
 
-/// A state change of a transaction with a registered broadcast: what its watchers are told.
+/// A state change of a transaction with a registered broadcast.
 pub const Change = struct {
     txid: [32]u8,
     /// 0.21.0: `revived` — an `input-rejected` that no longer holds (its parent is not rejected any
     /// more): back to unproven, its broadcast registered again. 0.22.0: no `accepted` (a status other
     /// than a rejection or a proof changes nothing).
     state: enum { proven, rejected, revived },
-    /// The watchers registered when it changed (`{to, box, request}`).
-    watchers: []const Value,
     /// The rejection's reason.
     detail: []const u8 = "",
     /// A rejection's cause (0.19.0): the proven transaction that spends the same output
@@ -372,14 +365,12 @@ pub const State = struct {
                 .{ .key = "position", .value = .{ .int = @intCast(lf.offset) } },
             });
             // Re-linked (its old block off our best chain): ONE height row per linkage — the old one
-            // goes; what the old linkage carried for the transaction stays (the watchers its proof
-            // settled, `broadcast`; the rejection it overrode, `overrode`).
+            // goes; the rejection the old linkage overrode stays (`overrode`).
             var overrode: ?[]const u8 = null;
             if (try self.map("proofs").get(&h)) |old| {
                 const oh = old.get("height") orelse return error.BadIndex;
                 if (oh != .int) return error.BadIndex;
                 _ = try self.map("proofHeights").remove(&(store_mod.be32(@intCast(oh.int)) ++ h));
-                if (old.get("broadcast")) |b| try es.append(self.arena, .{ .key = "broadcast", .value = b });
                 if (old.get("overrode")) |o| if (o == .cid) {
                     overrode = o.cid;
                 };
@@ -583,7 +574,7 @@ pub const State = struct {
                     try out.append(self.arena, .{ .txid = txid, .proven = true });
                 },
                 .unproven => {
-                    if ((try self.broadcastRecord(txid)) == null) try self.writeBroadcast(txid, null, .{ .watchers = try self.settledWatchers(txid) });
+                    if ((try self.broadcastRecord(txid)) == null) try self.register(txid);
                     try out.append(self.arena, .{ .txid = txid, .proven = false });
                 },
                 .rejected => {},
@@ -705,7 +696,7 @@ pub const State = struct {
         try self.resettle(root);
         const had = (try self.broadcastRecord(root)) != null;
         try self.settledBy(root, .rejected, reason, root_by);
-        if (!had) try self.changes.append(a, .{ .txid = root, .state = .rejected, .watchers = &.{}, .detail = reason, .by = root_by });
+        if (!had) try self.changes.append(a, .{ .txid = root, .state = .rejected, .detail = reason, .by = root_by });
         if (try self.txRaw(root)) |raw| {
             const tx = try bsvz.transaction.Transaction.parse(a, raw);
             for (tx.inputs) |in| try self.refreshSpent(store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index));
@@ -791,7 +782,7 @@ pub const State = struct {
             try self.register(txid);
             try self.revived.append(self.arena, txid);
         }
-        try self.changes.append(self.arena, .{ .txid = txid, .state = .revived, .watchers = &.{}, .detail = "" });
+        try self.changes.append(self.arena, .{ .txid = txid, .state = .revived, .detail = "" });
         return .revived;
     }
 
@@ -844,73 +835,27 @@ pub const State = struct {
         return out;
     }
 
-    /// Register the broadcast of an unproven transaction we hold (since now, no watchers).
+    /// Register the broadcast of an unproven transaction we hold (since now).
     pub fn register(self: *State, txid: [32]u8) !void {
-        try self.writeBroadcast(txid, null, .{});
-    }
-
-    const Fields = struct { path: ?[]const u8 = null, add_watcher: ?Value = null, watchers: ?[]const Value = null };
-
-    /// The broadcast record of `txid` with some fields changed (`prior`: the record as it stands;
-    /// `watchers`: the list to start from instead of the prior record's).
-    fn writeBroadcast(self: *State, txid: [32]u8, prior: ?Value, f: Fields) !void {
         const a = self.arena;
         const raw = (try self.txRaw(txid)) orelse return error.UnknownTransaction;
-        var watchers: std.ArrayList(Value) = .empty;
-        if (f.watchers) |ws| {
-            try watchers.appendSlice(a, ws);
-        } else if (prior) |p| if (p.getArray("watchers")) |ws| try watchers.appendSlice(a, ws);
-        if (f.add_watcher) |w| try watchers.append(a, w);
-        var fields: std.ArrayList(cbor.Entry) = .empty;
-        try fields.appendSlice(a, &.{
+        try self.map("broadcasts").putLink(&txid, try self.store.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "kind", .value = .{ .text = "broadcast" } },
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
             .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &store_mod.bitcoinCid(.tx, raw)) } },
-            .{ .key = "since", .value = .{ .uint = if (prior) |p| p.getUint("since") orelse @intCast(@max(self.now, 0)) else @intCast(@max(self.now, 0)) } },
-            .{ .key = "watchers", .value = .{ .array = watchers.items } },
-        });
-        if (f.path orelse if (prior) |p| p.getBytes("path") else null) |path| try fields.append(a, .{ .key = "path", .value = .{ .bytes = path } });
-        try self.map("broadcasts").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
+            .{ .key = "since", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
+        }) }));
     }
 
-    /// A caller to answer on each state change of `txid` (its broadcast must be registered).
-    pub fn watch(self: *State, txid: [32]u8, to: []const u8, box: []const u8, request: []const u8) !void {
-        const prior = (try self.broadcastRecord(txid)) orelse return error.NotRegistered;
-        const w: Value = .{ .map = try self.arena.dupe(cbor.Entry, &.{
-            .{ .key = "to", .value = .{ .bytes = to } },
-            .{ .key = "box", .value = .{ .text = box } },
-            .{ .key = "request", .value = .{ .cid = request } },
-        }) };
-        try self.writeBroadcast(txid, prior, .{ .add_watcher = w });
-    }
-
-    /// Proven or rejected: the watchers are told (`changes`) and the broadcast record goes. Proven, the
-    /// watchers move onto the `proofs` entry: a reorg registers the broadcast again with them.
+    /// Proven or rejected: the change listed (`changes`) and the broadcast record goes.
     fn settled(self: *State, txid: [32]u8, to: @FieldType(Change, "state"), detail: []const u8) !void {
         return self.settledBy(txid, to, detail, null);
     }
 
     fn settledBy(self: *State, txid: [32]u8, to: @FieldType(Change, "state"), detail: []const u8, by: ?[32]u8) !void {
-        const r = (try self.broadcastRecord(txid)) orelse return;
-        try self.changes.append(self.arena, .{ .txid = txid, .state = to, .watchers = r.getArray("watchers") orelse &.{}, .detail = detail, .by = by });
-        if (to == .proven) {
-            const c = (try self.broadcastCid(txid)).?;
-            const v = (try self.map("proofs").get(&txid)) orelse return error.BadIndex;
-            if (v != .map) return error.BadIndex;
-            var es: std.ArrayList(ProofEntry) = .empty;
-            for (v.map) |e| if (!std.mem.eql(u8, e.key, "broadcast")) try es.append(self.arena, e);
-            try es.append(self.arena, .{ .key = "broadcast", .value = .{ .cid = c } });
-            try self.map("proofs").put(&txid, .{ .map = es.items });
-        }
+        if ((try self.broadcastCid(txid)) == null) return;
+        try self.changes.append(self.arena, .{ .txid = txid, .state = to, .detail = detail, .by = by });
         _ = try self.map("broadcasts").remove(&txid);
-    }
-
-    /// The watchers of the broadcast record a proven transaction's proof settled (none: none).
-    pub fn settledWatchers(self: *State, txid: [32]u8) !?[]const Value {
-        const v = (try self.map("proofs").get(&txid)) orelse return null;
-        const b = v.get("broadcast") orelse return null;
-        if (b != .cid) return error.BadIndex;
-        return (try self.record(b.cid)).getArray("watchers");
     }
 
     pub const Outcome = enum { pending, proven, rejected };

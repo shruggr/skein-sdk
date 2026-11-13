@@ -32,8 +32,7 @@
 //              paths, BEEF, SPV, the record store and its index maps, and
 //              `state`, the chain app's records (shruggr/skein#78; over bsvz)
 //   wallet     the wallet library over `chain` (re-exported under the same    wallet/src/lib.zig
-//              names): BRC-29, the builder, the wallet's records and index
-//              maps, the overlay's state (over bsvz)
+//              names): BRC-29 and the BRC-100 wire frames (over bsvz)
 //
 // `wallet` imports the same `chain` module this package exports, so a
 // program may import either or both.

@@ -22,7 +22,7 @@ programs build against it too, so each file has one copy, here. Version
 | `message` | `lib/message.zig` | the mail record: `shapeProblem` (its shape and body; who sent it is the transport's to prove — a BRC-104 session, libp2p) and `problem` (plus the signature of the records that sign themselves: a claim, a host provider's answer; BRC-169's signing, checked with the sender's key alone) |
 | `brc104` | `lib/brc104.zig` | BRC-103/104 framing for a server program (the front door); a client is the kernel's `authfetch` |
 | `chain` | `chain/src/lib.zig` | the chain library (over bsvz): headers and the chain tracker, BEEF (V1, V2, Atomic, Outpoint, Subject — BRC-233), the BEEF envelope and pointer record and `record.wireOf` (shruggr/skein#121, #146: the exact bytes back from the envelope and the record the kernel's door writes), SPV, merkle paths as IPLD nodes, the record store and its maps, and `state`: the chain app's records (`chain-state`), which shruggr/skein-chain writes and every reader of `chain/state` reads; `image`: the header chain an image tree carries (`chain/headers/<first>`, `chain/tip`; shruggr/skein#132) and `load`, which fills an empty state's best chain from it; `host`: the host chain (shruggr/skein#156) — the record `{kind: "host-chain", network, maps: {headers, heights}, tip: {height, hash}}` the kernel's tracker keeps once per host (`Host.open`/`add`/`import`/`save`, `read`), which an instance's chain state points at (`State.pointAt`); `open`: the one opener for readers of `chain/state` (shruggr/skein-sdk#1) |
-| `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (re-exported under the same names): BRC-29, the transaction builder, the BRC-100 wire frames |
+| `wallet` | `wallet/src/lib.zig` | the wallet library over `chain` (re-exported under the same names): BRC-29 and the BRC-100 wire frames |
 | `skein_wit` | `wit/zig/skein_wit.zig` | the same calls as `sk` over the WIT interface `skein:kernel/skein`, for a WASI 0.2 component build |
 | `cabi` | `wit/zig/cabi.zig` | `malloc`/`realloc`/`free`/`abort`/`strlen` for wit-bindgen's C bindings, without wasi-libc |
 
@@ -30,12 +30,9 @@ programs build against it too, so each file has one copy, here. Version
 it depends on (`wit/README.md`). The ABI itself (what the kernel answers) is
 specified in skein's `docs/VM.md`.
 
-**The wallet module's combined `Wallet` record and `wallet/src/overlay.zig`**
-(chain, wallet and overlay maps in one state record) are not used by skein's
-programs since shruggr/skein#79: the chain state is the chain app's, the
-wallet's records are `programs/wallet`'s in skein, and an overlay's are
-shruggr/skein-overlay's. skein's wallet program still uses this module's
-builder, BRC-29 and wire code.
+**skein next:** the wallet module's combined `Wallet` record, `wallet/src/overlay.zig` and the
+transaction builder are deleted (no caller at any tag): the chain state is the chain app's, an
+overlay's records are shruggr/skein-overlay's. The wallet module keeps BRC-29 and the wire frames.
 
 ## Use it
 

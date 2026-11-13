@@ -1,6 +1,6 @@
-//! wallet-zig: the wallet's state inside the skein VM (issue #29). Keys and
-//! signing stay outside (the oracle); here are the records, the index maps
-//! over them, SPV, and BRC-29 payee internalization. The chain parts —
+//! wallet-zig (skein next): what programs signing through the signer take from the wallet
+//! library — the BRC-100 wire frames (`wire`) and BRC-29 (`brc29`). The combined wallet record,
+//! the overlay-in-wallet and the transaction builder are gone (no caller). The chain parts —
 //! headers and our chain tracker, merkle paths, BEEF, SPV, the record store —
 //! are the `chain` module (shruggr/skein#78), re-exported here under the
 //! names they always had.
@@ -16,10 +16,7 @@ pub const merkle = c.merkle;
 pub const chainstate = c.state;
 pub const brc29 = @import("brc29.zig");
 pub const wire = @import("wire.zig");
-pub const builder = @import("builder.zig");
-pub const wallet = @import("wallet.zig");
-pub const overlay = @import("overlay.zig");
-/// bsvz itself, for programs built on this library (programs/overlay).
+/// bsvz itself, for programs built on this library.
 pub const bsvz = @import("bsvz");
 
 test {

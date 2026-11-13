@@ -1,6 +1,5 @@
 //! The chain state (shruggr/skein#78, chain/src/state.zig) over an in-memory
-//! store: ingest proven and unproven BEEF, registered broadcasts and their
-//! watchers, statuses, proofs (and a proof that waits for its header), a
+//! store: ingest proven and unproven BEEF, registered broadcasts, statuses, proofs (and a proof that waits for its header), a
 //! rejection walking the spends, a double spend, abandonment, a reorg.
 const std = @import("std");
 const bsvz = @import("bsvz");
@@ -104,9 +103,6 @@ fn world(a: std.mem.Allocator, s: lib.store.Store, n: u8) !World {
     return .{ .st = st, .fund = fund, .h1 = h1 };
 }
 
-const caller: [33]u8 = .{0x02} ++ .{0x44} ** 32;
-const request: [36]u8 = .{ 0x01, 0x71, 0x12, 0x20 } ++ .{0x55} ** 32;
-
 test "ingest: proven in is recorded proven, nothing registered" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -128,7 +124,7 @@ test "ingest: proven in is recorded proven, nothing registered" {
     try std.testing.expectError(error.NetworkMismatch, State.load(a, ms.store(), saved, .main));
 }
 
-test "ingest: unproven in is registered; an intermediate status changes nothing (0.22.0), proven by its proof; watchers told" {
+test "ingest: unproven in is registered; an intermediate status changes nothing (0.22.0), proven by its proof" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -143,10 +139,9 @@ test "ingest: unproven in is registered; an intermediate status changes nothing 
     try std.testing.expectEqualSlices(u8, &child.txid, &got.registered[0]);
     try std.testing.expect(try w.st.map("unproven").has(&child.txid));
     try std.testing.expectEqualSlices(u8, &child.txid, &(try w.st.spentBy(w.fund.txid, 0)).?);
-    try w.st.watch(child.txid, &caller, "chain", &request);
     const r = (try w.st.broadcastRecord(child.txid)).?;
     try std.testing.expectEqual(@as(u64, 1000), r.getUint("since").?);
-    try std.testing.expectEqual(@as(usize, 1), r.getArray("watchers").?.len);
+    try std.testing.expect(r.get("watchers") == null); // skein next: no watchers
     // The Atomic BEEF to broadcast: the child over its proven parent.
     const out = try beef.parse(a, (try w.st.beefOf(child.txid)).?);
     try std.testing.expectEqual(@as(usize, 2), out.entries.len);
@@ -161,7 +156,7 @@ test "ingest: unproven in is registered; an intermediate status changes nothing 
     try std.testing.expectEqual(@as(usize, 0), w.st.changes.items.len);
     try std.testing.expectEqualStrings(before, (try w.st.broadcastCid(child.txid)).?);
     try std.testing.expect(r.get("accepted") == null and r.get("txStatus") == null);
-    // Its proof, before its header: kept, pending; the header: proven, the watcher told, the broadcast gone.
+    // Its proof, before its header: kept, pending; the header: proven, the broadcast gone.
     const path = try soloPath(a, 2, child.txid);
     try std.testing.expectEqual(State.Outcome.pending, try w.st.applyStatus(child.txid, "MINED", path));
     try std.testing.expect(try w.st.map("parked").has(&child.txid)); // 0.21.0: parked, whatever its status
@@ -173,7 +168,6 @@ test "ingest: unproven in is registered; an intermediate status changes nothing 
     try w.st.settleProven(child.txid);
     try std.testing.expectEqual(@as(usize, 1), w.st.changes.items.len);
     try std.testing.expectEqual(.proven, w.st.changes.items[0].state);
-    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items[0].watchers.len);
     try std.testing.expect((try w.st.broadcastRecord(child.txid)) == null);
     try std.testing.expect(!(try w.st.map("unproven").has(&child.txid)));
     _ = try w.st.save();
@@ -437,7 +431,6 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     const tb = try spend(a, &ta.tx, 0, 8_000);
     const got = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ ta, tb }));
     try std.testing.expectEqual(@as(usize, 2), got.registered.len);
-    try w.st.watch(tb.txid, &caller, "chain", &request);
     const base = try w.st.save();
 
     // A rejected: only A at the source (0.21.0); B by its parents' subscription (`reexamine`):
@@ -449,7 +442,6 @@ test "a rejection walks the spends; a proven competing spend is a double spend; 
     try std.testing.expectEqual(lib.state.Reexamined.rejected, try w.st.reexamine(tb.txid));
     try std.testing.expectEqual(lib.state.Status.rejected, try w.st.status(tb.txid));
     try std.testing.expectEqual(@as(usize, 2), w.st.changes.items.len);
-    try std.testing.expectEqual(@as(usize, 1), w.st.changes.items[1].watchers.len);
     try std.testing.expectEqualStrings("input-rejected", w.st.changes.items[1].detail);
     try std.testing.expect((try w.st.spentBy(w.fund.txid, 0)) == null);
     try std.testing.expect((try w.st.broadcastRecord(ta.txid)) == null and (try w.st.broadcastRecord(tb.txid)) == null);
@@ -564,7 +556,7 @@ test "a proof is the latest fact: a rejected transaction proven later is proven,
     _ = try st2.save();
 }
 
-test "a reorg turns a proven transaction back to unproven, its broadcast registered again; proven in another block, the same watchers told" {
+test "a reorg turns a proven transaction back to unproven, its broadcast registered again; proven in another block again" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -573,19 +565,16 @@ test "a reorg turns a proven transaction back to unproven, its broadcast registe
     var w = try world(a, ms.store(), 1);
     const child = try spend(a, &w.fund.tx, 0, 9_000);
     _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{child}));
-    try w.st.watch(child.txid, &caller, "chain", &request);
     _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), child.txid, 1_700_001_200)});
     try std.testing.expectEqual(State.Outcome.proven, try w.st.applyStatus(child.txid, "MINED", try soloPath(a, 2, child.txid)));
     try w.st.settleProven(child.txid); // its `chain/proof` subscription step
     try std.testing.expectEqual(@as(usize, 1), w.st.changes.items.len);
     const first = w.st.changes.items[0];
     try std.testing.expectEqual(.proven, first.state);
-    try std.testing.expectEqual(@as(usize, 1), first.watchers.len);
-    try std.testing.expectEqualSlices(u8, &caller, first.watchers[0].getBytes("to").?);
     try std.testing.expect((try w.st.broadcastRecord(child.txid)) == null);
     const proven = try w.st.save();
 
-    // A heavier branch without it: unproven again, its broadcast registered again with the watcher.
+    // A heavier branch without it: unproven again, its broadcast registered again.
     var st2 = try State.load(a, ms.store(), proven, .regtest);
     const alt1 = mine(hdr.hash(&w.h1), .{3} ** 32, 1_700_001_201);
     const alt2 = mine(hdr.hash(&alt1), .{4} ** 32, 1_700_001_202);
@@ -597,12 +586,11 @@ test "a reorg turns a proven transaction back to unproven, its broadcast registe
     const moved = try st2.blockChanged(st2.blocks.items[0].hash, st2.blocks.items[0].height);
     try std.testing.expectEqual(@as(usize, 1), moved.len);
     try std.testing.expect(!moved[0].proven);
-    const again = (try st2.broadcastRecord(child.txid)).?;
-    try std.testing.expectEqual(@as(usize, 1), again.getArray("watchers").?.len);
+    try std.testing.expect((try st2.broadcastRecord(child.txid)) != null);
     try std.testing.expect(try st2.map("unproven").has(&child.txid));
     const reverted = try st2.save();
 
-    // Mined again at 4, in another block: proven, the same watcher told of the new proof.
+    // Mined again at 4, in another block: proven again.
     var st3 = try State.load(a, ms.store(), reverted, .regtest);
     const alt3 = mine(hdr.hash(&alt2), child.txid, 1_700_001_203);
     _ = try st3.addHeaders(&.{&alt3});
@@ -612,10 +600,6 @@ test "a reorg turns a proven transaction back to unproven, its broadcast registe
     try std.testing.expectEqual(@as(usize, 1), st3.changes.items.len);
     const second = st3.changes.items[0];
     try std.testing.expectEqual(.proven, second.state);
-    try std.testing.expectEqual(@as(usize, 1), second.watchers.len);
-    try std.testing.expectEqualSlices(u8, first.watchers[0].getBytes("to").?, second.watchers[0].getBytes("to").?);
-    try std.testing.expectEqualStrings(first.watchers[0].getText("box").?, second.watchers[0].getText("box").?);
-    try std.testing.expectEqualSlices(u8, first.watchers[0].getCid("request").?, second.watchers[0].getCid("request").?);
     try std.testing.expectEqual(@as(u32, 4), (try st3.proofFor(child.txid)).?.block_height);
     try std.testing.expect((try st3.broadcastRecord(child.txid)) == null);
     try std.testing.expect(!(try st3.map("unproven").has(&child.txid)));
@@ -900,10 +884,9 @@ test "pointAt: a state names the host chain's roots — the same state as adding
     _ = try copy.addHeaders(&.{&h1});
     try std.testing.expectEqualStrings(try copy.save(), try st.save());
 
-    // The child, unproven, watched; mined at 2 on the host chain; its proof applies.
+    // The child, unproven; mined at 2 on the host chain; its proof applies.
     const child = try spend(a, &fund.tx, 0, 9_000);
     _ = try st.ingest(try beefOf(a, &.{.{ fund, 1 }}, &.{child}));
-    try st.watch(child.txid, &caller, "chain", &request);
     const h2 = mine(hdr.hash(&h1), child.txid, 1_700_001_200);
     const host2 = try hostAdd(a, s, host1, &.{&h2});
     const p2 = try st.pointAt(host2);
@@ -919,7 +902,7 @@ test "pointAt: a state names the host chain's roots — the same state as adding
     try std.testing.expectEqual(@as(u32, 2), p2b.fork);
     try std.testing.expectEqualStrings(proven, try again.save());
 
-    // A heavier branch from 1 replacing 2: unproven again, its broadcast registered again with the watcher.
+    // A heavier branch from 1 replacing 2: unproven again, its broadcast registered again.
     const alt2 = mine(hdr.hash(&h1), .{3} ** 32, 1_700_001_201);
     const alt3 = mine(hdr.hash(&alt2), .{4} ** 32, 1_700_001_202);
     const host3 = try hostAdd(a, s, host2, &.{ &alt2, &alt3 });
@@ -932,7 +915,7 @@ test "pointAt: a state names the host chain's roots — the same state as adding
     try std.testing.expectEqual(@as(usize, 1), st2.blocks.items.len);
     try std.testing.expect(!st2.blocks.items[0].active);
     _ = try st2.blockChanged(st2.blocks.items[0].hash, st2.blocks.items[0].height);
-    try std.testing.expectEqual(@as(usize, 1), (try st2.broadcastRecord(child.txid)).?.getArray("watchers").?.len);
+    try std.testing.expect((try st2.broadcastRecord(child.txid)) != null);
     try std.testing.expect(try st2.map("unproven").has(&child.txid));
     try std.testing.expectEqual(@as(?u32, 3), try st2.chain().tip());
 
@@ -1527,7 +1510,7 @@ test "0.21.0 parked: a path at a future height whose root is not the block's —
     try std.testing.expect(!(try w.st.map("parked").has(&t.txid)));
 }
 
-test "0.21.0 a proof landing between a reorg and its block step: T re-linked in B, its watchers kept, mined once" {
+test "0.21.0 a proof landing between a reorg and its block step: T re-linked in B, mined once" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1536,11 +1519,9 @@ test "0.21.0 a proof landing between a reorg and its block step: T re-linked in 
     var w = try world(a, ms.store(), 1);
     const t = try spend(a, &w.fund.tx, 0, 9_000);
     _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{t}));
-    try w.st.watch(t.txid, &caller, "chain", &request);
     _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), t.txid, 1_700_001_200)});
     _ = try w.st.applyStatus(t.txid, "MINED", try soloPath(a, 2, t.txid));
-    try w.st.settleProven(t.txid); // the watchers move onto the linkage
-    try std.testing.expectEqual(@as(usize, 1), (try w.st.settledWatchers(t.txid)).?.len);
+    try w.st.settleProven(t.txid);
     const s1 = try w.st.save();
     // Reorg: block A (2) leaves; the heavier branch's block 3 holds T; T's proof in it arrives
     // before A's block step.
@@ -1551,7 +1532,6 @@ test "0.21.0 a proof landing between a reorg and its block step: T re-linked in 
     const a_block = st2.blocks.items[0];
     _ = try st2.applyStatus(t.txid, "MINED", try soloPath(a, 3, t.txid));
     try std.testing.expectEqual(lib.state.Status.proven, try st2.status(t.txid));
-    try std.testing.expectEqual(@as(usize, 1), (try st2.settledWatchers(t.txid)).?.len); // kept
     // A's block step: T is no longer linked to A: nothing to re-read.
     try std.testing.expectEqual(@as(usize, 0), (try st2.blockChanged(a_block.hash, a_block.height)).len);
     try st2.settleProven(t.txid); // T's proof step
