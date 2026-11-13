@@ -34,9 +34,15 @@ the adapter and the canonical-ABI glue are instructions too. Every other
 field of an update is the same.
 
 The calls are `input`, `get`, `put`, `putblock`, `keep`, `launch`, `await`,
-`head`, `advance`, `wallet`, `emit`, `deadline`, `call`,
-`edges` (#42: the edges into a record, from the kernel's index; docs/VM.md "Edges")
-and `authfetch` (shruggr/skein#126: the kernel's BRC-104 client, a recorded call).
+`head`, `advance`, `wallet`, `emit`, `call`, `edges` (#42: the edges into a
+record, from the kernel's index; docs/VM.md "Edges"), `events`, `on`, `off`.
+
+**skein next (2026-11-13): `skein.wit` is updated (`await` takes a thread's CID
+or a fact's name as `list<u8>`; `deadline` and `authfetch` are gone), but
+`bindings/c/` and `zig/skein_wit.zig` are NOT regenerated: they still bind the
+old world (wit-bindgen 0.62.0 was not available to the build). The component
+runner is out of the kernel (skein extras/component-runner/), so nothing runs
+this world until it comes back.**
 There is no plain `http` and no `libp2p` (#70, #67: format 6 removed them;
 a `fetch` is an intention the runtime answers, #126); a handle is looked up by
 launching the `resolve` program.

@@ -1,47 +1,35 @@
-//! Calling an app (skein docs/APPS.md §4): one box per app, the function in
-//! the body, the answer a message to the sender. The dispatch helper an
-//! app's handler is written over.
+//! Calling an app (skein docs/APPS.md §4; skein next: a request row, the handler run directly).
+//! The dispatch helper an app's handler is written over.
 //!
 //! An app's manifest (etc/app.json) declares what it provides:
 //!
 //!   provides: [{interface: "demo.counter/1",
 //!               functions: {add: {writes: true, args: {by: "int", "note?": "string"}, answer: {count: "int"}}, …}}]
 //!
-//! At install the manifest becomes the root record of the app's head
-//! `<app>/app` (`{kind: "app", name, …, provides, …, tree, state?}`;
-//! skein-sdk 0.3.0, shruggr/skein#77: an app writes only heads under its
-//! own name, `<app>/…`); `serve` reads it from there (`headOf`). A function's full name is `<interface name>.<function>`, the
-//! interface's `/<major>` dropped: `demo.counter.add`. The program lists
-//! what it implements:
+//! At install the manifest becomes the root record of the app's head `<app>/app` (`{kind: "app",
+//! name, …, provides, …, tree, state?}`; an app writes only heads under its own name, `<app>/…`). A
+//! function's full name is `<interface name>.<function>`, the interface's `/<major>` dropped:
+//! `demo.counter.add`. The program lists what it implements:
 //!
 //!   const fns = [_]app.Function{ .{ .name = "demo.counter.add", .run = add }, … };
 //!   fn add(c: *app.Call) !Value { const by = Value.intOf(c.args.get("by")).?; … return result; }
 //!
-//! and hands every input to `serve(a, in, "<app name>", &fns, other)`. Three
-//! ways reach a function, with one definition:
+//! and hands every input to `serve(a, in, "<app name>", &fns, other)`. Two ways reach a function,
+//! with one definition:
 //!
-//!   a message in the app's box    a step on {message, body, box, sender}, body {fn, args}.
-//!                                 Answered with a message to the sender in the same box:
-//!                                   {fn, request: <message>, replyTo: <message>, result}
-//!                                   {fn, request: <message>, replyTo: <message>, error: {code, message}}
-//!                                 (`replyTo`: a program that emitted the call and awaits it is
-//!                                 stepped with the answer as its `reply`.) The sender must be in
-//!                                 the address book to be answered; else the answer is only the
-//!                                 step's result (stdout, in the log). Either way the step's stdout
-//!                                 is the answer as DAG-JSON.
-//!   an HTTP route                 a route {transport: "http", address: "/call", handler: "<role>.call"}:
-//!                                 the front door calls fn "call" with the request; the body is
-//!                                 {fn, args} (JSON, or dag-cbor as application/cbor); the answer,
-//!                                 on the connection: 200 {fn, result} | an error status {fn, error}.
-//!                                 Who may call is the kernel's (shruggr/skein#143): the route's
-//!                                 filters (`kernel.brc104`: the caller is the client's key) and
-//!                                 the gate (the manifest's `roles` for the route's fn) ran before
-//!                                 the handler; the request's `caller` is the door's principal.
-//!   an in-VM call                 call(<handler program>, "<interface>.<function>", args) → result
-//!                                 (dag-cbor), or the call's error.
+//!   a request row            a row {kind: "request", path: "/call", role, handler: "<app>.<role>.call"}:
+//!                            the kernel runs the handler directly as the request's thread (skein
+//!                            next: no front door) — step input `args` {fn, caller?, method, path,
+//!                            query, headers, body, row, request}; the body is {fn, args} (JSON, or
+//!                            dag-cbor as application/cbor); the answer, the step's stdout: {status,
+//!                            type, body} — 200 {fn, result} | an error status {fn, error}. Who may
+//!                            call is the row's role, gated by the kernel before anything is written;
+//!                            `caller` is the request's proven sender.
+//!   an in-VM call            call(<handler program>, "<interface>.<function>", args) → result
+//!                            (dag-cbor), or the call's error.
 //!
-//! A body without `fn` is not a call: `serve` hands it to `other` (a start
-//! message, a tick), or reports it.
+//! Any other step (an event row's handler, a fact `on` delivers: `args` {event, box, fn, …}) goes
+//! to `other` (null: refused).
 //!
 //! `args` are checked against the declared shape before the function runs:
 //! a map of keys to `string`, `int`, `ms`, `bytes`, `cid`, `bool`, `map`
@@ -49,8 +37,8 @@
 //! optional (absent or null); a key the shape does not name is refused.
 //!
 //! **`writes`.** A function's writes go through its `Call`: `put`,
-//! `putBlock`, `keep`, `advance`, `setState`, `emit`/`send`, `launch`,
-//! `deadline`, `awaitRecord`. For a function the manifest marks
+//! `putBlock`, `keep`, `advance`, `setState`, `emitEvent`, `launch`,
+//! `awaitThread`, `awaitName`. For a function the manifest marks
 //! `writes: false` each of them is refused (error code `read-only`): it
 //! answers from the app's head as it stands. (A function that calls the raw
 //! `sk` imports itself goes around this; the log shows what it did.) A
@@ -119,8 +107,8 @@ pub const Call = struct {
     name: []const u8,
     decl: Value,
     args: Value,
-    /// Who asked: the message's sender, the route's caller (the door's principal); null when the
-    /// route's filters named none, or an in-VM call.
+    /// Who asked: the request's proven sender (its signature's, or a check's); null for a
+    /// content-proven request, or an in-VM call.
     sender: ?[]const u8,
     /// The declaration's `writes`.
     writes: bool,
@@ -171,47 +159,37 @@ pub const Call = struct {
         c.manifest = r.root;
         return r.state;
     }
-    pub fn emit(c: *Call, to: []const u8, box: []const u8, body: Value, subject: ?[]const u8) ![]u8 {
+    pub fn emitEvent(c: *Call, event: Value) ![]u8 {
         try c.guard("emit");
-        return sk.emit(c.a, to, box, body, subject);
-    }
-    pub fn send(c: *Call, to: []const u8, box: []const u8, body: Value) ![]const u8 {
-        try c.guard("emit");
-        return sk.send(c.a, to, box, body);
+        return sk.emitEvent(c.a, event);
     }
     pub fn launch(c: *Call, prog: []const u8, args: []const u8) ![]u8 {
         try c.guard("launch");
         return sk.launch(c.a, prog, args);
     }
-    pub fn deadline(c: *Call, until_ms: i64) !void {
-        try c.guard("deadline");
-        return sk.deadline(until_ms);
-    }
-    pub fn awaitRecord(c: *Call, cid: []const u8) !void {
+    pub fn awaitThread(c: *Call, origin: []const u8) !void {
         try c.guard("await");
-        return sk.awaitRecord(cid);
+        return sk.awaitThread(origin);
+    }
+    pub fn awaitName(c: *Call, name: []const u8) !void {
+        try c.guard("await");
+        return sk.awaitName(name);
     }
 };
 
-/// Hand an input to the app: a message in a box, the `/call` route, or an
-/// in-VM call. A message whose body has no `fn` (a start message, a tick) goes
-/// to `other` (null: refused).
+/// Hand an input to the app: a request at its `/call` row (the request's thread), or an in-VM call.
+/// Any other step goes to `other` with its `args` (null: refused).
 pub fn serve(a: Allocator, in: Value, app: []const u8, fns: []const Function, other: ?*const fn (Allocator, Value, Value) anyerror!void) !void {
     const kind = Value.str(in.get("kind")) orelse "";
     if (eql(u8, kind, "call")) {
         const func = Value.str(in.get("fn")) orelse "";
         const arg = cbor.decode(a, Value.bytesOf(in.get("arg")) orelse "") catch return sk.report("the argument is not dag-cbor");
-        if (eql(u8, func, "call") and arg.get("match") != null) return sk.answer(a, try onRoute(a, in, app, fns, arg));
         return sk.answer(a, try onCall(a, in, app, fns, func, arg));
     }
     const args = in.get("args") orelse return sk.report("no args");
-    const body_cid = Value.cidOf(args.get("body")) orelse return sk.report("not a message (no body)");
-    const body = try sk.get(a, body_cid);
-    if (body != .map or body.get("fn") == null) {
-        const f = other orelse return sk.report("not a call: want {fn, args}");
-        return f(a, in, body);
-    }
-    try onMessage(a, in, app, fns, body);
+    if (args.get("method") != null and Value.cidOf(args.get("request")) != null) return sk.answer(a, try onRequest(a, in, app, fns, args));
+    const f = other orelse return sk.report("not a request at the app's /call row, and no handler for other steps");
+    return f(a, in, args);
 }
 
 /// The app's root head, `<app>/app` (shruggr/skein#77: an app's heads are `<app>/…`).
@@ -290,33 +268,6 @@ fn failureValue(a: Allocator, f: Failure) !Value {
     return e.value();
 }
 
-/// A message in the app's box: run it and answer the sender.
-fn onMessage(a: Allocator, in: Value, app: []const u8, fns: []const Function, body: Value) !void {
-    const args = in.get("args").?;
-    const message = Value.cidOf(args.get("message")) orelse return sk.report("not a message (no message)");
-    const box = Value.str(args.get("box")) orelse app;
-    const sender = Value.bytesOf(args.get("sender"));
-    var ans = cbor.MapBuilder.init(a);
-    var name: []const u8 = "";
-    const outcome: Outcome = blk: {
-        name = Value.str(body.get("fn")) orelse break :blk .{ .err = .{ .code = .@"bad-request", .message = "fn is not text" } };
-        break :blk try run(a, in, app, try manifestOf(a, app), fns, name, body.get("args"), sender);
-    };
-    try ans.put("fn", cbor.string(name));
-    try ans.put("request", cbor.cidv(message));
-    try ans.put("replyTo", cbor.cidv(message));
-    switch (outcome) {
-        .ok => |v| try ans.put("result", v),
-        .err => |f| try ans.put("error", try failureValue(a, f)),
-    }
-    const answer = ans.value();
-    // Answered to the sender when the address book can reach it.
-    if (sender) |s| if (try sk.peerOf(a, s) != null) {
-        _ = try sk.emit(a, s, box, answer, null);
-    };
-    try std.Io.File.stdout().writeStreamingAll(sk.io(), try dagjson.encode(a, answer));
-}
-
 /// An in-VM call: the result, or the call's error.
 fn onCall(a: Allocator, in: Value, app: []const u8, fns: []const Function, name: []const u8, arg: Value) !Value {
     const manifest = try manifestOf(a, app);
@@ -326,14 +277,26 @@ fn onCall(a: Allocator, in: Value, app: []const u8, fns: []const Function, name:
     };
 }
 
-/// The `/call` route: {fn, args} in the HTTP body → the answer on the connection.
-fn onRoute(a: Allocator, in: Value, app: []const u8, fns: []const Function, req: Value) !Value {
+/// The media type a request's headers name (its `content-type`, parameters dropped), or "".
+fn contentType(req: Value) []const u8 {
+    const hs = req.get("headers") orelse return "";
+    if (hs != .map) return "";
+    for (hs.map) |e| if (std.ascii.eqlIgnoreCase(e.key, "content-type")) {
+        const ct = Value.str(e.value) orelse return "";
+        return std.mem.trim(u8, ct[0 .. std.mem.indexOfScalar(u8, ct, ';') orelse ct.len], " ");
+    };
+    return "";
+}
+
+/// A request at the app's `/call` row (its thread's step `args`): {fn, args} in the body → the
+/// answer, the step's stdout {status, type, body}.
+fn onRequest(a: Allocator, in: Value, app: []const u8, fns: []const Function, req: Value) !Value {
     const caller = Value.bytesOf(req.get("caller"));
     var name: []const u8 = "";
     const outcome: Outcome = blk: {
         if (!eql(u8, Value.str(req.get("method")) orelse "", "POST")) break :blk .{ .err = .{ .code = .@"bad-request", .message = "POST {fn, args}" } };
         const raw = Value.bytesOf(req.get("body")) orelse "";
-        const ct = Value.str(req.get("contentType")) orelse "";
+        const ct = contentType(req);
         const body = (if (eql(u8, ct, "application/cbor")) cbor.decode(a, raw) else dagjson.decode(a, raw)) catch
             break :blk .{ .err = .{ .code = .@"bad-request", .message = "the body is not {fn, args} (JSON, or dag-cbor as application/cbor)" } };
         if (body != .map) break :blk .{ .err = .{ .code = .@"bad-request", .message = "the body is not {fn, args}" } };

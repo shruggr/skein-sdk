@@ -8,14 +8,13 @@
 //   mst        Merkle search trees over dag-cbor blocks (imports cbor, cid)    src/mst.zig
 //   secp       BRC-42 "anyone" keys and ECDSA verification, pure Zig           src/secp.zig
 //   sk         the preview1 `skein` imports and the helpers over them          lib/sk.zig
-//   brc104     BRC-103/104 framing for programs (imports cbor, sk)             lib/brc104.zig
 //   dagjson    dag-json (imports cbor)                                         lib/dagjson.zig
 //   message    the mail record: its shape; a claim's or a provider's signature lib/message.zig
 //   files      files from a git tree for an http handler: paths, index,      lib/files.zig
 //              301, ETag/304, content types, 404/405 (imports cbor, sk;
 //              shruggr/skein#125, moved out of skein-static)
-//   filter     answering as a filter (skein docs/APPS.md §2, #143):         lib/filter.zig
-//              {reject} | {answer} | {pass} (imports cbor, sk)
+//   check      answering as a check (skein next: a row's checks and recheck): lib/check.zig
+//              {reject} | {pass} (imports cbor, sk)
 //   signer     the signer app's wire (shruggr/skein-signer): BRC-100 request   lib/signer.zig
 //              frames decoded/encoded, the names a request is called under,
 //              the client programs use in place of the raw `wallet` import
@@ -64,11 +63,10 @@ pub fn build(b: *std.Build) void {
     b.modules.put(b.graph.arena, "mst", c.mst) catch @panic("OOM");
     const secp = b.addModule("secp", .{ .root_source_file = b.path("src/secp.zig"), .target = target, .optimize = optimize });
     const sk = b.addModule("sk", .{ .root_source_file = b.path("lib/sk.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "cbor", .module = c.cbor }} });
-    _ = b.addModule("brc104", .{ .root_source_file = b.path("lib/brc104.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
     const dagjson = b.addModule("dagjson", .{ .root_source_file = b.path("lib/dagjson.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "cbor", .module = c.cbor }} });
     const message = b.addModule("message", .{ .root_source_file = b.path("lib/message.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "secp", .module = secp } } });
     const files = b.addModule("files", .{ .root_source_file = b.path("lib/files.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
-    const filter = b.addModule("filter", .{ .root_source_file = b.path("lib/filter.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
+    const check = b.addModule("check", .{ .root_source_file = b.path("lib/check.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
     const signer = b.addModule("signer", .{ .root_source_file = b.path("lib/signer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk } } });
     const app = b.addModule("app", .{ .root_source_file = b.path("lib/app.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "sk", .module = sk }, .{ .name = "dagjson", .module = dagjson } } });
 
@@ -81,7 +79,7 @@ pub fn build(b: *std.Build) void {
     wit.addObjectFile(b.path("wit/bindings/c/program_component_type.o"));
 
     const test_step = b.step("test", "every module's tests and the wallet's vector corpus, natively");
-    for ([_]*std.Build.Module{ c.cid, c.cbor, c.mst, secp, dagjson, message, files, filter, app, signer }) |m| {
+    for ([_]*std.Build.Module{ c.cid, c.cbor, c.mst, secp, dagjson, message, files, check, app, signer }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 

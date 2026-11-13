@@ -1,12 +1,14 @@
-//! The `skein` import namespace for the Zig programs (the front door, the
-//! messagebox, resolve, the workbench's run and loop, and every app's
-//! handler): preview1 imports with f(…, out, cap) → n and `take` for a result
-//! that did not fit (kernel-zig/src/program.zig), wrapped so a program says
-//! `sk.get(a, cid)` and gets the bytes or an error whose message
-//! `lastError()` holds. Below the imports, what a handler builds on them:
-//! its thread's kept records, messages (`send`), the intentions the runtime
-//! answers (`deadline`, `fetch`; shruggr/skein#126), `authfetch` (the kernel's
-//! BRC-104 client), the address book and resolving a handle, and trees.
+//! The `skein` import namespace for the Zig programs (every app's handlers, checks and reads):
+//! preview1 imports with f(…, out, cap) → n and `take` for a result that did not fit
+//! (kernel-zig/src/program.zig), wrapped so a program says `sk.get(a, cid)` and gets the bytes or an
+//! error whose message `lastError()` holds. Below the imports, what a handler builds on them: its
+//! thread's kept records, events (`emitEvent`, `broadcast`), the later work (`launch`, `awaitThread`,
+//! `awaitName`, `on`), and trees.
+//!
+//! skein next (SPEC.md section 5): later work is exactly `launch` (the launcher does not wait),
+//! `await(x)` (x a fact's name or a thread's identity: THIS thread resumes, once) and `on(name, fn)`
+//! (always a function). Gone: the `deadline` and `authfetch` imports, awaiting a message's reply,
+//! messages to a key (`emit`/`send`), the address book (`peers`…), `launchResolve`, `fetch`.
 const std = @import("std");
 const cbor = @import("cbor");
 
@@ -25,19 +27,18 @@ pub const raw = struct {
     pub extern "skein" fn putblock(cid: [*]const u8, cid_len: u32, data: [*]const u8, len: u32) i32;
     pub extern "skein" fn keep(cid: [*]const u8, cid_len: u32) i32;
     pub extern "skein" fn launch(prog: [*]const u8, prog_len: u32, args: [*]const u8, args_len: u32, out: [*]u8, cap: u32) i32;
-    pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
+    /// skein next: x a thread's identity (a binary CID) or a fact's name (text).
+    pub extern "skein" fn @"await"(x: [*]const u8, x_len: u32) i32;
     pub extern "skein" fn head(name: [*]const u8, name_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
     pub extern "skein" fn wallet(frame: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn emit(msg: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
-    pub extern "skein" fn deadline(until_ms: i64) i32;
     pub extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     /// 0.20.0 (shruggr/skein call permissions): a named in-VM call; the kernel checks the name.
     pub extern "skein" fn callAs(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, name: [*]const u8, name_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
-    pub extern "skein" fn authfetch(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn events(q: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn on(name: [*]const u8, name_len: u32, func: [*]const u8, func_len: u32) i32;
     pub extern "skein" fn off(name: [*]const u8, name_len: u32, func: [*]const u8, func_len: u32) i32;
@@ -50,17 +51,12 @@ pub fn events(a: Allocator, query: Value) !Value {
     return cbor.decode(a, try result(a, raw.events, .{ q.ptr, n32(q.len) }));
 }
 
-/// Subscribe (shruggr/skein 0.5.2): `func` — "<role>.<fn>", or "<fn>" for an app with one program —
-/// of the calling app is stepped on each fact named `name` exactly that lands after this step. Kept
-/// when the step ends without error; refused in a kernel call.
-///
-/// With no `func` (null; shruggr/skein 0.5.4) the calling THREAD rests on `name`: its step ends with
-/// the thread resting, and every fact emitted under `name` after it wakes the thread (a step with
-/// `event` {event, box: <the name>, place} in its input, its own context intact); it rests on the
-/// name again. Threads resting on one name wake in the order they began resting.
-pub fn on(name: []const u8, func: ?[]const u8) !void {
-    const f = func orelse "";
-    if (raw.on(name.ptr, n32(name.len), f.ptr, n32(f.len)) < 0) return failed();
+/// `on(name, fn)` (shruggr/skein 0.5.2; skein next: always a function): `func` — "<role>.<fn>", or
+/// "<fn>" for an app with one program — of the calling app is stepped on each fact named `name`
+/// exactly that lands after this step (input `args` {event, box: <the name>, fn, place}). Kept when
+/// the step ends without error; refused in a kernel call. To resume THIS thread on a fact, `awaitName`.
+pub fn on(name: []const u8, func: []const u8) !void {
+    if (raw.on(name.ptr, n32(name.len), func.ptr, n32(func.len)) < 0) return failed();
 }
 
 /// End the calling app's one subscription of `func` to `name` (shruggr/skein 0.5.3) — the same two
@@ -144,8 +140,17 @@ pub fn keep(c: []const u8) !void {
     if (raw.keep(c.ptr, n32(c.len)) < 0) return failed();
 }
 
-pub fn awaitRecord(c: []const u8) !void {
-    if (raw.@"await"(c.ptr, n32(c.len)) < 0) return failed();
+/// `await(<thread>)` (skein next): THIS thread resumes, once, when the thread `origin` (one this step
+/// launched, or any other) comes to rest for good — input `resolved` [{thread, state, result, error}].
+/// The step ends waiting. A thread already at rest is refused (read its state instead).
+pub fn awaitThread(origin: []const u8) !void {
+    if (raw.@"await"(origin.ptr, n32(origin.len)) < 0) return failed();
+}
+
+/// `await(<name>)` (skein next): THIS thread resumes, once, when a fact named `name` lands — input
+/// `event` {event, box: <the name>, place}. The step ends waiting.
+pub fn awaitName(name: []const u8) !void {
+    if (raw.@"await"(name.ptr, n32(name.len)) < 0) return failed();
 }
 
 /// The CID a head names, or null.
@@ -158,43 +163,32 @@ pub fn advance(name: []const u8, c: []const u8) !void {
     if (raw.advance(name.ptr, n32(name.len), c.ptr, n32(c.len)) < 0) return failed();
 }
 
-/// Launch a thread running `prog` (a program record) with the record `args`
-/// as its arguments; its origin CID. The thread starts when this step ends,
-/// and this step's thread then waits on it.
+/// Launch a thread running `prog` (a program record) with the record `args` as its arguments; its
+/// origin CID. The thread starts when this step ends. The launcher does NOT wait (skein next): to
+/// have the result, `awaitThread` the CID in the same step.
 pub fn launch(a: Allocator, prog: []const u8, args: []const u8) ![]u8 {
     return result(a, raw.launch, .{ prog.ptr, n32(prog.len), args.ptr, n32(args.len) });
 }
 
-// There is no `subscribe` (skein-sdk 0.3.0, shruggr/skein#77): the dispatch
-// table is the kernel's, changed by admin messages (box `dispatch`) from
-// root (shruggr/skein#143), never by a program import.
+// There is no `subscribe` import (skein-sdk 0.3.0, shruggr/skein#77): the route table is the
+// kernel's, changed by root's requests at a `kernel.route` row, never by a program import.
 
 /// A BRC-100 wire frame to the signer → its result frame (a recorded call in a step).
 pub fn wallet(a: Allocator, frame: []const u8) ![]u8 {
     return result(a, raw.wallet, .{ frame.ptr, n32(frame.len) });
 }
 
-/// Emit a message (#70; unsigned, shruggr/skein#126 step 4: the transport that
-/// carries it proves its sender): `body` (a record) to identity `to` in `box`,
-/// about `subject` if given → the message's CID. `to` must be in the address
-/// book; the message goes out when this step ends without error. Its answer
-/// is an entry: `awaitRecord` the CID and end the step, and the reply steps
-/// the thread (input `reply`), or `undelivered` if a mailbox delivery gave up.
-pub fn emit(a: Allocator, to: []const u8, box: []const u8, body: Value, subject: ?[]const u8) ![]u8 {
-    var m = cbor.MapBuilder.init(a);
-    try m.put("to", .{ .bytes = to });
-    try m.put("box", .{ .string = box });
-    try m.put("body", .{ .bytes = try cbor.encode(a, body) });
-    if (subject) |s| try m.put("subject", cbor.cidv(s));
-    const bytes = try cbor.encode(a, m.value());
+/// Emit an event (skein next: the one way out): `event` a map {event: <name>, …fields} — a fact
+/// under the emitting app's own name, a broadcast, or a membership declaration (subscribe, beacon,
+/// liveness) → the event record's CID. Handed to the host when this step ends without error.
+pub fn emitEvent(a: Allocator, event: Value) ![]u8 {
+    const bytes = try cbor.encode(a, event);
     return result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
 }
 
-/// Broadcast a transaction (#65): the event {event: "broadcast", tx: <its
-/// CID, held>, beef?: <its Atomic BEEF>}, unauthenticated and addressed to no
-/// one — the host's wiring carries it to the network. → the event record's
-/// CID. Await the transaction's CID to rest on its proof (an event) or a
-/// status provider's message about it.
+/// Broadcast a transaction (#65): the event {event: "broadcast", tx: <its CID, held>, beef?: <its
+/// Atomic BEEF>}, addressed to no one — the host's wiring carries it to the network. → the event
+/// record's CID. What became of it is the chain app's fact `chain/tx/<txid>`: `awaitName` it.
 pub fn broadcast(a: Allocator, tx: []const u8, beef: ?[]const u8) ![]u8 {
     var m = cbor.MapBuilder.init(a);
     try m.put("event", .{ .string = "broadcast" });
@@ -202,37 +196,6 @@ pub fn broadcast(a: Allocator, tx: []const u8, beef: ?[]const u8) ![]u8 {
     if (beef) |b| try m.put("beef", .{ .bytes = b });
     const bytes = try cbor.encode(a, m.value());
     return result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
-}
-
-/// Rest until `until_ms` at most (shruggr/skein#126: an intention — the kernel
-/// records a `deadline` event on the step when it ends waiting, the runtime
-/// keeps it, and its answer at that time steps the thread with `woke`).
-pub fn deadline(until_ms: i64) !void {
-    if (raw.deadline(until_ms) < 0) return failed();
-}
-
-/// What `authfetch` asks a server (shruggr/skein#126): `path` (with its query)
-/// under the server's base URL, the method, headers (a map {name: text}; the
-/// x-bsv-auth headers are the kernel's), the body, a timeout.
-pub const AuthRequest = struct { method: []const u8 = "POST", path: []const u8 = "/", headers: ?Value = null, body: ?[]const u8 = null, timeout_ms: ?i64 = null };
-
-/// A BRC-104 request from this instance to the server at `url` (its base URL,
-/// e.g. a messagebox's) → {status, headers, body} (shruggr/skein#126). The
-/// kernel holds the BRC-103 session with that server, signs the request and
-/// checks the answer's signature through the signer; the runtime only moves
-/// the bytes. The exchange is a recorded call on the step (replay serves it).
-/// No answer at all is an error whose message starts "transient: ". The one
-/// direct HTTP path a program has: plain `fetch` goes through the host's proxy.
-pub fn authfetch(a: Allocator, url: []const u8, req: AuthRequest) !Value {
-    var q = cbor.MapBuilder.init(a);
-    try q.put("url", .{ .string = url });
-    try q.put("method", .{ .string = req.method });
-    try q.put("path", .{ .string = req.path });
-    if (req.headers) |h| try q.put("headers", h);
-    if (req.body) |b| try q.put("body", .{ .bytes = b });
-    if (req.timeout_ms) |t| try q.put("timeoutMs", cbor.int(t));
-    const bytes = try cbor.encode(a, q.value());
-    return cbor.decode(a, try result(a, raw.authfetch, .{ bytes.ptr, n32(bytes.len) }));
 }
 
 /// An in-VM call: `prog`'s function `func` with `arg` → what it wrote to stdout.
@@ -267,12 +230,6 @@ pub fn asName(in: Value) ?[]const u8 {
 /// Write the answer of a call (stdout) as dag-cbor.
 pub fn answer(a: Allocator, v: Value) !void {
     try std.Io.File.stdout().writeStreamingAll(io(), try cbor.encode(a, v));
-}
-
-/// The genesis program named `name` in an input's `programs`.
-pub fn program(in: Value, name: []const u8) ?[]const u8 {
-    const ps = in.get("programs") orelse return null;
-    return Value.cidOf(ps.get(name));
 }
 
 pub fn isKey(b: ?[]const u8) bool {
@@ -363,7 +320,7 @@ pub fn kept(a: Allocator, tip: []const u8) ![]const []const u8 {
     return out.items;
 }
 
-// ---------------------------------------------------------------- messages
+// ---------------------------------------------------------------- keys
 
 /// An identity key as records hold it (#33): its 33 bytes, or hex text (a
 /// JSON-form sender, kept as the sender made it); null when absent or null.
@@ -374,141 +331,6 @@ pub fn keyOf(a: Allocator, v: ?Value) !?[]const u8 {
         .bytes => |b| b,
         .string => |s| unhex(a, s) orelse report(try std.fmt.allocPrint(a, "identity key \"{s}\": not hex", .{s})),
         else => report("identity key: want bytes or hex"),
-    };
-}
-
-/// A message record (#40): {kind, op, sender, recipient, box, body, json?}.
-/// Its CID is the message's id, what a reply's replyTo names.
-pub fn readMessage(a: Allocator, message: []const u8) !Value {
-    const b = getBytes(a, message) catch |e| return wrap(a, "get message", e);
-    const m = cbor.decode(a, b) catch return report("message record: not dag-cbor");
-    if (m != .map) return report("message record: not a map");
-    return m;
-}
-
-/// A message's body record (dag-cbor), after reading the message itself.
-pub fn readBody(a: Allocator, message: []const u8, body: []const u8) !Value {
-    _ = try readMessage(a, message);
-    const b = getBytes(a, body) catch |e| return wrap(a, "get body", e);
-    return cbor.decode(a, b) catch report("body: not dag-cbor");
-}
-
-/// Whether a failure may pass (no answer, 5xx, 408, 425, 429): the
-/// messagebox's delivery and resolve mark those "transient: …".
-pub fn transient(msg: []const u8) bool {
-    return std.mem.indexOf(u8, msg, "transient: ") != null;
-}
-
-/// Send `body` to identity `to` in `box` (#70): an `emit` — the message goes
-/// out by `to`'s transport when this step ends (a mailbox recipient's
-/// through the messagebox program's delivery thread, over this instance's own
-/// BRC-103/104 session). Its CID is the message's id, what a reply's
-/// `replyTo` names: `awaitRecord` it to rest on the reply.
-pub fn send(a: Allocator, to: []const u8, box: []const u8, body: Value) ![]const u8 {
-    return emit(a, to, box, body, null);
-}
-
-/// The address book (#70, the head `peers`): its peer records {kind: "peer",
-/// key, transport, address, handle?, domain?, since, source}, this step's own
-/// writes included.
-pub fn peers(a: Allocator) ![]const Value {
-    const root = (try head(a, "peers")) orelse return &.{};
-    const t = try get(a, root);
-    const list = t.get("peers") orelse return &.{};
-    if (list != .array) return report("peers: not a list");
-    const out = try a.alloc(Value, list.array.len);
-    for (list.array, out) |x, *o| {
-        o.* = try get(a, Value.cidOf(x.get("peer")) orelse return report("peers: an entry names no peer record"));
-    }
-    return out;
-}
-
-/// The key the address book names for a BRC-169 handle, or null (resolve it:
-/// `launchResolve`).
-pub fn peerByHandle(a: Allocator, handle: []const u8, domain: []const u8) !?[]const u8 {
-    for (try peers(a)) |p| {
-        if (std.mem.eql(u8, Value.str(p.get("handle")) orelse "", handle) and std.mem.eql(u8, Value.str(p.get("domain")) orelse "", domain)) {
-            if (try keyOf(a, p.get("key"))) |k| return k;
-        }
-    }
-    return null;
-}
-
-/// The address book's entry for `key`, or null.
-pub fn peerOf(a: Allocator, key: []const u8) !?Value {
-    for (try peers(a)) |p| if (std.mem.eql(u8, Value.bytesOf(p.get("key")) orelse "", key)) return p;
-    return null;
-}
-
-/// The key the address book reaches at (`transport`, `address`) — e.g. a
-/// service on this host, ("local", "cron") — or null. The address book has no
-/// roles (shruggr/skein#126): an entry is a key, a transport and an address.
-pub fn peerAt(a: Allocator, transport: []const u8, address: []const u8) !?[]const u8 {
-    for (try peers(a)) |p| {
-        if (!std.mem.eql(u8, Value.str(p.get("transport")) orelse "", transport)) continue;
-        if (!std.mem.eql(u8, Value.str(p.get("address")) orelse "", address)) continue;
-        if (Value.bytesOf(p.get("key"))) |k| return k;
-    }
-    return null;
-}
-
-/// Resolve a BRC-169 handle (#70: external communication is a thread): launch
-/// the resolve program on {handle, domain, key?}; this step then waits on it,
-/// and when it finishes the address book names the handle (its result is the
-/// peer record) — or it errored (`resolved[i].error`). Its origin CID.
-pub fn launchResolve(a: Allocator, in: Value, handle: []const u8, domain: []const u8, key: ?[]const u8) ![]const u8 {
-    const rp = program(in, "resolve") orelse return report(try std.fmt.allocPrint(a, "resolve @{s}@{s}: no resolve program in the genesis", .{ handle, domain }));
-    var q = cbor.MapBuilder.init(a);
-    try q.put("handle", .{ .string = handle });
-    try q.put("domain", .{ .string = domain });
-    if (key) |k| try q.put("key", .{ .bytes = k });
-    return launch(a, rp, try put(a, q.value()));
-}
-
-/// One HTTP request as an intention (shruggr/skein#126): the event {event:
-/// "fetch", method, url, headers?, body?, timeoutMs?, maxBytes?} recorded on
-/// the step (the kernel adds the thread and step) → its CID, awaited here. The
-/// runtime sends it as the host is wired — signed with the instance's key, to
-/// its HTTP proxy — and the proxy's signed answer steps the thread with
-/// `reply` (replyOf): the body {replyTo: <this CID>, request, status, headers,
-/// body} or {replyTo, request, error} (no answer at all). No program reaches
-/// HTTP itself; `authfetch` is the one direct path, signed in the kernel.
-pub fn fetch(a: Allocator, method: []const u8, url: []const u8, headers: ?Value, body: ?[]const u8) ![]const u8 {
-    return fetchWith(a, method, url, headers, body, .{});
-}
-
-pub const FetchLimits = struct { timeout_ms: ?i64 = null, max_bytes: ?i64 = null };
-
-/// `fetch` with a timeout and a cap on the response body (`maxBytes`: a
-/// larger response is not carried in; the answer is {error}).
-pub fn fetchWith(a: Allocator, method: []const u8, url: []const u8, headers: ?Value, body: ?[]const u8, limits: FetchLimits) ![]const u8 {
-    var q = cbor.MapBuilder.init(a);
-    try q.put("event", .{ .string = "fetch" });
-    try q.put("method", .{ .string = method });
-    try q.put("url", .{ .string = url });
-    if (headers) |h| try q.put("headers", h);
-    if (body) |b| try q.put("body", .{ .bytes = b });
-    if (limits.timeout_ms) |t| try q.put("timeoutMs", cbor.int(t));
-    if (limits.max_bytes) |m| try q.put("maxBytes", cbor.int(m));
-    const bytes = try cbor.encode(a, q.value());
-    const id = try result(a, raw.emit, .{ bytes.ptr, n32(bytes.len) });
-    try awaitRecord(id);
-    return id;
-}
-
-/// A reply that woke this step (input `reply`): the message, its body record, and what it answers.
-pub const Reply = struct { message: []const u8, body: Value, box: []const u8, sender: []const u8, reply_to: []const u8 };
-
-pub fn replyOf(a: Allocator, in: Value) !?Reply {
-    const r = in.get("reply") orelse return null;
-    if (r != .map) return null;
-    const message = Value.cidOf(r.get("message")) orelse return null;
-    return .{
-        .message = message,
-        .body = try get(a, Value.cidOf(r.get("body")) orelse return report("reply: no body")),
-        .box = Value.str(r.get("box")) orelse "",
-        .sender = Value.bytesOf(r.get("sender")) orelse "",
-        .reply_to = Value.cidOf(r.get("replyTo")) orelse "",
     };
 }
 
