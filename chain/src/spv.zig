@@ -24,10 +24,15 @@ pub const Result = struct {
     proven: []bool,
 };
 
+/// The verifier's calls in this process, counted (skein next: a test confirms a BEEF the chain app's
+/// check proved is not proved again when it is recorded). Read only by tests.
+pub var calls: usize = 0;
+
 /// SPV over `given`, in its parents-first order (`beef_mod.order`: a writer that put a child before
 /// its parent is sorted, not refused, as ts-sdk and go-sdk read; the checks are the same).
 /// error.NotParentsFirst: a cycle, which no order resolves.
 pub fn verify(arena: std.mem.Allocator, given: beef_mod.Beef, ctx: Context) !Result {
+    calls += 1;
     const ord = beef_mod.order(arena, given.entries) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidBeef => return error.NotParentsFirst,

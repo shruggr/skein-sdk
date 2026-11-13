@@ -77,6 +77,7 @@ const chain_mod = @import("chain.zig");
 const store_mod = @import("store.zig");
 const merkle = @import("merkle.zig");
 const host_mod = @import("host.zig");
+const record_mod = @import("record.zig");
 
 const Store = store_mod.Store;
 const Map = store_mod.Map;
@@ -285,6 +286,30 @@ pub const State = struct {
         return v.bytes[0..32].*;
     }
 
+    /// An input of a transaction already spent by another held one (skein next, SPEC 6: the chain
+    /// app's recheck `chain.unspent`; moved from skein-overlay's state, 0.26.0).
+    pub const Spent = struct { op: [36]u8, by: [32]u8 };
+
+    /// The first input of `tx` (`txid`) that a transaction other than it, held here and not
+    /// rejected, already spends: the outpoint and its spender; null when none.
+    pub fn spentInput(self: *State, txid: [32]u8, tx: bsvz.transaction.Transaction) !?Spent {
+        for (tx.inputs) |in| {
+            const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
+            for (try self.spendersOf(op)) |other| {
+                if (std.mem.eql(u8, &other, &txid)) continue;
+                if ((try self.status(other)) == .rejected) continue;
+                return .{ .op = op, .by = other };
+            }
+        }
+        return null;
+    }
+
+    /// Held and not rejected (skein next, SPEC 6 [P]): the one thing a BEEF may name by txid alone,
+    /// in the chain app's check (`chain.beef`, skein-sdk chaindoor) and in `ingest` alike.
+    pub fn heldLive(self: *State, txid: [32]u8) !bool {
+        return (try self.holds(txid)) and !(try self.map("rejected").has(&txid));
+    }
+
     // ------------------------------------------------------------ status
 
     /// A transaction's status is its latest fact (0.18.0, David 2026-11-09): a proof on our best chain
@@ -486,6 +511,26 @@ pub const State = struct {
         if (!(try self.holds(txid))) return error.UnknownTransaction;
         const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return error.BadProof;
         return self.addPath(txid, p);
+    }
+
+    /// What a merkle path for `txid` comes to against this state, read only (skein next, SPEC 6: the
+    /// chain app's event check `chain.proof`, before the entry): ok, or the error `addProof` would
+    /// give — UnknownTransaction (not held), BadProof (malformed, conflicting, or not covering it),
+    /// UnknownHeader (no header at its height yet: an early proof, refused; the host offers it again),
+    /// RootMismatch (not our header's root). Nothing is put.
+    pub fn checkProof(self: *State, txid: [32]u8, path: []const u8) !void {
+        if (!(try self.holds(txid))) return error.UnknownTransaction;
+        const p = bsvz.spv.MerklePath.parse(self.arena, path) catch return error.BadProof;
+        const rev = merkle.reveal(self.arena, p) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return error.BadProof,
+        };
+        const leaves = try merkle.covered(self.arena, rev, p.path.len);
+        var has_subject = false;
+        for (leaves) |lf| has_subject = has_subject or std.mem.eql(u8, &lf.txid, &txid);
+        if (!has_subject) return error.BadProof;
+        const at = (try self.chain().at(p.block_height)) orelse return error.UnknownHeader;
+        if (!std.mem.eql(u8, &rev.root, &(try hdr.Header.parse(&at.raw)).merkle_root)) return error.RootMismatch;
     }
 
     /// 0.21.0: the path is saved (`putProof`: every transaction it newly covers linked, also when
@@ -893,9 +938,11 @@ pub const State = struct {
             const self: *SpvCtx = @ptrCast(@alignCast(ptr));
             return self.st.chain().rootAt(height);
         }
+        /// skein next (SPEC 6 [P]): held and not rejected, as the chain app's check reads it.
         pub fn knownRaw(ptr: *anyopaque, arena: std.mem.Allocator, txid: [32]u8) anyerror!?[]const u8 {
             _ = arena;
             const self: *SpvCtx = @ptrCast(@alignCast(ptr));
+            if (!(try self.st.heldLive(txid))) return null;
             return self.st.txRaw(txid);
         }
     };
@@ -907,14 +954,36 @@ pub const State = struct {
     /// refused — their scripts verified), then every transaction it carries
     /// recorded, every proof it carries put, and each one left unproven registered for broadcast
     /// (`registered`). A transaction spending what a proven one already spends is rejected at once.
+    /// skein next (SPEC 6): always verified in full — any BEEF handed in that is not a pointer record
+    /// the chain app's check wrote for the driving entry (`ingestChecked`).
     pub fn ingest(self: *State, bytes: []const u8) !Ingested {
+        return self.ingestAs(bytes, null);
+    }
+
+    /// skein next (SPEC 6 [P]): a BEEF the chain app's check (`chain.beef`, skein-sdk chaindoor)
+    /// already proved before the entry — `envelope` the envelope it wrote, over a pointer record THE
+    /// CALLER ATTESTS is in the driving entry's kernel-written `door.blocks` (the chain app checks
+    /// that; this function cannot). Recorded exactly as `ingest` records the same bytes, without
+    /// `spv.verify`: which transactions a BUMP proves is the record's `proves` (the check's
+    /// verifier's). A BUMP's root is still checked against our header when its path is saved
+    /// (`putProof`).
+    pub fn ingestChecked(self: *State, envelope: Value) !Ingested {
+        const e = record_mod.envelopeOf(envelope) orelse return error.InvalidBeef;
+        const rec = self.store.getValue(self.arena, e.beef) catch return error.InvalidBeef;
+        const bytes = record_mod.wireOf(self.arena, self.store, envelope) catch return error.InvalidBeef;
+        return self.ingestAs(bytes, rec);
+    }
+
+    /// `ingest`'s body: `checked` the pointer record whose `proves` stand for the verifier's (null:
+    /// verify in full).
+    fn ingestAs(self: *State, bytes: []const u8, checked_rec: ?Value) !Ingested {
         const a = self.arena;
         const parsed = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
         const subject = parsed.subject() orelse return error.InvalidBeef;
         const entry = parsed.find(subject) orelse return error.InvalidBeef;
         if (entry.raw == null) {
-            // A txid-only subject: only a transaction we already hold.
-            if (!(try self.holds(subject))) return error.UnknownTxidOnly;
+            // A txid-only subject: only a transaction we hold and that is not rejected (SPEC 6 [P]).
+            if (!(try self.heldLive(subject))) return error.UnknownTxidOnly;
         }
         // Parents first (a writer's order sorted, not refused): recorded and registered in it.
         const ordered = beef_mod.sorted(a, parsed) catch |e| switch (e) {
@@ -924,7 +993,7 @@ pub const State = struct {
         const held = try self.heldAsTxidOnly(ordered, subject);
         const b = held.beef;
         var ctx = SpvCtx{ .st = self };
-        const checked = try spv.verify(a, b, .{ .ptr = &ctx, .rootAtFn = SpvCtx.rootAt, .knownRawFn = SpvCtx.knownRaw });
+        const checked: spv.Result = if (checked_rec) |rec| .{ .proven = try provenOf(a, rec, b) } else try spv.verify(a, b, .{ .ptr = &ctx, .rootAtFn = SpvCtx.rootAt, .knownRawFn = SpvCtx.knownRaw });
         var registered: std.ArrayList([32]u8) = .empty;
         // Each BUMP is saved once (it links every transaction it covers), at the first proven entry it
         // holds: not once per entry.
@@ -975,6 +1044,22 @@ pub const State = struct {
         proof: []?usize,
     };
 
+    /// Per entry of `b` (a raw one), whether the pointer record's `proves` (the check's verifier, run
+    /// over the same BEEF) names its transaction.
+    fn provenOf(a: std.mem.Allocator, rec: Value, b: beef_mod.Beef) ![]bool {
+        const txs = rec.getArray("txs") orelse return error.InvalidBeef;
+        const by = record_mod.provenBy(a, rec) catch return error.InvalidBeef;
+        const out = try a.alloc(bool, b.entries.len);
+        for (b.entries, out) |e, *o| {
+            o.* = false;
+            if (e.raw == null) continue;
+            for (txs, by) |t, k| if (k != null and t == .cid) if (store_mod.bitcoinHash(t.cid)) |h| if (std.mem.eql(u8, &h, &e.txid)) {
+                o.* = true;
+            };
+        }
+        return out;
+    }
+
     /// 0.22.1 (David 2026-11-11: "if it's not just a TXID, we calculate what the TXID is and we look it
     /// up the same way"): every raw entry but the subject whose transaction we hold (`txs`, the lookup
     /// a txid-only entry gets) becomes its txid-only entry — its scripts not run, nothing recorded or
@@ -992,7 +1077,9 @@ pub const State = struct {
         var entries: ?[]beef_mod.Entry = null;
         for (b.entries, 0..) |e, i| {
             if (e.raw == null) continue;
-            const conv = !std.mem.eql(u8, &e.txid, &subject) and try self.holds(e.txid);
+            // skein next (SPEC 6 [P]): held and not rejected (a rejected one stays raw: verified, or
+            // proven by its BUMP — a proof overrides a rejection).
+            const conv = !std.mem.eql(u8, &e.txid, &subject) and try self.heldLive(e.txid);
             const fresh = conv and (try self.minedStatus(e.txid)) != .proven;
             for (b.bumps, 0..) |p, k| {
                 const proves = (e.format == .raw_with_bump and e.bump == k) or (beef_mod.bumpHas(p, e.txid) and leafFlagged(p, e.txid));

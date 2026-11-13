@@ -308,5 +308,6 @@ fn wireOf(a: std.mem.Allocator, r: Reader, env: Value) ![]u8 {
 
 test {
     _ = @import("check_test.zig");
+    _ = @import("ingest_test.zig");
     _ = beef;
 }

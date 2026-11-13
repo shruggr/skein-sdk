@@ -1823,3 +1823,71 @@ test "0.22.1 heldAsTxidOnly: the subject is never made txid-only; a BUMP proving
     try std.testing.expectEqual(beef.Format.raw_with_bump, v2.beef.entries[0].format);
     try std.testing.expectEqual(@as(usize, 2), v2.beef.bumps.len);
 }
+
+// ---------------------------------------------------------------- skein next (SPEC 6)
+
+test "skein next: spentInput — the second of two transactions spending one output names the first; a rejected spender does not count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const ta = try spend(a, &w.fund.tx, 0, 9_000);
+    const tb = try spend(a, &w.fund.tx, 0, 8_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ta}));
+    try std.testing.expect((try w.st.spentInput(ta.txid, ta.tx)) == null); // its own spend
+    const sp = (try w.st.spentInput(tb.txid, tb.tx)).?;
+    try std.testing.expectEqualSlices(u8, &ta.txid, &sp.by);
+    try std.testing.expectEqualSlices(u8, &lib.store.outpointKey(w.fund.txid, 0), &sp.op);
+    _ = try w.st.reject(ta.txid, "REJECTED");
+    try std.testing.expect((try w.st.spentInput(tb.txid, tb.tx)) == null);
+}
+
+test "skein next: checkProof — ok for a held transaction under our header; an early proof (no header yet) UnknownHeader; a wrong root, a malformed path, an unheld transaction refused; nothing put" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 1);
+    const child = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{child}));
+    const before = try w.st.save();
+    const linked = w.st.linked.items.len;
+    // Early: the header at 2 is not held yet.
+    try std.testing.expectError(error.UnknownHeader, w.st.checkProof(child.txid, try soloPath(a, 2, child.txid)));
+    try std.testing.expectError(error.UnknownTransaction, w.st.checkProof(.{9} ** 32, try soloPath(a, 1, .{9} ** 32)));
+    try std.testing.expectError(error.BadProof, w.st.checkProof(child.txid, &.{ 1, 2, 3 }));
+    // The header at 1 holds the funding alone: a solo path for the child at 1 gives another root.
+    try std.testing.expectError(error.RootMismatch, w.st.checkProof(child.txid, try soloPath(a, 1, child.txid)));
+    _ = try w.st.addHeaders(&.{&mine(hdr.hash(&w.h1), child.txid, 1_700_001_200)});
+    try w.st.checkProof(child.txid, try soloPath(a, 2, child.txid));
+    try std.testing.expectEqual(lib.state.Status.unproven, try w.st.status(child.txid)); // nothing put
+    try std.testing.expect(!std.mem.eql(u8, before, try w.st.save())); // only the header moved it
+    try std.testing.expectEqual(linked, w.st.linked.items.len);
+}
+
+test "skein next: the txid-only rule is held and not rejected — a rejected transaction named by txid alone is refused at ingest, as at the check" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 2);
+    const ta = try spend(a, &w.fund.tx, 0, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ta}));
+    const tb = try spend(a, &ta.tx, 0, 8_000);
+    const named = try beef.serialize(a, .{ .version = beef.V2, .atomic = tb.txid, .bumps = &.{}, .entries = try a.dupe(beef.Entry, &.{ .{ .txid = ta.txid, .format = .txid_only }, .{ .txid = tb.txid, .format = .raw, .raw = tb.raw, .tx = tb.tx } }) });
+    const base = try w.st.save();
+    // Held, unproven: passes.
+    var ok = try State.load(a, ms.store(), base, .regtest);
+    _ = try ok.ingest(named);
+    // Held, rejected: refused (it may not be named by txid alone), its spender with it.
+    var no = try State.load(a, ms.store(), base, .regtest);
+    _ = try no.reject(ta.txid, "REJECTED");
+    try std.testing.expectError(error.UnknownTxidOnly, no.ingest(named));
+    // A txid-only subject that is rejected: refused.
+    const subj = try beef.serialize(a, .{ .version = beef.V2, .atomic = ta.txid, .bumps = &.{}, .entries = try a.dupe(beef.Entry, &.{.{ .txid = ta.txid, .format = .txid_only }}) });
+    try std.testing.expectError(error.UnknownTxidOnly, no.ingest(subj));
+}
