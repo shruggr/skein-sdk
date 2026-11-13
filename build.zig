@@ -26,6 +26,9 @@
 //   cabi       malloc/realloc/free/abort/strlen for wit-bindgen's C bindings   wit/zig/cabi.zig
 //   skein_wit  the `skein` calls over the WIT interface, for a component       wit/zig/skein_wit.zig
 //              build (the C bindings compiled in: wit/bindings/c)
+//   chaindoor  the chain app's checks before the entry (skein next): the     chain/door/lib.zig
+//              BEEF check (`chain.beef`) and its pointer-record and envelope
+//              builders, moved out of the kernel (imports cbor, cid, mst, chain)
 //   chain      the chain library: headers and the chain tracker, merkle       chain/src/lib.zig
 //              paths, BEEF, SPV, the record store and its index maps, and
 //              `state`, the chain app's records (shruggr/skein#78; over bsvz)
@@ -100,6 +103,10 @@ pub fn build(b: *std.Build) void {
     b.modules.put(b.graph.arena, "chain", chain) catch @panic("OOM");
     const ctests = b.addTest(.{ .root_module = chainModule(b, "chain/test.zig", target, optimize, c.mst).? });
     test_step.dependOn(&b.addRunArtifact(ctests).step);
+    // skein next: the chain app's checks before the entry (the BEEF check moved out of the kernel).
+    const door = doorModule(b, target, optimize, c, chain);
+    b.modules.put(b.graph.arena, "chaindoor", door) catch @panic("OOM");
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = doorModule(b, target, optimize, c, chain) })).step);
 
     if (!with_wallet) return;
     const wallet = walletModule(b, "wallet/src/lib.zig", target, optimize, c.mst, chain) orelse {
@@ -124,6 +131,7 @@ pub fn build(b: *std.Build) void {
 /// asked for bsvz (see `build`): no imports, never compiled.
 fn placeholders(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, with_wallet: bool) void {
     if (!b.modules.contains("chain")) _ = b.addModule("chain", .{ .root_source_file = b.path("chain/src/lib.zig"), .target = target, .optimize = optimize });
+    if (!b.modules.contains("chaindoor")) _ = b.addModule("chaindoor", .{ .root_source_file = b.path("chain/door/lib.zig"), .target = target, .optimize = optimize });
     if (with_wallet and !b.modules.contains("wallet")) _ = b.addModule("wallet", .{ .root_source_file = b.path("wallet/src/lib.zig"), .target = target, .optimize = optimize });
 }
 
@@ -145,6 +153,16 @@ fn chainModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget
         .target = target,
         .optimize = optimize,
         .imports = &.{ .{ .name = "bsvz", .module = bsvz.module("bsvz") }, .{ .name = "mst", .module = mst } },
+    });
+}
+
+/// chaindoor (chain/door/lib.zig): the chain app's BEEF check over the SDK's codecs and the chain module.
+fn doorModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, c: Codecs, chain: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("chain/door/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "cbor", .module = c.cbor }, .{ .name = "cid", .module = c.cid }, .{ .name = "mst", .module = c.mst }, .{ .name = "chain", .module = chain } },
     });
 }
 
