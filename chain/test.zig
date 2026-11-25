@@ -763,3 +763,66 @@ test "pointAt: a state names the host chain's roots — the same state as adding
     var main_st = try State.load(a, s, null, .main);
     try std.testing.expectError(error.NetworkMismatch, main_st.pointAt(host3));
 }
+
+fn spend2(a: std.mem.Allocator, s1: *const bsvz.transaction.Transaction, v1: u32, s2: *const bsvz.transaction.Transaction, v2: u32, sats: u64) !Tx {
+    var b = bsvz.transaction.Builder.init(a);
+    try b.addInputFromTx(s1, v1);
+    try b.addInputFromTx(s2, v2);
+    const script = p2pkh(try pub33());
+    try b.addOutput(.{ .satoshis = @intCast(sats), .locking_script = bsvz.script.Script.init(try a.dupe(u8, &script)) });
+    var tx = try b.build();
+    const key = try bsvz.crypto.PrivateKey.fromBytes(priv);
+    const srcs = [_]*const bsvz.transaction.Transaction{ s1, s2 };
+    const vs = [_]u32{ v1, v2 };
+    for (srcs, vs, 0..) |src, v, i| {
+        const prev = src.outputs[v];
+        const u = try bsvz.transaction.templates.p2pkh_spend.signAndBuildUnlockingScript(a, &tx, i, prev.locking_script, prev.satoshis, key, bsvz.transaction.templates.p2pkh_spend.default_scope);
+        @constCast(tx.inputs)[i].unlocking_script = u;
+    }
+    const raw = try tx.serialize(a);
+    return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
+}
+
+test "audit: spentBy for a held parent and for a parent only in the BEEF ancestry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 3);
+    // P held beforehand (spends fund:0); Q spends fund:1 and arrives only inside S's BEEF.
+    const p = try spend(a, &w.fund.tx, 0, 9_000);
+    const q = try spend(a, &w.fund.tx, 1, 9_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{p}));
+    try std.testing.expect(try w.st.holds(p.txid));
+    try std.testing.expect(!(try w.st.holds(q.txid)));
+    const s = try spend2(a, &p.tx, 0, &q.tx, 0, 8_000);
+    _ = try w.st.ingest(try beefOf(a, &.{.{ w.fund, 1 }}, &.{ p, q, s }));
+    std.debug.print("\nholds S={} P={} Q={}\n", .{ try w.st.holds(s.txid), try w.st.holds(p.txid), try w.st.holds(q.txid) });
+    const sp = try w.st.spentBy(p.txid, 0);
+    const sq = try w.st.spentBy(q.txid, 0);
+    std.debug.print("spentBy(P,0)==S: {}  spentBy(Q,0)==S: {}\n", .{ sp != null and std.mem.eql(u8, &sp.?, &s.txid), sq != null and std.mem.eql(u8, &sq.?, &s.txid) });
+    // variant: parent absent from the BEEF entirely
+    var ms2 = lib.store.MemStore.init(std.testing.allocator);
+    defer ms2.deinit();
+    var w2 = try world(a, ms2.store(), 3);
+    _ = try w2.st.ingest(try beefOf(a, &.{.{ w2.fund, 1 }}, &.{p}));
+    const r = w2.st.ingest(try beefOf(a, &.{.{ w2.fund, 1 }}, &.{ p, s }));
+    std.debug.print("absent-parent ingest: {any}\n", .{r});
+    try std.testing.expect(sp != null);
+    try std.testing.expect(sq != null);
+}
+
+test "audit: direct putTx of S with neither parent held" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = lib.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var w = try world(a, ms.store(), 3);
+    const p = try spend(a, &w.fund.tx, 0, 9_000);
+    const q = try spend(a, &w.fund.tx, 1, 9_000);
+    const s = try spend2(a, &p.tx, 0, &q.tx, 0, 8_000);
+    _ = try w.st.putTx(s.txid, s.raw);
+    std.debug.print("\nDIRECT holds P={} Q={} spentBy(P,0)={} spentBy(Q,0)={}\n", .{ try w.st.holds(p.txid), try w.st.holds(q.txid), (try w.st.spentBy(p.txid, 0)) != null, (try w.st.spentBy(q.txid, 0)) != null });
+}
